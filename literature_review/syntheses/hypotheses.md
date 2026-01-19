@@ -8,7 +8,8 @@
 
 #### H1: Memory-Attention Complementarity
 
-**Hypothesis**: Memory-augmented architectures and attention-based mechanisms are complementary approaches that can be combined for better dynamic graph representation learning.
+**Hypothesis**: Memory-augmented architectures and attention-based mechanisms 
+are complementary approaches that can be combined for better dynamic graph representation learning.
 
 **Supporting Evidence**:
 - TAWRMAC combines memory with co-occurence attention
@@ -21,6 +22,20 @@
 - Hybrid: TGN + DyGFormer attention layers
 - Evaluation: AP, AUC, MRR on Wikipeida, Reddit, MOOC datasets
 
+
+#### H3: Frequency-Domain Effectiveness
+
+**Hypotheses**: Frequency-domain approaches are particulary effective for dynamic graphs with periodic or quasi-periodic temporal patterns.
+
+**Supporting Evidence**:
+- FreeDyG shows 5-8% improvement on periodic datasets
+- Signal processing theory supports frequency analysis for periodic signals
+
+**Testable Prediction**: FreeDyG's performance advantage will correlate with the degree of periodicity in temporal patterns.
+
+**Experimental Design**:
+
+- Me
 
 
 
