@@ -29,7 +29,7 @@ class BaseDynamicGNN(L.LightningModule, ABC):
         self.dropout_layer = nn.Dropout(dropout)
 
     def _init_time_encoder(self):
-        return TimeEncode(self.time_encoding_dim)
+        return TimeEncoder(self.time_encoding_dim)
     
     def forward(self, batch):
         pass
@@ -83,7 +83,7 @@ class BaseDynamicGNN(L.LightningModule, ABC):
         pass
 
 
-class TimeEncode(nn.Module):
+class TimeEncoder(nn.Module):
     def __init__(self, time_dim):
         super().__init__()
         self.time_dim = time_dim
