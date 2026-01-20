@@ -5,7 +5,7 @@ import numpy as np
 import yaml
 from datetime import datetime
 
-def set_see(seed:int):
+def set_seed(seed:int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -13,6 +13,16 @@ def set_see(seed:int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def get_device(gpu_ids=None):
+    if gpu_ids is None or gpu_ids == 0:
+        device = torch.device('cpu')
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        print("CUDa not available, using cpu")
+        device = torch.device('cpu')
+    return device
 
 def load_config(path):
     with open(path, "r") as f:

@@ -1,0 +1,35 @@
+experiment:
+  name: "tawrmac_reproduction"
+  description: "Reproducing TAWRMAC (2025) on Wikipedia"
+  seed: 42
+  precision: 32
+
+data:
+  dataset: wikipedia
+  evaluation_type: inductive  # or transductive
+  negative_sampling_strategy: "historical"  # random/historical/inductive
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  max_neighbors: 10
+
+model:
+  name: TAWRMAC
+  memory_dim: 172
+  walk_length: 4
+  num_walks: 10
+ 
+
+training:
+  batch_size: 200
+  max_epochs: 50
+  patience: 10
+  gradient_clip_val: 1.0
+
+logging:
+  log_dir: "logs/"
+  checkpoint_dir: "checkpoints/"
+  monitor: "val_ap"  
+  # for AP/AUC, "min" for loss
+  mode: "max"  
+  save_top_k: 3

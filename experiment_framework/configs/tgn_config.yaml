@@ -1,0 +1,57 @@
+# TGN Model Configuration
+
+# Model parameters
+model:
+  name: "TGN"
+  num_nodes: null  # Will be set based on dataset
+  node_features: 0  # Use learned embeddings
+  hidden_dim: 172
+  time_encoding_dim: 32
+  memory_dim: 172
+  message_dim: 172
+  num_layers: 1
+  dropout: 0.1
+  
+# Training parameters
+training:
+  batch_size: 200
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  max_epochs: 100
+  patience: 5
+  gradient_clip_val: 1.0
+  
+# Data parameters
+data:
+  dataset: "wikipedia"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  max_neighbors: 10
+  
+# Experiment parameters
+experiment:
+  name: "tgn_experiment"
+  description: "TGN baseline experiment"
+  seed: 42
+  device: "auto"  # auto, cpu, cuda
+  precision: 32
+  
+# Logging
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  save_top_k: 3
+  monitor: "val_loss"
+  mode: "min"
+  
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "ap", "auc"]
+  test_batch_size: 1000
+  
+# Hardware
+hardware:
+  gpus: 1  # null for CPU, number for GPU count
+  num_workers: 4
+  pin_memory: true

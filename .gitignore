@@ -1,3 +1,39 @@
+# --- Python Cache & Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# --- Checkpoints & Model Files ---
+*.pth
+*.pt
+*.ckpt
+*.bin
+checkpoint*/
+checkpoints/
+models/saved_models/
+
+# --- Logs & Training Output ---
+logs/
+*.log
+tensorboard/
+runs/
+wandb/
+mlruns/
+
+# --- Environment & IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Jupyter Notebook Checkpoints ---
+.ipynb_checkpoints/
+
+# --- Dataset/Model Cache ---
+.cache/
+
 # --- Research Files ---
 # Ignore all PDFs by default to keep the repo light
 *.pdf

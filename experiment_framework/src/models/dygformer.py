@@ -1,7 +1,7 @@
 import torch 
 import torch.nn as nn
 
-from base_model import BaseDynamicGNN, TimeEncoder
+from .base_model import BaseDynamicGNN, TimeEncoder
 
 class DyGFormer(BaseDynamicGNN):
     def __init__(self, num_nodes, node_features, hidden_dim, time_encoding_dim=32,num_layers=2,num_heads=8,dropout=0.1,max_neibors=20,neighbor_co_occurrence=True,learning_rate=1e-4,weight_decay=1e-5, **kwargs):
@@ -80,7 +80,7 @@ class DyGFormer(BaseDynamicGNN):
             embeddings = torch.cat([node_features, time_enc], dim=-1)
 
         if self.neighbor_co_occurrence and neighbors is not None:
-            co_occurrence_enc = self.co_occurrence_encoder(
+            co_occurrence_enc = self.neighbor_co_occurrence(
                 nodes, neighbors, neighbor_times, node_type
             )
             embeddings = torch.cat([embeddings, co_occurrence_enc], dim=-1)
