@@ -8,14 +8,17 @@ model:
   hidden_dim: 176
   time_encoding_dim: 32
   num_layers: 2
-  num_heads: 4 # 1, 2, 4, 8
+  num_heads: 4
   dropout: 0.1
   max_neighbors: 20
+  patch_size: 1
+  max_sequence_length: 256
+  channel_embedding_dim: 64  # New parameter
   neighbor_co_occurrence: true
   
 # Training parameters
 training:
-  batch_size: 200
+  batch_size: 200 # for debugging 32, 200
   learning_rate: 0.0001
   weight_decay: 0.00001
   max_epochs: 100
@@ -24,9 +27,9 @@ training:
   
 # Data parameters
 data:
-  dataset: "reddit"
+  dataset: "wikipedia"
   evaluation_type: inductive
-  negative_sampling_strategy: "historical"
+  negative_sampling_strategy: "inductive" # random, historical, inductive
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
@@ -39,11 +42,13 @@ experiment:
   seed: 42
   device: "auto"
   precision: 32
+
+
   
 # Logging
 logging:
-  log_dir: "logs"
-  checkpoint_dir: "checkpoints"
+  log_dir: "./logs"
+  checkpoint_dir: "./checkpoints"
   save_top_k: 3
   monitor: "val_loss"
   mode: "min"
@@ -51,10 +56,11 @@ logging:
 # Evaluation
 evaluation:
   metrics: ["accuracy", "ap", "auc"]
-  test_batch_size: 1000
+  test_batch_size: 1000 #1000 
   
 # Hardware
 hardware:
   gpus: 1
-  num_workers: 4
-  pin_memory: true
+  num_workers: 0
+  pin_memory: false
+

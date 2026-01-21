@@ -1,4 +1,12 @@
 import os
+
+
+# Limit threading to prevent OpenBLAS crashes
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -14,8 +22,9 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from loguru import logger
 
 from src.models.dygformer import DyGFormer
+from src.models.tgn import TGN
 from src.utils.general_utils import set_seed, get_device
-from src.datasets.loaders import get_dataset_loader
+from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
 
 # MODEL_REGISTRY={
@@ -25,7 +34,8 @@ from src.datasets.loaders import get_dataset_loader
 # }
 
 MODEL_REGISTRY={
-    "DyGFormer": DyGFormer,    
+    "DyGFormer": DyGFormer,
+    "TGN": TGN,    
 }
 
 def load_config(config_path):
@@ -144,6 +154,16 @@ def train_model(config: dict):
     
     # Initialize model
     model = setup_model(config, num_nodes)
+    # FIX: Load and set raw features
+    dataset_name = config['data']['dataset']
+    if dataset_name in DATASET_LOADERS:
+        data = DATASET_LOADERS[dataset_name]()
+        node_features = data.get('node_features', torch.zeros(num_nodes, 172))
+        edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
+        model.set_raw_features(node_features, edge_features)
+        logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
+    
+    
     logger.info(f"Model: {model.__class__.__name__}")
     logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
     

@@ -17,12 +17,19 @@
 
 ## Implementation Priority
 
-### Tier 1 (essential)
-1. **TGN** - Foundational model, must-implement baseline
+### Tier 1 (Essential)
+1. **TGN** - Foundation model, must-implement baseline
 2. **DyGFormer** - Current state-of-the-art transformer approach
-3. **TAWRMAC** - Latest and most efficient
+3. **TAWRMAC** - Latest and most efficient model
 
 ### Tier 2 (Important)
+4. **CTGN** - Novel continuous-time approach
+5. **FreeDyG** - Unique frequency-domain perspective
+6. **GraphMixer** - Efficient MLP-based alternative
+
+### Tier 3 (Baseline)
+7. **EdgeBank** - Simple but strong baseline
+8. **JODIE** - Historical significance and comparison
 
 
 

@@ -1,5 +1,6 @@
 """Dataset loading utilities."""
 
+
 import os
 from typing import Tuple, Dict, Any
 import torch
@@ -32,6 +33,7 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     
     Args:
         config: Configuration dictionary
+        negative_sampling_strate: random, historical, 
         
     Returns:
         Tuple of (train_loader, val_loader, test_loader, num_nodes)
@@ -57,9 +59,17 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     edges = data['edges']  # [num_edges, 2]
     timestamps = data['timestamps']  # [num_edges]
     edge_features = data.get('edge_features')  # Optional
+    node_features = data.get('node_features')  # Optional
     num_nodes = data['num_nodes']
     
     logger.info(f"Loaded dataset with {num_nodes} nodes and {len(edges)} edges")
+    
+    
+    # FIX: Log feature dimensions for debugging
+    if node_features is not None:
+        logger.info(f"Node features shape: {node_features.shape}")
+    if edge_features is not None:
+        logger.info(f"Edge features shape: {edge_features.shape}")
     
     # # Temporal split
     # from .utils import temporal_train_val_test_split
@@ -67,12 +77,15 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     splits = temporal_train_val_test_split(
         edges=edges,
         timestamps=timestamps,
-        edge_features=edge_features,
+        # edge_features=edge_features,
         train_ratio=data_config['train_ratio'],
         val_ratio=data_config['val_ratio'],
         test_ratio=data_config['test_ratio']
     )
     
+    # FIX: Determine device from config
+    device = 'cuda' if hardware_config.get('gpus', 0) > 0 else 'cpu'
+
     # Create datasets
     train_dataset = TemporalDataset(
         edges=splits['train_edges'],
@@ -80,7 +93,8 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         edge_features=splits.get('train_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
-        split='train'
+        split='train',
+        device= device
     )
     
     val_dataset = TemporalDataset(
@@ -89,7 +103,8 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         edge_features=splits.get('val_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
-        split='val'
+        split='val',
+        device = device
     )
     
     test_dataset = TemporalDataset(
@@ -98,16 +113,20 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         edge_features=splits.get('test_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
-        split='test'
+        split='test',
+        device = device
     )
-    
+     # FIX: Use proper device selection for DataLoader
+    pin_memory = hardware_config.get('pin_memory', True) and device == 'cuda'
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=training_config['batch_size'],
         shuffle=True,
         num_workers=hardware_config['num_workers'],
-        pin_memory=hardware_config['pin_memory'],
+        # pin_memory=hardware_config['pin_memory'],
+        pin_memory=pin_memory,
         collate_fn=train_dataset.collate_fn
     )
     
@@ -116,7 +135,8 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         batch_size=training_config['batch_size'],
         shuffle=False,
         num_workers=hardware_config['num_workers'],
-        pin_memory=hardware_config['pin_memory'],
+        # pin_memory=hardware_config['pin_memory'],
+        pin_memory=pin_memory,
         collate_fn=val_dataset.collate_fn
     )
     
@@ -125,7 +145,8 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         batch_size=config['evaluation']['test_batch_size'],
         shuffle=False,
         num_workers=hardware_config['num_workers'],
-        pin_memory=hardware_config['pin_memory'],
+        # pin_memory=hardware_config['pin_memory'],
+        pin_memory=pin_memory,
         collate_fn=test_dataset.collate_fn
     )
     

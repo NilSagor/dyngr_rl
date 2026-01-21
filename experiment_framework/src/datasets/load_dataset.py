@@ -2,6 +2,7 @@
 import os
 import numpy as np
 import torch
+import pandas as pd
 
 # Get the directory where this file lives
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,46 +11,93 @@ DATA_ROOT = os.path.join(SCRIPT_DIR, "..", "..", "data", "processed")
 
 
 def load_wikipedia():
-
-    path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia.npy")
-    data = np.load(path)
-    
-    if data.shape[1]>2:
-        edges = torch.from_numpy(data[:,:2]).long()
-        edge_features = torch.from_numpy(data[:,2:]).float()
-    else:
-        edges = torch.from_numpy(data).long()
-        edge_features = None
-    # edges = torch.from_numpy(np.load(path))
     
     csv_path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia.csv")
-    timestamps = torch.from_numpy(np.genfromtxt(
-        csv_path, 
-        delimiter=",",
-        skip_header=1,
-        dtype=np.float64,
-        filling_values=0.0)[:, 2].astype(np.float32)).float()
-    
+    print(f"loading csv from {csv_path}")    
+    df = pd.read_csv(csv_path)
 
-    # path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia.npy")
-    # edges = torch.from_numpy(np.load(path))
-    # # edges = torch.from_numpy(np.load("data/processed/wikipedia/ml_wikipedia.npy"))
-    # csv_path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia.csv") 
-    # timestamps = torch.from_numpy(np.loadtxt(csv_path, delimiter=",")[:,2])
-    # # timestamps = torch.from_numpy(np.loadtxt("data/processed/wikipedia/ml_wikipedia.csv", delimiter=",")[:, 2])  # assuming [src, dst, ts]
-    # valid_mask = (edges[:, 0]>=0)&(edges[:,1]>=0) & (edges[:, 0]!=edges[:,1])
-    # edges = edges[valid_mask]
-    # timestamps = timestamps[valid_mask]
-    print("Edges shape:", edges.shape)
-    # # After applying valid_mask
-    # if len(edges) == 0:
-    #     raise ValueError(f"No valid edges found in {dataset_name}. Check data integrity.")
-    num_nodes = int(edges.max().item()+1)
+  
+
+    # Extract data
+    src = df['u'].values.astype(np.int64) - 1
+    dst = df['i'].values.astype(np.int64) - 1
+    timestamps = df['ts'].values.astype(np.float32)
+    
+    edges = torch.stack([
+        torch.from_numpy(src),
+        torch.from_numpy(dst)
+    ], dim=1)
+
+    # Load node features
+    node_feat_path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia_node.npy")
+    print(f"Loading node features from: {node_feat_path}")
+    node_features = np.load(node_feat_path).astype(np.float32)
+    
+    # Load edge features
+    edge_feat_path = os.path.join(DATA_ROOT, "wikipedia", "ml_wikipedia.npy")
+    print(f"Loading edge features from: {edge_feat_path}")
+    edge_features = np.load(edge_feat_path).astype(np.float32)
+    
+    # Fix: Remove extra row if present
+    if edge_features.shape[0] == len(src) + 1:
+        print("Removing extra row from edge features...")
+        edge_features = edge_features[1:]  # Remove first row
+    
+    assert edge_features.shape[0] == len(src), f"Edge features shape {edge_features.shape} doesn't match edges {len(src)}"
+
+    # Print debug info
+    print(f"\nDataset Statistics:")
+    print(f"  Number of edges: {len(src)}")
+    print(f"  Node features shape: {node_features.shape}")
+    print(f"  Edge features shape: {edge_features.shape}")
+    print(f"  Source node range: {src.min()} to {src.max()}")
+    print(f"  Destination node range: {dst.min()} to {dst.max()}")
+    print(f"  Timestamp range: {timestamps.min()} to {timestamps.max()}")
+
+    # Adjust for 1-indexing (DyGFormer uses 0 for padding)
+    src = src + 1
+    dst = dst + 1
+    # num_nodes = int(max(src.max(), dst.max()))
+    num_nodes = int(edges.max().item() + 1)  # This will be 9228 if max ID is 9227
+    
+    print(f"\nAfter adjustment for 1-indexing:")
+    print(f"  Adjusted num_nodes: {num_nodes}")
+    print(f"  Node indices now start from 1 (0 is padding)")
+    
+    # Create edge array in DyGFormer format: [src, dst, timestamp, edge_idx]
+    edge_idx = np.arange(len(src), dtype=np.int64) + 1  # 1-indexed edge ids
+    edges = np.column_stack([src, dst])
+    
+    # Create node raw features with padding at index 0
+    node_raw_features = np.zeros((num_nodes + 1, node_features.shape[1]), dtype=np.float32)
+    actual_num_nodes = min(num_nodes, node_features.shape[0])
+    node_raw_features[1:actual_num_nodes + 1] = node_features[:actual_num_nodes]
+
+    # Create edge raw features with padding at index 0
+    edge_raw_features = np.zeros((len(edge_idx) + 1, edge_features.shape[1]), dtype=np.float32)
+    edge_raw_features[1:] = edge_features
+
+    # print(f"Edges shape: {edges.shape}")
+    # print(f"Node ID range: {edges.min()} to {edges.max()}")
+    # print(f"Num nodes from features: {node_features.size(0)}")
+
+    print(f"\nFinal shapes for DyGFormer:")
+    print(f"  node_raw_features shape: {node_raw_features.shape}")
+    print(f"  edge_raw_features shape: {edge_raw_features.shape}")
+    print(f"  edges_array shape: {edges.shape}")
+
+    edges = torch.from_numpy(edges).long()
+    timestamps = torch.from_numpy(timestamps).float()
+    node_features = torch.from_numpy(node_raw_features).float()
+    edge_features = torch.from_numpy(edge_raw_features).float()
+    
     return {
         "edges": edges,
-        "timestamps": timestamps.float(),
-        "edge_feature": edge_features,
-        "num_nodes": num_nodes
+        "timestamps": timestamps,
+        "node_features": node_features,
+        "edge_features": edge_features,
+        "num_nodes": num_nodes,
+        "num_edges": len(src),
     }
 
 

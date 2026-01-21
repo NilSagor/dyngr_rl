@@ -21,7 +21,8 @@ class TemporalDataset(Dataset):
         num_nodes: int = None,
         max_neighbors: int = 10,
         split: str = 'train',
-        negative_sampling_ratio: float = 1.0
+        negative_sampling_ratio: float = 1.0,
+        device: str = "cpu" # device fixed
     ):
         """Initialize temporal dataset.
         
@@ -36,15 +37,17 @@ class TemporalDataset(Dataset):
         """
         super().__init__()
         
-        self.edges = edges
+        self.edges = edges.to(device)
         print("Edges shape:", self.edges.shape)
         # assert self.edges.shape[1] == 2, f"Expected 2 columns for edges, got {self.edges.shape[1]}"
-        self.timestamps = timestamps
+        self.timestamps = timestamps.to(device)
         print("Timestamps shape:", self.timestamps.shape)
-        self.edge_features = edge_features        
+        self.edge_features = edge_features.to(device) if edge_features is not None else None        
         self.max_neighbors = max_neighbors
         self.split = split
         self.negative_sampling_ratio = negative_sampling_ratio
+        self.device = device # store device
+
         
         # Infer number of nodes if not provided
         if num_nodes is None:
@@ -62,7 +65,7 @@ class TemporalDataset(Dataset):
         
     def _build_adjacency_list(self):
         """Build adjacency list for efficient neighborhood sampling."""
-        self.adj_list = {i: [] for i in range(self.num_nodes)}
+        self.adj_list = {i: [] for i in range(self.num_nodes+1)}
         
         for idx, (src, dst) in enumerate(self.edges):
             timestamp = self.timestamps[idx].item()
@@ -131,12 +134,12 @@ class TemporalDataset(Dataset):
             timestamp = self.timestamps[idx].item()
             
             # Random source node
-            src_node = torch.randint(0, self.num_nodes, (1,)).item()
+            src_node = torch.randint(1, self.num_nodes+1, (1,), device=self.device).item()
             
             # Random destination node (ensure it's not the same as source)
             dst_node = src_node
             while dst_node == src_node:
-                dst_node = torch.randint(0, self.num_nodes, (1,)).item()
+                dst_node = torch.randint(1, self.num_nodes+1, (1,), device=self.device).item()
                 
             negative_samples.append((src_node, dst_node, timestamp))
             
@@ -166,26 +169,26 @@ class TemporalDataset(Dataset):
         
         if len(valid_neighbors) == 0:
             # No valid neighbors, return padding
-            neighbors = torch.zeros(max_neighbors, dtype=torch.long)
-            neighbor_times = torch.zeros(max_neighbors, dtype=torch.float32)
+            neighbors = torch.zeros(max_neighbors, dtype=torch.long, device=self.device)
+            neighbor_times = torch.zeros(max_neighbors, dtype=torch.float32, device=self.device)
         else:
             # Take most recent neighbors
             valid_neighbors = valid_neighbors[-max_neighbors:]
             neighbor_ids, neighbor_timestamps = zip(*valid_neighbors)
             
-            neighbors = torch.tensor(neighbor_ids, dtype=torch.long)
-            neighbor_times = torch.tensor(neighbor_timestamps, dtype=torch.float32)
+            neighbors = torch.tensor(neighbor_ids, dtype=torch.long, device=self.device)
+            neighbor_times = torch.tensor(neighbor_timestamps, dtype=torch.float32, device=self.device)
             
             # Pad if necessary
             if len(neighbors) < max_neighbors:
                 padding_size = max_neighbors - len(neighbors)
                 neighbors = torch.cat([
                     neighbors,
-                    torch.zeros(padding_size, dtype=torch.long)
+                    torch.zeros(padding_size, dtype=torch.long, device=self.device)
                 ])
                 neighbor_times = torch.cat([
                     neighbor_times,
-                    torch.zeros(padding_size, dtype=torch.float32)
+                    torch.zeros(padding_size, dtype=torch.float32, device=self.device)
                 ])
                 
         return neighbors, neighbor_times
@@ -211,10 +214,10 @@ class TemporalDataset(Dataset):
         )
         
         return {
-            'src_node': torch.tensor(sample['src_node'], dtype=torch.long),
-            'dst_node': torch.tensor(sample['dst_node'], dtype=torch.long),
-            'timestamp': torch.tensor(sample['timestamp'], dtype=torch.float32),
-            'label': torch.tensor(sample['label'], dtype=torch.float32),
+            'src_node': torch.tensor(sample['src_node'], dtype=torch.long, device=self.device),
+            'dst_node': torch.tensor(sample['dst_node'], dtype=torch.long, device=self.device),
+            'timestamp': torch.tensor(sample['timestamp'], dtype=torch.float32, device=self.device),
+            'label': torch.tensor(sample['label'], dtype=torch.float32, device=self.device),
             'src_neighbors': src_neighbors,
             'dst_neighbors': dst_neighbors,
             'src_neighbor_times': src_neighbor_times,
@@ -241,9 +244,11 @@ class TemporalDataset(Dataset):
         # Handle optional edge features
         edge_features = [item['edge_feature'] for item in batch]
         if any(ef is not None for ef in edge_features):
+            # Get feature dimension
+            feat_dim = next(ef.shape[0] for ef in edge_features if ef is not None)
             # Stack edge features if they exist
             batch_dict['edge_features'] = torch.stack([
-                ef if ef is not None else torch.zeros(1)
+                ef if ef is not None else torch.zeros(feat_dim, device=self.device)
                 for ef in edge_features
             ])
             
