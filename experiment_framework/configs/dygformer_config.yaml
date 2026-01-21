@@ -8,7 +8,7 @@ model:
   hidden_dim: 176
   time_encoding_dim: 32
   num_layers: 2
-  num_heads: 4
+  num_heads: 4 # 1, 2, 4, 8
   dropout: 0.1
   max_neighbors: 20
   neighbor_co_occurrence: true
@@ -24,8 +24,8 @@ training:
   
 # Data parameters
 data:
-  dataset: "wikipedia"
-  evaluation_type: transductive
+  dataset: "reddit"
+  evaluation_type: inductive
   negative_sampling_strategy: "historical"
   train_ratio: 0.7
   val_ratio: 0.15
