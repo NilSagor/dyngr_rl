@@ -212,18 +212,25 @@ class DyGFormer(BaseDynamicGNN):
                     padded_sequences['neighbor_ids'][i, 1:seq_length] = valid_neighbors[:seq_length-1]
                     
                     # Calculate time differences
-                    time_diffs = node_interact_times[i] - valid_times[:seq_length-1]
+                    time_diffs = node_interact_times[i] - valid_times[:seq_length-1] # shape: [num_neighbors]
+
+                    time_encoded = self.time_encoder(time_diffs) # add feature dim: [num_neighbors, time_dim]
                     
                     # Get time features
-                    padded_sequences['time_features'][i, 1:seq_length] = self.time_encoder(
-                        time_diffs.unsqueeze(1)
-                    ).squeeze(1)
-            
+                    # padded_sequences['time_features'][i, 1:seq_length] = self.time_encoder(
+                    #     time_diffs.unsqueeze(-1)
+                    # ).squeeze(1)
+                    padded_sequences['time_features'][i, 1:seq_length] = time_encoded
+                    # padded_sequences['time_features'][i, 1:seq_length] = self.time_encoder(time_diffs.unsqueeze(1)).squeeze(-1)
             # Set the node itself
             padded_sequences['neighbor_ids'][i, 0] = node_ids[i]
             padded_sequences['time_features'][i, 0] = self.time_encoder(
                 torch.zeros(1, device=device)
             ).squeeze(0)
+            
+            # Get edge features for the sequence
+            # edge_ids_in_sequence = padded_sequences['edge_ids'][i, :seq_length]
+            # padded_sequences['edge_features'][i, :seq_length] = self.edge_raw_features[edge_ids_in_sequence]
 
             # FIX: Handle potential invalid indices (skip padding node 0)
             node_ids_in_sequence = padded_sequences['neighbor_ids'][i, :seq_length]
@@ -346,6 +353,11 @@ class DyGFormer(BaseDynamicGNN):
     def _compute_loss(self, batch):
         logits = self.forward(batch)
         labels = batch['labels'].float()
+        # DEBUG: Check label distribution
+        print(f"DEBUG: Labels - mean={labels.mean():.3f}, min={labels.min()}, max={labels.max()}")
+        # Should be ~0.5 if balanced
+        # If labels.mean() is 0.0 or 1.0, your negative sampling is broken.
+
         return self.loss_fn(logits, labels)
 
     def _compute_metrics(self, batch):

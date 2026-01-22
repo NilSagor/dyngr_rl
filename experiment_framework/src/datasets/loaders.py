@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from loguru import logger
 
 from .temporal_dataset import TemporalDataset
+from .load_dataset import load_generic_dataset
 from .load_dataset import (
     load_wikipedia,
     load_reddit,
@@ -43,17 +44,24 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     data_config = config['data']
     training_config = config['training']
     hardware_config = config['hardware']
-    
+    model_name = config['model']['name']
+
+    # Load with model-specific formatting
+    if model_name in ['TGN', 'JODIE']:
+        data = load_generic_dataset(dataset_name, model_type="tgn")
+    else:  # DyGFormer, TAWRMAC
+        data = load_generic_dataset(dataset_name, model_type="dygformer")
+
     if dataset_name not in DATASET_LOADERS:
         raise ValueError(f"Unknown dataset: {dataset_name}. "
                         f"Available datasets: {list(DATASET_LOADERS.keys())}")
     
     # Load dataset
     logger.info(f"Loading {dataset_name} dataset...")
-    loader_func = DATASET_LOADERS[dataset_name]
+    # loader_func = DATASET_LOADERS[dataset_name]
     
-    # Load raw data
-    data = loader_func()
+    # # Load raw data
+    # data = loader_func()
     
     # Extract components
     edges = data['edges']  # [num_edges, 2]
@@ -94,6 +102,7 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
         split='train',
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
         device= device
     )
     
@@ -103,6 +112,7 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         edge_features=splits.get('val_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
         split='val',
         device = device
     )
@@ -113,6 +123,7 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
         edge_features=splits.get('test_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
         split='test',
         device = device
     )

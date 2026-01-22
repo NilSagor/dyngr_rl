@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import lightning as L
 from abc import ABC, abstractmethod
-from torch_geometric.data import Data
+# from torch_geometric.data import Data
 
 
 class BaseDynamicGNN(L.LightningModule, ABC):
@@ -99,6 +99,40 @@ class TimeEncoder(nn.Module):
         args = timestamps*self.freqs.unsqueeze(0) # [batch_size, time_dim//2]
         time_enc = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return time_enc #[batch_size, time_dim]
+    
+
+
+# base_model.py
+# class TimeEncoder(nn.Module):
+#     def __init__(self, time_dim, method="sinusoidal"):  # Add method parameter
+#         super().__init__()
+#         self.time_dim = time_dim
+#         self.method = method
+        
+#         if method == "sinusoidal":
+#             # Your original implementation
+#             freqs = torch.exp(
+#                 torch.linspace(0, 1, time_dim//2) * torch.log(torch.tensor(10000.0))
+#             )
+#             self.register_buffer('freqs', freqs)
+            
+#         elif method == "learnable":
+#             # TGN-style learnable encoding
+#             self.w = nn.Linear(1, time_dim)
+#             self.w.weight = nn.Parameter(
+#                 (1 / 10 ** np.linspace(0, 9, time_dim)).float().reshape(time_dim, -1)
+#             )
+#             self.w.bias = nn.Parameter(torch.zeros(time_dim).float())
+#         else:
+#             raise ValueError(f"Unknown time encoding method: {method}")
+
+#     def forward(self, timestamps):
+#         if self.method == "sinusoidal":
+#             timestamps = timestamps.unsqueeze(-1)
+#             args = timestamps * self.freqs.unsqueeze(0)
+#             return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+#         else:  # learnable
+#             return torch.cos(self.w(timestamps.unsqueeze(-1)))
 
 class MemoryModule(nn.Module):
     def __init__(self, num_nodes, memory_dim, message_dim, time_encoding_dim):

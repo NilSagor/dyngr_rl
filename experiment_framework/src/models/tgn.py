@@ -440,3 +440,23 @@ class LinkPredictor(nn.Module):
         link_input = torch.cat([src_embeddings, dst_embeddings], dim=-1)
         
         return self.mlp(link_input).squeeze(-1)
+    
+
+class LinkPredictor(nn.Module):
+    """Link prediction head."""
+    def __init__(self, hidden_dim, dropout):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, src_embeddings, dst_embeddings):
+        combined = torch.cat([src_embeddings, dst_embeddings], dim=-1)
+        logits = self.mlp(combined).squeeze(-1)
+        return logits

@@ -4,7 +4,7 @@
 model:
   name: "DyGFormer"
   num_nodes: null  # Will be set based on dataset
-  node_features: 0  # Use learned embeddings
+  node_features: 172  # wikipedia had 172 D features, if not, use 0 Use learned embeddings
   hidden_dim: 176
   time_encoding_dim: 32
   num_layers: 2
@@ -28,8 +28,9 @@ training:
 # Data parameters
 data:
   dataset: "wikipedia"
-  evaluation_type: inductive
-  negative_sampling_strategy: "inductive" # random, historical, inductive
+  # overriden 
+  # evaluation_type: random # change to "inductive" for inductive 
+  # negative_sampling_strategy: "transductive" # random, historical/inductive
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
@@ -37,8 +38,8 @@ data:
   
 # Experiment parameters
 experiment:
-  name: "dygformer_experiment"
-  description: "DyGFormer transformer experiment"
+  # name: "dygformer_${data.evaluation_type}_${data.negative_sampling_strategy}"
+  # description: "DyGFormer on Wikipedia |${data.evaluation_type}|${data.negative_sampling_strategy}"
   seed: 42
   device: "auto"
   precision: 32
@@ -47,8 +48,8 @@ experiment:
   
 # Logging
 logging:
-  log_dir: "./logs"
-  checkpoint_dir: "./checkpoints"
+  # log_dir: "./logs/${experiment.name}"
+  # checkpoint_dir: "./checkpoints/${experiment.name}"
   save_top_k: 3
   monitor: "val_loss"
   mode: "min"

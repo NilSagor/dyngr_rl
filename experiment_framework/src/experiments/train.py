@@ -11,20 +11,21 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-
+import string
 
 import argparse
 import yaml 
 import torch 
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from loguru import logger
 
 from src.models.dygformer import DyGFormer
-from src.models.tgn import TGN
+# from src.models.tgn import TGN
 from src.utils.general_utils import set_seed, get_device
 from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
+
 
 
 # MODEL_REGISTRY={
@@ -35,7 +36,7 @@ from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
 MODEL_REGISTRY={
     "DyGFormer": DyGFormer,
-    "TGN": TGN,    
+    # "TGN": TGN,    
 }
 
 def load_config(config_path):
@@ -87,7 +88,16 @@ def setup_trainer(config: dict):
     )
     callbacks.append(early_stop_callback)
     
+    # learning rate monitoring
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    callbacks.append(lr_monitor)
+
     # Logger
+    csv_logger = CSVLogger(
+        save_dir=config['logging']['log_dir'],
+        name=config['experiment']['name']
+    )
+    
     logger_type = config.get('logger', 'tensorboard')
     if logger_type == 'tensorboard':
         logger_inst = TensorBoardLogger(
@@ -112,7 +122,7 @@ def setup_trainer(config: dict):
         accelerator=accelerator,
         devices=devices,
         callbacks=callbacks,
-        logger=logger_inst,
+        logger=[logger_inst, csv_logger],
         precision=config['experiment']['precision'],
         gradient_clip_val=config['training']['gradient_clip_val'],
         log_every_n_steps=10,
@@ -123,7 +133,38 @@ def setup_trainer(config: dict):
     return trainer
 
 
+def resolve_config(config, context=None):
+    """Resovle ${key.subkey} placeholder in config"""
+    if context is None:
+        context = config
 
+    def replace_value(value):
+        if isinstance(value, str):
+            try:
+                template = string.Template(value)
+                return template.substitute(flatten_dict(context))
+            except (KeyError, ValueError):
+                return value
+        return value
+
+    def flatten_dict(d, parent_key='', sep='.'):
+        items = []
+        for k,v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, new_key, sep=sep).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
+
+    def recurse(obj):
+        if isinstance(obj, dict):
+            return {k:recurse(replace_value(v)) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [recurse(item) for item in obj]
+        else:
+            return replace_value(obj)
+    return recurse(config)
 
 
 def train_model(config: dict):
@@ -154,15 +195,26 @@ def train_model(config: dict):
     
     # Initialize model
     model = setup_model(config, num_nodes)
-    # FIX: Load and set raw features
+    # Set raw features for models that need them
+    
     dataset_name = config['data']['dataset']
     if dataset_name in DATASET_LOADERS:
         data = DATASET_LOADERS[dataset_name]()
         node_features = data.get('node_features', torch.zeros(num_nodes, 172))
         edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
-        model.set_raw_features(node_features, edge_features)
-        logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
+        # model.set_raw_features(node_features, edge_features)
+        
+        # FIX: Load and set raw features
+        if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
+            model.set_raw_features(
+                node_features,
+                edge_features
+            )
+        elif config['model']['name'] == 'TGN':
+            # TGN uses edge features directly in message passing
+            model.edge_features = edge_features
     
+        logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
     logger.info(f"Model: {model.__class__.__name__}")
     logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -196,6 +248,18 @@ def train_model(config: dict):
     logger.info(f"Saved final model to: {final_model_path}")
 
 
+
+
+# # In main(), after loading config and applying overrides
+# eval_type = config['data'].get('evaluation_type', 'transductive')
+# neg_sample = config['data'].get('negative_sampling_strategy', 'random')
+
+# # Update experiment name and logging paths
+# config['experiment']['name'] = f"dygformer_{eval_type}_{neg_sample}"
+# config['experiment']['description'] = f"DyGFormer on Wikipedia | {eval_type} | {neg_sample}"
+# config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
+# config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -221,6 +285,8 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.configs)
+    # multiple combination experiment
+    config = resolve_config(config)
 
     if args.override:
         for override in args.override:
@@ -236,6 +302,16 @@ def main():
                 current[keys[-1]] = ast.literal_eval(value)
             except:
                 current[keys[-1]] = value
+
+    eval_type = config['data'].get('evaluation_type', 'transductive')
+    neg_sample = config['data'].get('negative_sampling_strategy', 'random')
+
+     # Update dynamic fields
+    config['experiment']['name'] = f"dygformer_{eval_type}_{neg_sample}"
+    config['experiment']['description'] = f"DyGFormer on Wikipedia | {eval_type} | {neg_sample}"
+    config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
+    config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
+    
     # Create directories
     os.makedirs(config['logging']['log_dir'], exist_ok=True)
     os.makedirs(config['logging']['checkpoint_dir'], exist_ok=True)
