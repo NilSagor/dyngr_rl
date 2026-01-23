@@ -11,11 +11,15 @@
 - **Config File**: `configs/dygformer_config.yaml`
 - **GPU**: RTX 4060ti 16g
 ### Results
-| Metric      | Our Result | Paper Result | Gap |Evaluation Type|
-|-------------|---------|---------|---------------|----|
-| Test Accuracy | 0.9265 |0.86|-+0.0665|Inductive|
-| Test AP       | 0.5079 |**0.86-0.99**|**-0.35-0.48**|inductive|
-| Test Loss     | 0.2087 |-|-|-|
+|Model Name|Dataset  |EvaluationType|Sampling Strategy|Test AP|TEST AUC|Test Acc|Test Loss|Notes  |
+|----------|-------  |----------    |---------        |-------|----    |--------|---------|---    |
+| DyGFormer|Wikipedia|inductive     |inductive        |0.5079 |Nan     |0.9266  |0.2191   |-0.3521| 
+|          |         |              |Historical       |0.5079 |Nan     |0.9279  |0.2192   |       |   
+|          |         |              |Random           |0.9811 |0.9717  |0.9239  | 0.2148  |       |
+|          |         |Transductive  |inductive        |0.9801 |0.9707  |0.9260  |0.2185   |       |
+|          |         |              |Historical       |0.5079 |Nan     |0.9267  |0.2192   |       |
+|          |         |              |Random           |0.5079 |Nan     |0.9267  | 0.2192  |       |
+
 
 ### Analysis
 - **AP is critically low** (0.507 vs expected: 0.86+ based on literature), confirming **H9: Negative Sampling Bias**

@@ -182,11 +182,19 @@ class TemporalDataset(Dataset):
         """Generate one negative sample for a given positive edge"""
         if self.negative_sampling_strategy == "random":
             # Sample random nodes that aren't the positive edge
-            while True:
+            attempts = 0
+            max_attempts = 100
+            while attempts < max_attempts:
                 src = torch.randint(1, self.num_nodes + 1, (1,)).item()
                 dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
                 if src != dst and (src, dst) not in self.positive_edge_set:
                     return src, dst, pos_timestamp
+            # Fallback to simple random if can't find valid pair
+            src = torch.randint(1, self.num_nodes + 1, (1,)).item()
+            dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+            while src == dst:
+                dst = torch.randint(1, self.num_nodes+1, (1,)).item()
+            return src, dst, pos_timestamp
                     
         elif self.negative_sampling_strategy == "historical":
             # Sample from historical edges before pos_timestamp
@@ -196,7 +204,8 @@ class TemporalDataset(Dataset):
                 rand_idx = valid_indices[torch.randint(0, len(valid_indices), (1,))].item()
                 return self.edges[rand_idx, 0].item(), self.edges[rand_idx, 1].item(), pos_timestamp
             else:
-                return self._generate_single_negative(pos_src, pos_dst, pos_timestamp)  # fallback
+                # No historical edges to fallback to random sampling
+                return self._generate_single_negative_random(pos_src, pos_dst, pos_timestamp)  # fallback
                 
         else:  # inductive
             # For inductive, use future timestamp approximation
@@ -207,6 +216,24 @@ class TemporalDataset(Dataset):
                 dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
             return src, dst, future_timestamp
 
+    def _generate_single_negative_random(self, pos_src, pos_dst, pos_timestamp):
+        """Helper method for random negative sampling without recursion"""
+        attempts = 0
+        max_attempts = 100
+        while attempts < max_attempts:
+            src = torch.randint(1, self.num_nodes + 1, (1,)).item()
+            dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+            if src != dst and (src, dst) not in self.positive_edge_set:
+                return src, dst, pos_timestamp
+            attempts += 1
+        
+        # Final fallback
+        src = torch.randint(1, self.num_nodes + 1, (1,)).item()
+        dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+        while src == dst:
+            dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+        return src, dst, pos_timestamp
+    
     def _generate_random_negatives(self, num_negative: int):
         """Sample from all possible edges not in positive set"""
         negatives = []
@@ -228,23 +255,41 @@ class TemporalDataset(Dataset):
     def _generate_historical_negatives(self, num_negative: int) -> List[Tuple[int, int, float]]:
         """Sample from past positive edges not in current batch."""
         negatives = []
+        
+        # Get all possible node pairs that appeared historically
+        historical_nodes = torch.unique(self.edges.flatten())
+        historical_edges_set = set(map(tuple, self.edges.tolist()))
+
         # Get all historical edges before current time window
-        for _ in range(num_negative):
-            # Sample a random timestamp from training period
-            timestamp = torch.rand(1, device=self.device).item() * self.timestamps.max().item()
+        attempts = 0
+        while len(negatives) < num_negative and attempts < num_negative*10:
+            # Sample two historical nodes
+            # Sample two historical nodes
+            src = historical_nodes[torch.randint(0, len(historical_nodes), (1,))].item()
+            dst = historical_nodes[torch.randint(0, len(historical_nodes), (1,))].item()
             
-            # Find edges before this timestamp
-            valid_mask = self.timestamps < timestamp
-            if valid_mask.sum() == 0:
-                # Fallback to random if no historical edges
-                return self._generate_random_negatives(num_negative)
+            if src != dst and (src, dst) not in historical_edges_set:
+                # Sample timestamp from historical period
+                timestamp = self.timestamps[torch.randint(0, len(self.timestamps), (1,))].item()
+                negatives.append((src, dst, timestamp))
                 
-            valid_indices = torch.where(valid_mask)[0]
-            pos_idx = valid_indices[torch.randint(0, len(valid_indices), (1,)).item()]
+            attempts += 1
+        # for _ in range(num_negative):
+        #     # Sample a random timestamp from training period
+        #     timestamp = torch.rand(1, device=self.device).item() * self.timestamps.max().item()
             
-            src_node = self.edges[pos_idx, 0].item()
-            dst_node = self.edges[pos_idx, 1].item()
-            negatives.append((src_node, dst_node, timestamp))
+        #     # Find edges before this timestamp
+        #     valid_mask = self.timestamps < timestamp
+        #     if valid_mask.sum() == 0:
+        #         # Fallback to random if no historical edges
+        #         return self._generate_random_negatives(num_negative)
+                
+        #     valid_indices = torch.where(valid_mask)[0]
+        #     pos_idx = valid_indices[torch.randint(0, len(valid_indices), (1,)).item()]
+            
+        #     src_node = self.edges[pos_idx, 0].item()
+        #     dst_node = self.edges[pos_idx, 1].item()
+        #     negatives.append((src_node, dst_node, timestamp))
         return negatives
 
     

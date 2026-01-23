@@ -354,7 +354,7 @@ class DyGFormer(BaseDynamicGNN):
         logits = self.forward(batch)
         labels = batch['labels'].float()
         # DEBUG: Check label distribution
-        print(f"DEBUG: Labels - mean={labels.mean():.3f}, min={labels.min()}, max={labels.max()}")
+        # print(f"DEBUG: Labels - mean={labels.mean():.3f}, min={labels.min()}, max={labels.max()}")
         # Should be ~0.5 if balanced
         # If labels.mean() is 0.0 or 1.0, your negative sampling is broken.
 
