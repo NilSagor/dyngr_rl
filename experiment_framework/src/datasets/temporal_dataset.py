@@ -85,45 +85,7 @@ class TemporalDataset(Dataset):
         for node in self.adj_list:
             self.adj_list[node].sort(key=lambda x: x[1])
             
-    # def _prepare_samples(self):
-    #     """Prepare positive and negative samples."""
-        
-    #     # Positive samples
-    #     self.positive_samples = list(range(self.num_edges))
-        
-    #     # Generate negative samples
-    #     num_negative = int(self.num_edges * self.negative_sampling_ratio)
-    #     self.negative_samples = self._generate_negative_samples(num_negative)
-        
-    #     # Combine positive and negative samples
-    #     self.samples = []
-        
-    #     # Add positive samples
-    #     for idx in self.positive_samples:
-    #         self.samples.append({
-    #             'idx': idx,
-    #             'label': 1.0,
-    #             'src_node': self.edges[idx, 0].item(),
-    #             'dst_node': self.edges[idx, 1].item(),
-    #             'timestamp': self.timestamps[idx].item(),
-    #             'edge_feature': self.edge_features[idx] if self.edge_features is not None else None
-    #         })
-            
-    #     # Add negative samples
-    #     for src_node, dst_node, timestamp in self.negative_samples:
-    #         self.samples.append({
-    #             'idx': -1,  # Negative samples don't have original indices
-    #             'label': 0.0,
-    #             'src_node': src_node,
-    #             'dst_node': dst_node,
-    #             'timestamp': timestamp,
-    #             'edge_feature': None
-    #         })
-            
-    #     # Shuffle samples for training
-    #     if self.split == 'train':
-    #         indices = torch.randperm(len(self.samples))
-    #         self.samples = [self.samples[i] for i in indices]
+    
     def _prepare_samples(self):
         """Prepare positive and negative samples."""
         self.samples = []
@@ -142,11 +104,25 @@ class TemporalDataset(Dataset):
             
             # Add ONE negative sample per positive sample (for evaluation)
             if self.split != 'train':
-                neg_src, neg_dst, neg_ts = self._generate_single_negative(
-                    self.edges[idx, 0].item(), 
-                    self.edges[idx, 1].item(), 
-                    self.timestamps[idx].item()
-                )
+                if self.negative_sampling_strategy == "historical":
+                    neg_src, neg_dst, neg_ts = self._generate_single_historical_negative(
+                        self.edges[idx, 0].item(), 
+                        self.edges[idx, 1].item(), 
+                        self.timestamps[idx].item()
+                    )
+                elif self.negative_sampling_strategy == "inductive":
+                    neg_src, neg_dst, neg_ts = self._generate_single_inductive_negative(
+                        self.edges[idx, 0].item(), 
+                        self.edges[idx, 1].item(), 
+                        self.timestamps[idx].item()
+                    )
+                else:
+                    neg_src, neg_dst, neg_ts = self._generate_single_negative_random(
+                        self.edges[idx, 0].item(), 
+                        self.edges[idx, 1].item(), 
+                        self.timestamps[idx].item()
+                    )
+
                 self.samples.append({
                     'idx': -1,
                     'label': 0.0,
@@ -158,9 +134,21 @@ class TemporalDataset(Dataset):
                 })
         
         # For training: use negative_sampling_ratio
-        if self.split == 'train':
-            num_negative = int(self.num_edges * self.negative_sampling_ratio)
+        # if self.split == 'train':
+        #     num_negative = int(self.num_edges * self.negative_sampling_ratio)
+            
+        #     if self.negative_sampling_strategy == "historical":
+        #         negative_samples = self._generate_historical_negatives(num_negative)
+        #     elif self.negative_sampling_strategy == "inductive":
+        #         negative_samples = self._generate_inductive_negatives(num_negative)
+        #     else:  # random
+        #         negative_samples = self._generate_random_negatives(num_negative)
+            
+        if self.split == "train":
+            num_negative = int(self.num_edges*self.negative_sampling_ratio)
             negative_samples = self._generate_random_negatives(num_negative)
+
+            # negative_samples = self._generate_random_negatives(num_negative)
             for src_node, dst_node, timestamp in negative_samples:
                 self.samples.append({
                     'idx': -1,
@@ -177,7 +165,33 @@ class TemporalDataset(Dataset):
             indices = torch.randperm(len(self.samples))
             self.samples = [self.samples[i] for i in indices]
             
-    
+    def _generate_single_historical_negative(self, pos_src, pos_dst, pos_timestamp):
+        """Generate historical negative: (pos_src, w, pos_timestamp) where w is a past neighbor of pos_src ≠ pos_dst"""
+        # Get all neighbors of pos_src BEFORE pos_timestamp
+        mask = (self.edges[:, 0] == pos_src) & (self.timestamps < pos_timestamp)
+        candidate_dsts = self.edges[mask, 1]
+        
+        # Filter out the positive destination
+        valid_candidates = candidate_dsts[candidate_dsts != pos_dst]
+        
+        if len(valid_candidates) > 0:
+            neg_dst = valid_candidates[torch.randint(0, len(valid_candidates), (1,))].item()
+            return pos_src, neg_dst, pos_timestamp
+        
+        # Fallback to random if no historical neighbors
+        return self._generate_single_negative_random(pos_src, pos_dst, pos_timestamp)
+
+    def _generate_single_inductive_negative(self, pos_src, pos_dst, pos_timestamp):
+        """Generate inductive negative: sample from future nodes"""
+        # For true inductive, you'd need unseen nodes, but simple approximation:
+        future_mask = self.timestamps > pos_timestamp
+        if future_mask.sum() > 0:
+            future_indices = torch.where(future_mask)[0]
+            rand_idx = future_indices[torch.randint(0, len(future_indices), (1,))].item()
+            return self.edges[rand_idx, 0].item(), self.edges[rand_idx, 1].item(), pos_timestamp
+        else:
+            return self._generate_single_negative_random(pos_src, pos_dst, pos_timestamp)
+
     def _generate_single_negative(self, pos_src, pos_dst, pos_timestamp):
         """Generate one negative sample for a given positive edge"""
         if self.negative_sampling_strategy == "random":
@@ -252,47 +266,39 @@ class TemporalDataset(Dataset):
         # Pre-compute positive edge set in __init__
         return (src, dst) in self.positive_edge_set or (dst, src) in self.positive_edge_set
 
-    def _generate_historical_negatives(self, num_negative: int) -> List[Tuple[int, int, float]]:
-        """Sample from past positive edges not in current batch."""
-        negatives = []
+    # def _generate_historical_negatives(self, num_negative: int) -> List[Tuple[int, int, float]]:
+    #     """
+    #     Generate truly historical negatives:
+    #     - Sample edges from the FUTURE part of the timeline (last 30%)
+    #     - Assign them PAST timestamps (first 70%)
+    #     - At that past time, the edge truly didn't exist
+    #     """
+    #     negatives = []
         
-        # Get all possible node pairs that appeared historically
-        historical_nodes = torch.unique(self.edges.flatten())
-        historical_edges_set = set(map(tuple, self.edges.tolist()))
-
-        # Get all historical edges before current time window
-        attempts = 0
-        while len(negatives) < num_negative and attempts < num_negative*10:
-            # Sample two historical nodes
-            # Sample two historical nodes
-            src = historical_nodes[torch.randint(0, len(historical_nodes), (1,))].item()
-            dst = historical_nodes[torch.randint(0, len(historical_nodes), (1,))].item()
+    #     # Split timeline: first 70% = "past", last 30% = "future edges"
+    #     split_idx = int(len(self.edges) * 0.7)
+    #     if split_idx >= len(self.edges):
+    #         return self._generate_random_negatives(num_negative)  # Fallback
+        
+    #     # Pre-compute future edges for speed
+    #     future_edges = self.edges[split_idx:]
+    #     future_timestamps = self.timestamps[split_idx:]
+        
+    #     for _ in range(num_negative):
+    #         # Sample edge from future
+    #         idx = torch.randint(0, len(future_edges), (1,)).item()
+    #         src = future_edges[idx, 0].item()
+    #         dst = future_edges[idx, 1].item()
             
-            if src != dst and (src, dst) not in historical_edges_set:
-                # Sample timestamp from historical period
-                timestamp = self.timestamps[torch.randint(0, len(self.timestamps), (1,))].item()
-                negatives.append((src, dst, timestamp))
-                
-            attempts += 1
-        # for _ in range(num_negative):
-        #     # Sample a random timestamp from training period
-        #     timestamp = torch.rand(1, device=self.device).item() * self.timestamps.max().item()
+    #         # Sample timestamp from past (before this edge existed)
+    #         past_idx = torch.randint(0, split_idx, (1,)).item()
+    #         past_timestamp = self.timestamps[past_idx].item()
             
-        #     # Find edges before this timestamp
-        #     valid_mask = self.timestamps < timestamp
-        #     if valid_mask.sum() == 0:
-        #         # Fallback to random if no historical edges
-        #         return self._generate_random_negatives(num_negative)
-                
-        #     valid_indices = torch.where(valid_mask)[0]
-        #     pos_idx = valid_indices[torch.randint(0, len(valid_indices), (1,)).item()]
-            
-        #     src_node = self.edges[pos_idx, 0].item()
-        #     dst_node = self.edges[pos_idx, 1].item()
-        #     negatives.append((src_node, dst_node, timestamp))
-        return negatives
-
+    #         negatives.append((src, dst, past_timestamp))
+        
+    #     return negatives
     
+            
     def _generate_inductive_negatives(self, num_negative:int)->List[Tuple[int, int, float]]:
         """Sample from future test edges (for inductive setting)."""
         negatives = []

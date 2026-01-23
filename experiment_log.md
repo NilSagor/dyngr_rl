@@ -5,39 +5,39 @@
 ### Configuration
 - **Model**: DyGFormer
 - **Dataset**: Wikipedia (ml_wikipedia)
-- **Negative Sampling**: historical
-- **Evaluation Type**: transductive
+- **Negative Sampling**: random/historical/inductive
+- **Evaluation Type**: transductive/inductive
 - **Seed**: 42
 - **Config File**: `configs/dygformer_config.yaml`
 - **GPU**: RTX 4060ti 16g
 ### Results
 |Model Name|Dataset  |EvaluationType|Sampling Strategy|Test AP|TEST AUC|Test Acc|Test Loss|Notes  |
 |----------|-------  |----------    |---------        |-------|----    |--------|---------|---    |
-| DyGFormer|Wikipedia|inductive     |inductive        |0.5079 |Nan     |0.9266  |0.2191   |-0.3521| 
-|          |         |              |Historical       |0.5079 |Nan     |0.9279  |0.2192   |       |   
-|          |         |              |Random           |0.9811 |0.9717  |0.9239  | 0.2148  |       |
-|          |         |Transductive  |inductive        |0.9801 |0.9707  |0.9260  |0.2185   |       |
-|          |         |              |Historical       |0.5079 |Nan     |0.9267  |0.2192   |       |
-|          |         |              |Random           |0.5079 |Nan     |0.9267  | 0.2192  |       |
+|          |         |              |Random           |0.9811 |0.9711  |0.9239  |0.2147   |       |
+|          |         |              |Historical       |0.4794 |0.4376  |0.4276  |5.0051   |       |   
+| DyGFormer|Wikipedia|Inductive     |inductive        |0.9801 |0.9706  |0.9260  |0.2285   |       | 
+|          |         |              |Random           |0.9811 |0.9711  |0.9239  |0.2147   |       |
+|          |         |              |Historical       |0.4794 |0.4376  |0.4276  |5.0051   |       |
+|          |         |Transductive  |inductive        |0.9801 |0.9706  |0.9260  |0.2285   |       |
 
 
 ### Analysis
-- **AP is critically low** (0.507 vs expected: 0.86+ based on literature), confirming **H9: Negative Sampling Bias**
-- High accuracy (0.9265) is misleading due  to **class imbalance artifact** (few positive edges)
-- **AUC = nan** because test batches contain **only one class** → negative sampling issue 
-- Possible issues:
-  - **Root cause**: Negative sampling generates **too-easy negatives** or **incorrect temporal masking**
-  - Negative sampling not aligned with DyGLib protocol
-  - Missing edge features (Wikipedia has 172-D edge features!)
-  - Incorrect temporal split
+- Extreme Performance Disparity by Sampling Strategy
+  Random NSS: AP ≈ 0.98 (near-perfect)
+  Historical NSS: AP ≈ 0.48 (worse than random)
+  50-point AP gap confirms that negative sampling strategy dramatically impacts model rankings
+- Evaluation Type Independence
+  Both transductive and inductive settings show identical patterns
+- Historical NSS Failure Mode
+  AP = 0.48 < 0.5 means the model performs worse than random guessing
+  High loss (5.0) indicates severe optimization instability
 
 ### Action Items
 - [x] **Confirmed data loading works** (no crashes, correct shapes)
 - [ ] **Fix negative sampling** to match DyGLib protocol:
   - Historical: sample from past positive edges not in current batch
-  - Inductive: sample from future test edges
-- [ ] **Implement proper edge feature integration** in DyGFormer
-- [ ] **Run transductive baseline** (all nodes seen in training)
+- [ ] **TGN Baseline Implementation**
+- [ ] **TAWRMAC 2025 Baseline Implementation**
 - [ ] **Implement TGN baseline** for H1 testing
 
 <!-- ### Links to Hypotheses

@@ -12,7 +12,8 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 import string
-
+import csv
+from datetime import datetime
 import argparse
 import yaml 
 import torch 
@@ -187,6 +188,18 @@ def train_model(config: dict):
         negative_sampling_strategy=config['data'].get('negative_sampling_strategy', 'random')    
     )
     
+    # DEBUG: Verify temporal splits
+    train_timestamps = train_loader.dataset.timestamps
+    val_timestamps = val_loader.dataset.timestamps
+    test_timestamps = test_loader.dataset.timestamps
+
+    print(f"Train timestamp range: {train_timestamps.min():.0f} to {train_timestamps.max():.0f}")
+    print(f"Val timestamp range: {val_timestamps.min():.0f} to {val_timestamps.max():.0f}")
+    print(f"Test timestamp range: {test_timestamps.min():.0f} to {test_timestamps.max():.0f}")
+
+    # Check for leakage: test edges should be AFTER train edges
+    assert test_timestamps.min() > train_timestamps.max(), "DATA LEAKAGE: Test edges are not after train edges!"
+    
     # experiment logging
     logger.info(f"Seed: {config['experiment']['seed']}")
     logger.info(f"PyTorch version: {torch.__version__}")
@@ -247,6 +260,31 @@ def train_model(config: dict):
     trainer.save_checkpoint(final_model_path)
     logger.info(f"Saved final model to: {final_model_path}")
 
+    # Prepare result row
+    result_row = {
+        'model': config['model']['name'],
+        'dataset': config['data']['dataset'],
+        'evaluation_type': config['data']['evaluation_type'],
+        'negative_sampling_strategy': config['data']['negative_sampling_strategy'],
+        'seed': config['experiment']['seed'],
+        'test_accuracy': test_results[0].get('test_accuracy', 0.0),
+        'test_ap': test_results[0].get('test_ap', 0.0),
+        'test_auc': test_results[0].get('test_auc', 0.0),
+        'test_loss': test_results[0].get('test_loss', 0.0),
+        # 'config_file': args.configs if 'args' in locals() else 'unknown',
+        'timestamp': datetime.now().isoformat()
+    }
+
+    # Save to CSV
+    csv_path = os.path.join(config['logging']['log_dir'], '..', 'all_results.csv')
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=result_row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(result_row)
 
 
 
@@ -280,6 +318,14 @@ def main():
         "--override",
         nargs="*",
         help="Override config parameters "
+    )
+
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="List of random seeds to run"
     )
 
     args = parser.parse_args()
@@ -328,12 +374,15 @@ def main():
     logger.info(f"Description: {config['experiment']['description']}")
     logger.info(f"Config file: {args.configs}")
     
-    # Start training
-    try:
-        train_model(config)
-    except Exception as e:
-        logger.error(f"Training failed with error: {e}")
-        raise
+    for seed in args.seeds:
+        config['experiment']['seed'] = seed
+
+        # Start training
+        try:
+            train_model(config)
+        except Exception as e:
+            logger.error(f"Training failed with error {seed} : {e}")
+            raise
 
 
 

@@ -4,7 +4,7 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean, scatter_max
+# from torch_scatter import scatter_mean, scatter_max
 
 from .base_model import BaseDynamicGNN, MemoryModule, TimeEncoder
 
@@ -29,6 +29,14 @@ class TGN(BaseDynamicGNN):
         dropout: float = 0.1,
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
+        n_heads: int = 2,
+        n_neighbors: int = 20,
+        use_memory: bool = True,
+        memory_update_at_start: bool = True,
+        embedding_module_type: str = "graph_attention",
+        message_function_type: str = "mlp",
+        aggregator_type : str = "last", 
+        memory_updater_type: str = "gru",
         neighbor_sampler: Optional[nn.Module] = None,
         **kwargs
     ):
@@ -46,6 +54,17 @@ class TGN(BaseDynamicGNN):
         
         self.memory_dim = memory_dim
         self.message_dim = message_dim
+        self.n_heads = n_heads
+        self.n_neighbors = n_neighbors
+        self.use_memory = use_memory
+        self.memory_update_at_start = memory_update_at_start
+        self.embedding_module_type = embedding_module_type
+        self.message_function_type = message_function_type
+        self.aggregator_type = aggregator_type
+        self.memory_updater_type = memory_updater_type
+
+        self.register_buffer("node_raw_features", None)
+        self.register_buffer("edge_raw_features", None)
         
         # Memory module
         self.memory_module = MemoryModule(
@@ -416,30 +435,6 @@ class TemporalAttentionLayer(nn.Module):
         return output
 
 
-class LinkPredictor(nn.Module):
-    """Link prediction head."""
-    
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-    def forward(
-        self,
-        src_embeddings: torch.Tensor,
-        dst_embeddings: torch.Tensor
-    ) -> torch.Tensor:
-        """Predict link probability."""
-        
-        # Concatenate source and destination embeddings
-        link_input = torch.cat([src_embeddings, dst_embeddings], dim=-1)
-        
-        return self.mlp(link_input).squeeze(-1)
     
 
 class LinkPredictor(nn.Module):

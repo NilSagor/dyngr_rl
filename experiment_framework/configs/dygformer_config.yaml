@@ -29,7 +29,7 @@ training:
 data:
   dataset: "wikipedia"
   # overriden 
-  # evaluation_type: random # change to "inductive" for inductive 
+  evaluation_type: random # change to "inductive" for inductive 
   # negative_sampling_strategy: "transductive" # random, historical/inductive
   train_ratio: 0.7
   val_ratio: 0.15
