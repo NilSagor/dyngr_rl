@@ -17,7 +17,7 @@ from .load_dataset import (
     load_uci,
 )
 
-from .data_utils import temporal_train_val_test_split
+from .data_utils import temporal_train_val_test_split, create_inductive_split
 
 # Dataset registry
 DATASET_LOADERS = {
@@ -79,17 +79,34 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     if edge_features is not None:
         logger.info(f"Edge features shape: {edge_features.shape}")
     
+    logger.info(f"Edges shape: {edges.shape}")
+    logger.info(f"Edge features shape: {edge_features.shape if edge_features is not None else 'None'}")
+    
     # # Temporal split
     # from .utils import temporal_train_val_test_split
-    
-    splits = temporal_train_val_test_split(
-        edges=edges,
-        timestamps=timestamps,
-        # edge_features=edge_features,
-        train_ratio=data_config['train_ratio'],
-        val_ratio=data_config['val_ratio'],
-        test_ratio=data_config['test_ratio']
-    )
+
+    eval_type = config['data']['evaluation_type']
+
+    if eval_type == "inductive":
+        
+        splits = create_inductive_split(
+            edges=edges,
+            timestamps=timestamps,
+            edge_features = edge_features,
+            train_ratio=data_config['train_ratio'],
+            val_ratio=data_config['val_ratio'],
+            test_ratio=data_config['test_ratio'],
+            unseen_node_ratio = 0.2 # make configurable
+        )
+    else: # transductive
+        splits = temporal_train_val_test_split(
+            edges=edges,
+            timestamps=timestamps,
+            # edge_features=edge_features,
+            train_ratio=data_config['train_ratio'],
+            val_ratio=data_config['val_ratio'],
+            test_ratio=data_config['test_ratio']
+        )
     
     # FIX: Determine device from config
     device = 'cuda' if hardware_config.get('gpus', 0) > 0 else 'cpu'

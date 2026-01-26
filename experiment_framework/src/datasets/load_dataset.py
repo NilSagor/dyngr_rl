@@ -17,18 +17,23 @@ def load_generic_dataset(dataset_name, model_type="dygformer"):
     edge_feat_path = os.path.join(folder_path, f"ml_{dataset_name}.npy")
 
     df = pd.read_csv(csv_path)
-    src = df['u'].values.astype(np.int64) - 1
-    dst = df['i'].values.astype(np.int64) - 1
+    # src = df['u'].values.astype(np.int64) - 1
+    # dst = df['i'].values.astype(np.int64) - 1
     # timestamps = df['ts'].values.astype(np.float32)
 
     # Load features
     node_features = np.load(node_feat_path).astype(np.float32)
     edge_features = np.load(edge_feat_path).astype(np.float32)
     
-    
+    print(len(df))
     # Fix edge features extra row
-    if edge_features.shape[0] == len(src) + 1:
+    if edge_features.shape[0] > len(df):
+        print(f"Removing extra row from {dataset_name} edge features: {edge_features.shape[0]} -> {len(df)}")
         edge_features = edge_features[1:]
+
+    # Verify shapes match
+    assert edge_features.shape[0] == len(df), f"Edge features shape {edge_features.shape} doesn't match edges {len(df)}"
+    
 
     # Get true number of nodes from node features
     num_actual_nodes = node_features.shape[0] 
@@ -50,16 +55,17 @@ def load_generic_dataset(dataset_name, model_type="dygformer"):
         # DyGFormer/TAWRMAC: 1-indexed with padding
         src_1indexed = df['u'].values.astype(np.int64)  # Keep 1-indexed
         dst_1indexed = df['i'].values.astype(np.int64)  # Keep 1-indexed
+        edges_array = np.column_stack([src_1indexed, dst_1indexed])
         
         # Create padded node features (index 0 = padding)
         node_raw_features = np.zeros((num_actual_nodes + 1, node_features.shape[1]), dtype=np.float32)
         node_raw_features[1:] = node_features
         
         # Create padded edge features (index 0 = padding)
-        edge_raw_features = np.zeros((len(edge_features) + 1, edge_features.shape[1]), dtype=np.float32)
-        edge_raw_features[1:] = edge_features
+        edge_features_unpadded = edge_features # shape [157474, 172]
+        edge_features_padded = np.zeros((len(edge_features) + 1, edge_features.shape[1]), dtype=np.float32)
+        edge_features_padded[1:] = edge_features
         
-        edges_array = np.column_stack([src_1indexed, dst_1indexed])
 
     # # Convert to 0-indexed for calculations
     # src = df['u'].values.astype(np.int64) - 1
@@ -87,7 +93,8 @@ def load_generic_dataset(dataset_name, model_type="dygformer"):
         "edges": torch.from_numpy(edges_array).long(),
         "timestamps": torch.from_numpy(df['ts'].values.astype(np.float32)).float(),
         "node_features": torch.from_numpy(node_raw_features).float(),
-        "edge_features": torch.from_numpy(edge_raw_features).float(),
+        "edge_features": torch.from_numpy(edge_features_unpadded).float(), # for splitting
+        "edge_padded": torch.from_numpy(edge_features_padded).float(), # for model
         "num_nodes": num_actual_nodes,  # 9228
     }
 

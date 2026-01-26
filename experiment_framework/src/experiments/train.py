@@ -198,7 +198,7 @@ def train_model(config: dict):
     print(f"Test timestamp range: {test_timestamps.min():.0f} to {test_timestamps.max():.0f}")
 
     # Check for leakage: test edges should be AFTER train edges
-    assert test_timestamps.min() > train_timestamps.max(), "DATA LEAKAGE: Test edges are not after train edges!"
+    assert test_timestamps.min() >= val_timestamps.max(), "Test should start after validation"
     
     # experiment logging
     logger.info(f"Seed: {config['experiment']['seed']}")
@@ -214,7 +214,7 @@ def train_model(config: dict):
     if dataset_name in DATASET_LOADERS:
         data = DATASET_LOADERS[dataset_name]()
         node_features = data.get('node_features', torch.zeros(num_nodes, 172))
-        edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
+        edge_features = data.get('edge_features_padded', torch.zeros(len(data['edges']), 1))
         # model.set_raw_features(node_features, edge_features)
         
         # FIX: Load and set raw features

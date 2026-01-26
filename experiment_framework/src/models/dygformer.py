@@ -1,6 +1,9 @@
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
+
+
 from .base_model import BaseDynamicGNN, TimeEncoder
 
 class DyGFormer(BaseDynamicGNN):
@@ -255,7 +258,7 @@ class DyGFormer(BaseDynamicGNN):
         node_features = padded_sequences['node_features']
         edge_features = padded_sequences['edge_features']
         time_features = padded_sequences['time_features']
-        print(f"Time features mean: {time_features.mean():.6f}, std: {time_features.std():.6f}") # should not be zero!
+        # print(f"Time features mean: {time_features.mean():.6f}, std: {time_features.std():.6f}") # should not be zero!
 
         # Create patches
         node_patches = self._create_patches(node_features, actual_lengths)
@@ -359,7 +362,7 @@ class DyGFormer(BaseDynamicGNN):
         # Should be ~0.5 if balanced
         # If labels.mean() is 0.0 or 1.0, your negative sampling is broken.
         loss = self.loss_fn(logits, labels)
-        print(f"Loss: {loss.item():.4f}, requires_grad: {loss.requires_grad}")
+        # print(f"Loss: {loss.item():.4f}, requires_grad: {loss.requires_grad}")
         return loss
 
     def _compute_metrics(self, batch):
@@ -371,7 +374,7 @@ class DyGFormer(BaseDynamicGNN):
         ap = self._compute_ap(probs, labels)
         
         # Compute AUC
-        from sklearn.metrics import roc_auc_score
+        
         auc = roc_auc_score(labels.cpu().numpy(), probs.detach().cpu().numpy())
         
         return {

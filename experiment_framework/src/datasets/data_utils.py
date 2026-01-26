@@ -100,47 +100,78 @@ def create_inductive_split(
         Dictionary with inductive splits
     """
     
-    # Get all unique nodes
-    all_nodes = torch.unique(edges.flatten())
-    num_nodes = len(all_nodes)
+    # Sort chronologically
+    sorted_idx = torch.argsort(timestamps)
+    edges = edges[sorted_idx]
+    timestamps = timestamps[sorted_idx]
+    if edge_features is not None:
+        edge_features = edge_features[sorted_idx]
     
-    # Split nodes into seen/unseen for inductive setting
-    num_unseen = int(num_nodes * unseen_node_ratio)
-    unseen_nodes = all_nodes[torch.randperm(num_nodes)[:num_unseen]]
-    seen_nodes = all_nodes[~torch.isin(all_nodes, unseen_nodes)]
+    num_edges = len(edges)
+    train_end = int(num_edges * train_ratio)
+    val_end = train_end + int(num_edges * val_ratio)
     
-    # Create node masks
-    is_unseen = torch.isin(edges.flatten(), unseen_nodes).view(-1, 2).any(dim=1)
+    # Get nodes from training period only
+    train_nodes = torch.unique(edges[:train_end].flatten())
     
-    # Split edges based on node visibility
-    seen_edges = edges[~is_unseen]
-    seen_timestamps = timestamps[~is_unseen]
-    seen_edge_features = edge_features[~is_unseen] if edge_features is not None else None
+    # Randomly hold out some training nodes as unseen
+    num_unseen = int(len(train_nodes) * unseen_node_ratio)
+    perm = torch.randperm(len(train_nodes))
+    unseen_nodes = train_nodes[perm[:num_unseen]]
+    seen_nodes = train_nodes[perm[num_unseen:]]
     
-    unseen_edges = edges[is_unseen]
-    unseen_timestamps = timestamps[is_unseen]
-    unseen_edge_features = edge_features[is_unseen] if edge_features is not None else None
+    # Create initial chronological splits
+    train_edges = edges[:train_end]
+    train_timestamps = timestamps[:train_end]
+    val_edges = edges[train_end:val_end]
+    val_timestamps = timestamps[train_end:val_end]
+    test_edges = edges[val_end:]
+    test_timestamps = timestamps[val_end:]
     
-    # Split seen edges chronologically
-    seen_splits = temporal_train_val_test_split(
-        seen_edges, seen_timestamps, seen_edge_features,
-        train_ratio, val_ratio, test_ratio
+    if edge_features is not None:
+        train_edge_features = edge_features[:train_end]
+        val_edge_features = edge_features[train_end:val_end]
+        test_edge_features = edge_features[val_end:]
+    
+  # Remove any edges involving unseen nodes from train/val
+    def filter_edges(edges, timestamps, edge_features, unseen_nodes):
+        mask = ~(torch.isin(edges[:, 0], unseen_nodes) | torch.isin(edges[:, 1], unseen_nodes))
+        filtered_edges = edges[mask]
+        filtered_timestamps = timestamps[mask]
+        filtered_features = edge_features[mask] if edge_features is not None else None
+        return filtered_edges, filtered_timestamps, filtered_features
+
+    train_edges, train_timestamps, train_edge_features = filter_edges(
+        train_edges, train_timestamps, 
+        train_edge_features if edge_features is not None else None,
+        unseen_nodes
     )
     
-    # Add unseen nodes to test set
-    result = seen_splits
+    val_edges, val_timestamps, val_edge_features = filter_edges(
+        val_edges, val_timestamps,
+        val_edge_features if edge_features is not None else None,
+        unseen_nodes
+    )  
+    # Create splits
+    # Test set remains unchanged (contains both seen and unseen node edges)
     
-    # Add unseen edges to test set for true inductive evaluation
-    if len(unseen_edges) > 0:
-        result['test_edges'] = torch.cat([result['test_edges'], unseen_edges])
-        result['test_timestamps'] = torch.cat([result['test_timestamps'], unseen_timestamps])
-        if edge_features is not None:
-            result['test_edge_features'] = torch.cat([result['test_edge_features'], unseen_edge_features])
+    splits = {
+        'train_edges': train_edges,
+        'train_timestamps': train_timestamps,
+        'val_edges': val_edges,
+        'val_timestamps': val_timestamps,
+        'test_edges': test_edges,
+        'test_timestamps': test_timestamps,
+        'seen_nodes': seen_nodes,
+        'unseen_nodes': unseen_nodes
+    }
     
-    result['seen_nodes'] = seen_nodes
-    result['unseen_nodes'] = unseen_nodes
+    if edge_features is not None:
+        splits['train_edge_features'] = train_edge_features
+        splits['val_edge_features'] = val_edge_features
+        splits['test_edge_features'] = test_edge_features
     
-    return result
+    return splits
 
 
 def prepare_evaluation_data(
