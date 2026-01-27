@@ -137,6 +137,7 @@ def get_dataset_loader(config: Dict[str, Any],negative_sampling_strategy) -> Tup
     test_dataset = TemporalDataset(
         edges=splits['test_edges'],
         timestamps=splits['test_timestamps'],
+        unseen_nodes= splits.get("unseen_nodes"),
         edge_features=splits.get('test_edge_features'),
         num_nodes=num_nodes,
         max_neighbors=data_config['max_neighbors'],

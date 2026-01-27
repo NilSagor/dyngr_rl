@@ -23,6 +23,7 @@ class TemporalDataset(Dataset):
         split: str = 'train',
         negative_sampling_ratio: float = 1.0,
         negative_sampling_strategy: str = "random",
+        unseen_nodes = None,
         device: str = "cpu" # device fixed
     ):
         """Initialize temporal dataset.
@@ -48,7 +49,11 @@ class TemporalDataset(Dataset):
         self.split = split
         self.negative_sampling_ratio = negative_sampling_ratio
         self.negative_sampling_strategy = negative_sampling_strategy
-        self.device = device 
+        self.device = device
+
+        self.unseen_nodes = unseen_nodes if unseen_nodes is not None else torch.tensor([]) 
+
+
 
         
         # Infer number of nodes if not provided
@@ -183,13 +188,14 @@ class TemporalDataset(Dataset):
 
     def _generate_single_inductive_negative(self, pos_src, pos_dst, pos_timestamp):
         """Generate inductive negative: sample from future nodes"""
-        # For true inductive, you'd need unseen nodes, but simple approximation:
-        future_mask = self.timestamps > pos_timestamp
-        if future_mask.sum() > 0:
-            future_indices = torch.where(future_mask)[0]
-            rand_idx = future_indices[torch.randint(0, len(future_indices), (1,))].item()
-            return self.edges[rand_idx, 0].item(), self.edges[rand_idx, 1].item(), pos_timestamp
+        """Generate inductive negative: (pos_src, unseen_node, pos_timestamp)"""
+        if hasattr(self, 'unseen_nodes') and len(self.unseen_nodes) > 0:
+            # Sample from truly unseen nodes
+            unseen_idx = torch.randint(0, len(self.unseen_nodes), (1,)).item()
+            neg_dst = self.unseen_nodes[unseen_idx].item()
+            return pos_src, neg_dst, pos_timestamp
         else:
+            # Fallback if no unseen nodes available
             return self._generate_single_negative_random(pos_src, pos_dst, pos_timestamp)
 
     def _generate_single_negative(self, pos_src, pos_dst, pos_timestamp):
@@ -266,37 +272,7 @@ class TemporalDataset(Dataset):
         # Pre-compute positive edge set in __init__
         return (src, dst) in self.positive_edge_set or (dst, src) in self.positive_edge_set
 
-    # def _generate_historical_negatives(self, num_negative: int) -> List[Tuple[int, int, float]]:
-    #     """
-    #     Generate truly historical negatives:
-    #     - Sample edges from the FUTURE part of the timeline (last 30%)
-    #     - Assign them PAST timestamps (first 70%)
-    #     - At that past time, the edge truly didn't exist
-    #     """
-    #     negatives = []
-        
-    #     # Split timeline: first 70% = "past", last 30% = "future edges"
-    #     split_idx = int(len(self.edges) * 0.7)
-    #     if split_idx >= len(self.edges):
-    #         return self._generate_random_negatives(num_negative)  # Fallback
-        
-    #     # Pre-compute future edges for speed
-    #     future_edges = self.edges[split_idx:]
-    #     future_timestamps = self.timestamps[split_idx:]
-        
-    #     for _ in range(num_negative):
-    #         # Sample edge from future
-    #         idx = torch.randint(0, len(future_edges), (1,)).item()
-    #         src = future_edges[idx, 0].item()
-    #         dst = future_edges[idx, 1].item()
-            
-    #         # Sample timestamp from past (before this edge existed)
-    #         past_idx = torch.randint(0, split_idx, (1,)).item()
-    #         past_timestamp = self.timestamps[past_idx].item()
-            
-    #         negatives.append((src, dst, past_timestamp))
-        
-    #     return negatives
+    
     
             
     def _generate_inductive_negatives(self, num_negative:int)->List[Tuple[int, int, float]]:
