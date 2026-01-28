@@ -19,6 +19,10 @@
 |          |         |              |Random           |0.9811 |0.9711  |0.9239  |0.2147   |       |
 |          |         |              |Historical       |0.4794 |0.4376  |0.4276  |5.0051   |       |
 |          |         |Transductive  |inductive        |0.9801 |0.9706  |0.9260  |0.2285   |       |
+|          |uci      |Inductive     |inductive        |0.9472 |0.9252  |0.8731  |0.3328   |       |
+|          |lastfm   |Inductive     |inductive        |0.8783 |0.8566  |0.6756  |1.4696   |       |
+|          |mooc     |Inductive     |inductive        |0.9829 |0.9849  |0.9445  |0.2268   |       |
+|          |reddit   |Inductive     |inductive        |0.9884 |0.9862  |0.9357  |0.1665   |       |
 
 
 ### Analysis

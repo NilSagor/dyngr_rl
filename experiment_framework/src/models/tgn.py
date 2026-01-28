@@ -4,10 +4,18 @@ from typing import Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 # from torch_scatter import scatter_mean, scatter_max
 
 from .base_model import BaseDynamicGNN, MemoryModule, TimeEncoder
 
+from .tgn_module.memory import Memory
+from .tgn_module.memory_updater import get_memory_updater
+from .tgn_module.message_aggregator import get_message_aggregator
+from .tgn_module.message_function import get_message_function
+from .tgn_module.memory_updater import get_memory_updater
+from .tgn_module.embedding_module import get_embedding_module
+from .tgn_module.temporal_attention import MergeLayer
 
 class TGN(BaseDynamicGNN):
     """Temporal Graph Networks for Deep Learning on Dynamic Graphs.
@@ -67,11 +75,22 @@ class TGN(BaseDynamicGNN):
         self.register_buffer("edge_raw_features", None)
         
         # Memory module
-        self.memory_module = MemoryModule(
-            num_nodes=num_nodes,
-            memory_dim=memory_dim,
-            message_dim=message_dim,
-            time_encoding_dim=time_encoding_dim
+        # self.memory_module = MemoryModule(
+        #     num_nodes=num_nodes,
+        #     memory_dim=memory_dim,
+        #     message_dim=message_dim,
+        #     time_encoding_dim=time_encoding_dim
+        # )
+
+        self.memory = Memory(
+            n_nodes = num_nodes,
+            memory_dim = memory_dim,
+            input_dim = message_dim + time_encoding_dim,
+            message_dimension= message_dim,
+            device =self.device
+        )
+        self.memory_updater = get_memory_updater(
+
         )
         
         # Message function
@@ -83,13 +102,15 @@ class TGN(BaseDynamicGNN):
             message_dim=message_dim
         )
         
-        # Embedding module (Graph Neural Network)
+
+        # Embedding module (Graph Neural Network) [use neighbor information from the batch]
         self.embedding_module = EmbeddingModule(
             node_features=node_features,
             memory_dim=memory_dim,
-            time_encoding_dim=time_encoding_dim,
             hidden_dim=hidden_dim,
+            time_encoding_dim=time_encoding_dim,
             num_layers=num_layers,
+            n_heads = n_heads,
             dropout=dropout
         )
         
@@ -117,61 +138,160 @@ class TGN(BaseDynamicGNN):
         Returns:
             Link prediction logits [batch_size]
         """
+        # get source and destination nodes
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']
+
+        # Generate negative samples (random)
+        negative_nodes = self._generate_negative_samples(
+            src_nodes.cpu().numpy(),
+            dst_nodes.cpu().numpy(),
+        )
+
+        src_nodes_np = src_nodes.cpu().numpy()
+        dst_nodes_np = dst_nodes.cpu().numpy()
+        timestamps_np = timestamps.cpu().numpy()
+
+        # compute embeddings 
+        source_embedding, destination_embedding, negative_embedding = self.compute_temporal_embeddings(
+            source_nodes = src_nodes_np,
+            destination_nodes = dst_nodes_np,
+            negative_nodes = negative_nodes,
+            edge_times = timestamps_np,
+            edge_idxs = np.arange(len(src_nodes)), # dummy edge indice
+            n_neighbors = self.n_neighbors
+         )
         
-        # Get current memory for nodes
-        src_memory = self.memory_module.get_memory(src_nodes)
-        dst_memory = self.memory_module.get_memory(dst_nodes)
+        # Link Prediction
+        pos_scores = self.link_predictor(
+            torch.cat([source_embedding, source_embedding], dim=0),
+            torch.cat([destination_embedding, negative_embedding])
+        ).squeeze(dim=0)
+
+        return pos_scores
         
-        # Get node features
-        if self.node_features > 0:
-            src_features = self.node_embedding(src_nodes)
-            dst_features = self.node_embedding(dst_nodes)
-        else:
-            src_features = None
-            dst_features = None
+    def compute_temporal_embeddings(self, source_nodes, destination_nodes, negative_nodes, edge_times, edge_idxs, n_neighbors=20):
+        """Compute temporal embeddings for sources, destination, and negatives"""
+        n_smaples = len(source_nodes)
+        nodes = np.concatenate([source_nodes, destination_nodes, negative_nodes])
+        positives = np.concatenate([source_nodes, destination_nodes])
+        timestamps = np.concatenate([edge_times, edge_times, edge_times])
+
+        memory = None
+        time_diffs = None
+
+        if self.use_memory and self.memory is not None:
+            if self.memory_update_at_start:
+                memory, last_update = self.get_update_memory(
+                    list(range(self.num_nodes)),
+                    self.memory.messages
+                )
+            else:
+                memory = self.memory.get_memory(list(range(self.num_nodes)))
+                last_update = self.memory.last_update
+
+            # Compute time differences
+            source_time_diffs = torch.LongTensor(edge_times).to(self.device) - \
+                                last_update[source_nodes].long()
+            source_time_diffs = (source_time_diffs - self.mean_time_shift_src) / self.std_time_shift_src
             
-        # Time encoding
-        time_enc = self.time_encoder(timestamps)
+            destination_time_diffs = torch.LongTensor(edge_times).to(self.device) - \
+                                    last_update[destination_nodes].long()
+            destination_time_diffs = (destination_time_diffs - self.mean_time_shift_dst) / self.std_time_shift_dst
+            
+            negative_time_diffs = torch.LongTensor(edge_times).to(self.device) - \
+                                    last_update[negative_nodes].long()
+            negative_time_diffs = (negative_time_diffs - self.mean_time_shift_dst) / self.std_time_shift_dst
+            
+            time_diffs = torch.cat([source_time_diffs, destination_time_diffs, 
+                                    negative_time_diffs], dim=0)
         
-        # Compute embeddings with neighborhood aggregation
-        if 'edge_indices' in batch:
-            # Temporal neighborhood aggregation
-            src_embeddings = self.embedding_module(
-                nodes=src_nodes,
-                features=src_features,
-                memory=src_memory,
-                edge_indices=batch['edge_indices'],
-                edge_times=batch['edge_times'],
-                timestamps=timestamps
-            )
-            dst_embeddings = self.embedding_module(
-                nodes=dst_nodes,
-                features=dst_features,
-                memory=dst_memory,
-                edge_indices=batch['edge_indices'],
-                edge_times=batch['edge_times'],
-                timestamps=timestamps
+        # Compute embeddings using the embedding module
+        if self.embedding_module is not None:
+            node_embedding = self.embedding_module.compute_embedding(
+                memory=memory,
+                source_nodes=nodes,
+                timestamps=timestamps,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors,
+                time_diffs=time_diffs
             )
         else:
-            # Simple embedding without neighborhood aggregation
-            src_embeddings = self.embedding_module.simple_embed(
-                features=src_features,
-                memory=src_memory,
-                time_enc=time_enc
-            )
-            dst_embeddings = self.embedding_module.simple_embed(
-                features=dst_features,
-                memory=dst_memory,
-                time_enc=time_enc
-            )
-            
-        # Link prediction
-        logits = self.link_predictor(src_embeddings, dst_embeddings)
+            # Fallback to simple embedding
+            if memory is not None:
+                node_embedding = memory[nodes]
+            else:
+                node_embedding = self.node_embedding(
+                    torch.from_numpy(nodes).long().to(self.device)
+                )
+
+        source_node_embedding = node_embedding[:n_samples]
+        destination_node_embedding = node_embedding[n_samples:2 * n_samples]
+        negative_node_embedding = node_embedding[2 * n_samples:]
         
-        return logits
+        # Update memory if needed
+        if self.use_memory and self.memory_update_at_start and self.memory is not None:
+            self.update_memory(positives, self.memory.messages)
+            self.memory.clear_messages(positives)
+        
+        return source_node_embedding, destination_node_embedding, negative_node_embedding
+
+        
+        
+        
+        
+        # # Get current memory for nodes
+        # src_memory = self.memory_module.get_memory(src_nodes)
+        # dst_memory = self.memory_module.get_memory(dst_nodes)
+        
+        # # Get node features
+        # if self.node_features > 0:
+        #     src_features = self.node_embedding(src_nodes)
+        #     dst_features = self.node_embedding(dst_nodes)
+        # else:
+        #     src_features = None
+        #     dst_features = None
+            
+        # # Time encoding
+        # time_enc = self.time_encoder(timestamps)
+        
+        # # Compute embeddings with neighborhood aggregation
+        # if 'edge_indices' in batch:
+        #     # Temporal neighborhood aggregation
+        #     src_embeddings = self.embedding_module(
+        #         nodes=src_nodes,
+        #         features=src_features,
+        #         memory=src_memory,
+        #         edge_indices=batch['edge_indices'],
+        #         edge_times=batch['edge_times'],
+        #         timestamps=timestamps
+        #     )
+        #     dst_embeddings = self.embedding_module(
+        #         nodes=dst_nodes,
+        #         features=dst_features,
+        #         memory=dst_memory,
+        #         edge_indices=batch['edge_indices'],
+        #         edge_times=batch['edge_times'],
+        #         timestamps=timestamps
+        #     )
+        # else:
+        #     # Simple embedding without neighborhood aggregation
+        #     src_embeddings = self.embedding_module.simple_embed(
+        #         features=src_features,
+        #         memory=src_memory,
+        #         time_enc=time_enc
+        #     )
+        #     dst_embeddings = self.embedding_module.simple_embed(
+        #         features=dst_features,
+        #         memory=dst_memory,
+        #         time_enc=time_enc
+        #     )
+            
+        # # Link prediction
+        # logits = self.link_predictor(src_embeddings, dst_embeddings)
+        
+        # return logits
         
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute binary cross-entropy loss for link prediction."""
@@ -179,10 +299,69 @@ class TGN(BaseDynamicGNN):
         labels = batch['labels'].float()
         
         # Update memory after forward pass
-        self._update_memory(batch)
+        if self.use_memory:
+            self._update_memory(batch)
         
         return self.loss_fn(logits, labels)
         
+    def _update_memory(self, batch: Dict[str, torch.Tensor]):
+        
+        """Update node memories after interaction."""
+        src_nodes = batch['src_nodes']
+        dst_nodes = batch['dst_nodes']
+        timestamps = batch['timestamps']
+
+               
+        # Get node features
+        if self.node_features > 0:
+            src_features = self.node_embedding(src_nodes) 
+            dst_features = self.node_embedding(dst_nodes)
+        else:
+            src_features = None
+            dst_features = None 
+            
+        
+        # Get memories
+        src_memory = self.memory_module.get_memory(src_nodes)
+        dst_memory = self.memory_module.get_memory(dst_nodes)
+        
+        # Time encoding
+        time_enc = self.time_encoder(timestamps)
+        
+        
+        # Get edge features if available
+        edge_features = None
+        if 'edge_features' in batch:
+            edge_features = batch['edge_features']
+            # Expand edge features for message function
+            edge_features_expanded = edge_features.unsqueeze(1).repeat(1,2,1)
+            edge_features_expanded = edge_features_expanded.view(-1, edge_features.size(-1))
+        else:
+            edge_features_expanded = torch.zeros(len(src_nodes)*2, 1).to(self.device)
+
+        
+                
+        # compute Messages for source and destination nodes/both directions
+        src_messages = self.message_fn(
+            src_features, dst_features, src_memory, dst_memory, time_enc
+        )
+        dst_messages = self.message_fn(
+            dst_features, src_features, dst_memory, src_memory, time_enc
+        )
+        
+        # # Update memories
+        # self.memory_module.update_memory(src_nodes, src_messages, timestamps)
+        # self.memory_module.update_memory(dst_nodes, dst_messages, timestamps)
+       
+        
+        # combine messages
+        all_messages = torch.cat([src_messages, dst_messages], dim=0)
+        all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
+        all_timestamps = torch.cat([timestamps, timestamps], dim=0)
+
+        # Update memories
+        self.memory_module.update_memory(all_nodes, all_messages, all_timestamps)
+    
     def _compute_metrics(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Compute evaluation metrics."""
         logits = self.forward(batch)
@@ -197,40 +376,22 @@ class TGN(BaseDynamicGNN):
         
         # Average Precision (simplified)
         ap = self._compute_ap(probs, labels)
+
+        # compute AUC using sklearn
+        from sklearn.metrics import roc_auc_score
+        try:
+            auc = roc_auc_score(labels.cpu().numpy(), probs.detach().cpu().numpy())
+            auc_tensor = torch.tensor(auc, device=self.device)
+        except:
+            auc_tensor = torch.tensor(0.0, device=self.device)
         
         return {
             'accuracy': accuracy,
             'ap': ap,
+            'auc': auc_tensor,
             'loss': self.loss_fn(logits, labels)
         }
-        
-    def _update_memory(self, batch: Dict[str, torch.Tensor]):
-        """Update node memories after interaction."""
-        src_nodes = batch['src_nodes']
-        dst_nodes = batch['dst_nodes']
-        timestamps = batch['timestamps']
-        
-        # Compute messages
-        src_features = self.node_embedding(src_nodes) if self.node_features > 0 else None
-        dst_features = self.node_embedding(dst_nodes) if self.node_features > 0 else None
-        
-        src_memory = self.memory_module.get_memory(src_nodes)
-        dst_memory = self.memory_module.get_memory(dst_nodes)
-        
-        time_enc = self.time_encoder(timestamps)
-        
-        # Messages for source and destination nodes
-        src_messages = self.message_fn(
-            src_features, dst_features, src_memory, dst_memory, time_enc
-        )
-        dst_messages = self.message_fn(
-            dst_features, src_features, dst_memory, src_memory, time_enc
-        )
-        
-        # Update memories
-        self.memory_module.update_memory(src_nodes, src_messages, timestamps)
-        self.memory_module.update_memory(dst_nodes, dst_messages, timestamps)
-        
+     
     def _compute_ap(self, probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Compute Average Precision (simplified)."""
         # Sort by probability
@@ -246,6 +407,25 @@ class TGN(BaseDynamicGNN):
         # Average precision
         ap = precisions.mean()
         return ap
+    
+        
+    def on_train_epoch_start(self):
+        """Reset memory at start of train epoch."""
+        super().on_train_epoch_start()
+        if self.use_memory and self.memory is not None:
+            self.memory.__init_memory__()
+
+    def on_validation_epoch_start(self):
+        """Reset memory at start of validation epoch."""
+        super().on_validation_epoch_start()
+        if self.use_memory and self.memory is not None:
+            self.memory.__init_memory__()
+
+    def on_test_epoch_start(self):
+        """Reset memory at start of test epoch."""
+        super().on_test_epoch_start()
+        if self.use_memory and self.memory is not None:
+            self.memory.__init_memory__()
 
 
 class MessageFunction(nn.Module):

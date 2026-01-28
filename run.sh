@@ -13,12 +13,14 @@ for dataset in "${DATASETS[@]}"; do
         for neg_sample in random historical inductive; do
             for seed in "${SEEDS[@]}"; do
                 # echo "Running: $eval_type + $neg_sample"
-                echo "Running: $dataset | $eval_type | $neg_strat | seed=$seed"
+                echo "Running: $dataset | $eval_type | $neg_sample | seed=$seed"
                 python "$SCRIPT" \
                 --configs "$CONFIG" \
                 --override \
+                    data.dataset="$dataset" \
                     data.evaluation_type=$eval_type \
-                    data.negative_sampling_strategy=$neg_sample
+                    data.negative_sampling_strategy=$neg_sample \
+                    experiment.seed="$seed"
             done
         done
     done
