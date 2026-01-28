@@ -23,7 +23,8 @@ from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from loguru import logger
 
 from src.models.dygformer import DyGFormer
-# from src.models.tgn import TGN
+from src.models.tgn import TGN
+
 from src.utils.general_utils import set_seed, get_device
 from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
@@ -37,7 +38,7 @@ from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
 MODEL_REGISTRY={
     "DyGFormer": DyGFormer,
-    # "TGN": TGN,    
+    "TGN": TGN,    
 }
 
 def load_config(config_path):
@@ -213,9 +214,17 @@ def train_model(config: dict):
     dataset_name = config['data']['dataset']
     if dataset_name in DATASET_LOADERS:
         data = DATASET_LOADERS[dataset_name]()
+        
+        # Get features (handle both padded and unpadded)
         node_features = data.get('node_features', torch.zeros(num_nodes, 172))
-        edge_features = data.get('edge_features_padded', torch.zeros(len(data['edges']), 1))
-        # model.set_raw_features(node_features, edge_features)
+        if 'edge_features_padded' in data:
+            edge_features = data['edge_features_padded']
+        else:
+            # Create padded version for consistency
+            unpadded = data.get('edge_features', torch.zeros(len(data['edges']), 1))
+            padded = torch.zeros(len(unpadded) + 1, unpadded.shape[1])
+            padded[1:] = unpadded
+            edge_features = padded
         
         # FIX: Load and set raw features
         if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
@@ -223,9 +232,14 @@ def train_model(config: dict):
                 node_features,
                 edge_features
             )
+            
         elif config['model']['name'] == 'TGN':
             # TGN uses edge features directly in message passing
-            model.edge_features = edge_features
+            node_features = data.get('node_features', torch.zeros(num_nodes, 172))
+        edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))  # Unpadded
+        
+        model.set_node_features(node_features)
+        model.edge_features = edge_features  
     
         logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
@@ -349,12 +363,13 @@ def main():
             except:
                 current[keys[-1]] = value
 
+    model_name = config['model'].get('name', 'dygformer')
     eval_type = config['data'].get('evaluation_type', 'transductive')
     neg_sample = config['data'].get('negative_sampling_strategy', 'random')
 
      # Update dynamic fields
-    config['experiment']['name'] = f"dygformer_{eval_type}_{neg_sample}"
-    config['experiment']['description'] = f"DyGFormer on Wikipedia | {eval_type} | {neg_sample}"
+    config['experiment']['name'] = f"{model_name}_{eval_type}_{neg_sample}"
+    config['experiment']['description'] = f"{model_name} on Wikipedia | {eval_type} | {neg_sample}"
     config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
     config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
     

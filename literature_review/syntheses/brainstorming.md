@@ -16,3 +16,21 @@ Datasets: UCI, Enron, MOOC (Lower density datasets where "Positive Sparsity" mak
 
 
 Chapter III: The "Scalability & Robustness" ThrustExperiments: Vector-DB Acceleration + Adaptive Annealing.Story: "Sophisticated negative mining is computationally expensive. We introduce a Vector-DB indexed sampling strategy that maintains $O(\log N)$ complexity even with annealing hardness, making advanced TGNNs usable on real-world web-scale graphs."Datasets: Flights, Large-scale benchmarks (1M+ nodes)
+
+
+###
+DTS-GN (First Proposal)
+Why DTS-GN is Better for Your Research Trajectory:
+Builds on Your Validated Findings:
+Your results prove negative sampling bias creates illusory performance gaps
+DTS-GN directly addresses this by disentangling temporal vs. structural signals
+Novel Technical Contribution:
+"Disentangled Temporal-Semantic Graph Network" is a concrete, implementable architecture
+Can be compared directly against DyGFormer/TGN baselines
+Provides mechanistic explanation for your H9/MH1 findings
+Strong Paper 3 Foundation:
+"Beyond AUC" needs both diagnosis (your current results) + solution (DTS-GN)
+Shows you're not just critiquing, but providing better alternatives
+Reproducibility Focus:
+Curriculum-based adaptive sampling ensures consistent evaluation
+Addresses the root cause of the reproducibility crisis you've documented

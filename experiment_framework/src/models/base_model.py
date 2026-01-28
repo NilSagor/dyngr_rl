@@ -6,7 +6,16 @@ from abc import ABC, abstractmethod
 
 
 class BaseDynamicGNN(L.LightningModule, ABC):
-    def __init__(self, num_nodes, node_features, hidden_dim, time_encoding_dim = 32, num_layers = 2, dropout=0.1, learning_rate=1e-4, weight_decay=1e-5, **kwargs):
+    def __init__(self, 
+                 num_nodes, 
+                 node_features, 
+                 hidden_dim, 
+                 time_encoding_dim = 32, 
+                 num_layers = 2, 
+                 dropout=0.1, 
+                 learning_rate=1e-4, 
+                 weight_decay=1e-5, 
+                 **kwargs):
         super().__init__()
         self.save_hyperparameters()
 
