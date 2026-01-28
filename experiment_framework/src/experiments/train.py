@@ -227,19 +227,19 @@ def train_model(config: dict):
             edge_features = padded
         
         # FIX: Load and set raw features
+        # Set features based on model type
         if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
-            model.set_raw_features(
-                node_features,
-                edge_features
-            )
-            
+            model.set_raw_features(node_features, edge_features)
         elif config['model']['name'] == 'TGN':
-            # TGN uses edge features directly in message passing
-            node_features = data.get('node_features', torch.zeros(num_nodes, 172))
-        edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))  # Unpadded
-        
-        model.set_node_features(node_features)
-        model.edge_features = edge_features  
+            # TGN uses UNPADDED edge features directly
+            unpadded_edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
+            # Set raw features (TGN should have set_raw_features method)
+            if hasattr(model, 'set_raw_features'):
+                model.set_raw_features(node_features, unpadded_edge_features)
+            else:
+                # Fallback: set attributes directly
+                model.node_raw_features = node_features.to(device)
+                model.edge_raw_features = unpadded_edge_features.to(device)  
     
         logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
@@ -284,8 +284,7 @@ def train_model(config: dict):
         'test_accuracy': test_results[0].get('test_accuracy', 0.0),
         'test_ap': test_results[0].get('test_ap', 0.0),
         'test_auc': test_results[0].get('test_auc', 0.0),
-        'test_loss': test_results[0].get('test_loss', 0.0),
-        # 'config_file': args.configs if 'args' in locals() else 'unknown',
+        'test_loss': test_results[0].get('test_loss', 0.0),        
         'timestamp': datetime.now().isoformat()
     }
 
@@ -301,16 +300,6 @@ def train_model(config: dict):
         writer.writerow(result_row)
 
 
-
-# # In main(), after loading config and applying overrides
-# eval_type = config['data'].get('evaluation_type', 'transductive')
-# neg_sample = config['data'].get('negative_sampling_strategy', 'random')
-
-# # Update experiment name and logging paths
-# config['experiment']['name'] = f"dygformer_{eval_type}_{neg_sample}"
-# config['experiment']['description'] = f"DyGFormer on Wikipedia | {eval_type} | {neg_sample}"
-# config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
-# config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
 
 def main():
     parser = argparse.ArgumentParser()

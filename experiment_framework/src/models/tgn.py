@@ -230,7 +230,7 @@ class TGN(BaseDynamicGNN):
             destination_nodes = dst_nodes_np,
             negative_nodes = negative_nodes,
             edge_times = timestamps_np,
-            edge_idxs = np.arange(len(src_nodes)), # dummy edge indice
+            # edge_idxs = np.arange(len(src_nodes)), # dummy edge indice
             n_neighbors = self.n_neighbors
          )
         
@@ -377,18 +377,18 @@ class TGN(BaseDynamicGNN):
         timestamps = batch['timestamps']
 
                
-        # Get node features
+        # Get node features from raw features (not embedding layer)
         if self.node_features > 0:
-            src_features = self.node_embedding(src_nodes) 
-            dst_features = self.node_embedding(dst_nodes)
+            src_features = self.node_raw_features[src_nodes]
+            dst_features = self.node_raw_features[dst_nodes]
         else:
-            src_features = None
-            dst_features = None 
-            
+            src_features = torch.zeros(len(src_nodes), self.hidden_dim, device=self.device)
+            dst_features = torch.zeros(len(dst_nodes), self.hidden_dim, device=self.device)
+                
         
         # Get memories
-        src_memory = self.memory_module.get_memory(src_nodes)
-        dst_memory = self.memory_module.get_memory(dst_nodes)
+        src_memory = self.memory.get_memory(src_nodes)
+        dst_memory = self.memory.get_memory(dst_nodes)
         
         # Time encoding
         time_enc = self.time_encoder(timestamps)
@@ -425,7 +425,7 @@ class TGN(BaseDynamicGNN):
         all_timestamps = torch.cat([timestamps, timestamps], dim=0)
 
         # Update memories
-        self.memory_module.update_memory(all_nodes, all_messages, all_timestamps)
+        self.memory.update_memory(all_nodes, all_messages, all_timestamps)
     
          
     def _compute_ap(self, probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
