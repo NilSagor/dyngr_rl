@@ -1,8 +1,8 @@
 import torch.nn as nn
 
 class MessageFunction(nn.Module):
-    def compute_message(self, raw_messages):
-        return None
+    def forward(self, raw_messages):
+        return NotImplementedError
     
 class MLPMessageFunction(MessageFunction):
     def __init__(self, raw_message_dimension, message_dimension):
@@ -13,13 +13,13 @@ class MLPMessageFunction(MessageFunction):
             nn.Linear(raw_message_dimension//2, message_dimension),
         )
 
-    def compute_message(self, raw_messages):
+    def forward(self, raw_messages):
         messages = self.mlp(raw_messages)
         return messages
     
 
 class IdentityMessageFunction(MessageFunction):
-    def compute_message(self, raw_messages):
+    def forward(self, raw_messages):
         return raw_messages
 
 def get_message_function(module_type, raw_message_dimension, message_dimension):
@@ -27,3 +27,5 @@ def get_message_function(module_type, raw_message_dimension, message_dimension):
         return MLPMessageFunction(raw_message_dimension, message_dimension)
     elif module_type == "identity":
         return IdentityMessageFunction()
+    else:
+        raise ValueError(f"Unknown message function type: {module_type}")

@@ -53,17 +53,28 @@ class TemporalDataset(Dataset):
 
         self.unseen_nodes = unseen_nodes if unseen_nodes is not None else torch.tensor([]) 
 
-
-
+        
         
         # Infer number of nodes if not provided
         if num_nodes is None:
-            self.num_nodes = int(edges.max().item() + 1)
+            self.num_nodes = int(edges.max().item())
         else:
             self.num_nodes = num_nodes
             
         self.num_edges = len(edges)
         
+        # Sort edges by timestamp before creating samples
+        sorted_indices = torch.argsort(self.timestamps)
+        self.edges = self.edges[sorted_indices]
+        self.timestamps = self.timestamps[sorted_indices]
+        if self.edge_features is not None:
+            self.edge_features = self.edge_features[sorted_indices]
+        
+        # Get actual number of nodes (excluding padding)
+        actual_max_node = int(self.edges.max().item())
+        self.num_nodes = actual_max_node  # This should be 9228 for Wikipedia
+
+
         # Build adjacency list for neighborhood sampling
         self._build_adjacency_list()
         
@@ -245,7 +256,7 @@ class TemporalDataset(Dataset):
             dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
             if src != dst and (src, dst) not in self.positive_edge_set:
                 return src, dst, pos_timestamp
-            attempts += 1
+        attempts += 1
         
         # Final fallback
         src = torch.randint(1, self.num_nodes + 1, (1,)).item()

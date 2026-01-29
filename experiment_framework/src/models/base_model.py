@@ -104,10 +104,14 @@ class TimeEncoder(nn.Module):
 
     def forward(self, timestamps):
         
-        timestamps = timestamps.unsqueeze(-1) # [batch_size, 1]
-        args = timestamps*self.freqs.unsqueeze(0) # [batch_size, time_dim//2]
+        # Handle both [batch_size] and [batch_size, 1] inputs
+        if timestamps.dim() == 2 and timestamps.shape[1] == 1:
+            timestamps = timestamps.squeeze(-1)  # [batch_size]
+        
+        # [batch_size, 1] * [1, time_dim//2] = [batch_size, time_dim//2]
+        args = timestamps.unsqueeze(-1) * self.freqs.unsqueeze(0)
         time_enc = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return time_enc #[batch_size, time_dim]
+        return time_enc  # [batch_size, time_dim] - 2D tensor
     
 
 

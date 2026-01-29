@@ -24,12 +24,17 @@ class Memory(nn.Module):
     """
     Initializes the memory to all zeros. It should be called at the start of each epoch.
     """
-    # Treat memory as parameter so that it is saved and loaded together with the model
-    self.memory = nn.Parameter(torch.zeros((self.n_nodes, self.memory_dimension)).to(self.device),
-                               requires_grad=False)
-    self.last_update = nn.Parameter(torch.zeros(self.n_nodes).to(self.device),
-                                    requires_grad=False)
-
+    # Get current device from existing memory or use specified device
+    current_device = self.memory.device if hasattr(self, 'memory') else self.device
+    
+    # Create tensors on correct device
+    memory_tensor = torch.zeros((self.n_nodes, self.memory_dimension), device=current_device)
+    last_update_tensor = torch.zeros(self.n_nodes, device=current_device)
+    
+    # Register as parameters
+    self.memory = nn.Parameter(memory_tensor, requires_grad=False)
+    self.last_update = nn.Parameter(last_update_tensor, requires_grad=False)
+    
     self.messages = defaultdict(list)
 
   def store_raw_messages(self, nodes, node_id_to_messages):
@@ -73,3 +78,11 @@ class Memory(nn.Module):
   def clear_messages(self, nodes):
     for node in nodes:
       self.messages[node] = []
+
+  def to(self, device):
+    """Move memory to specified device."""
+    if hasattr(self, 'memory'):
+        self.memory = self.memory.to(device)
+        self.last_update = self.last_update.to(device)
+        self.device = device
+    return self
