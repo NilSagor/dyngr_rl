@@ -25,7 +25,7 @@ class SequenceMemoryUpdater(MemoryUpdater):
     valid_mask = last_update <= timestamps
     if not valid_mask.all():
         # Log warning for debugging
-        print(f"Warning: Skipping {(~valid_mask).sum().item()} memory updates in the past")
+        # print(f"Warning: Skipping {(~valid_mask).sum().item()} memory updates in the past")
         unique_node_ids = unique_node_ids[valid_mask]
         unique_messages = unique_messages[valid_mask]
         timestamps = timestamps[valid_mask]

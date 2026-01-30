@@ -40,10 +40,10 @@ class TemporalDataset(Dataset):
         super().__init__()
         
         self.edges = edges.to(device)
-        print("Edges shape:", self.edges.shape)
+        # print("Edges shape:", self.edges.shape)
         # assert self.edges.shape[1] == 2, f"Expected 2 columns for edges, got {self.edges.shape[1]}"
         self.timestamps = timestamps.to(device)
-        print("Timestamps shape:", self.timestamps.shape)
+        # print("Timestamps shape:", self.timestamps.shape)
         self.edge_features = edge_features.to(device) if edge_features is not None else None        
         self.max_neighbors = max_neighbors
         self.split = split
@@ -103,11 +103,12 @@ class TemporalDataset(Dataset):
             
     
     def _prepare_samples(self):
-        """Prepare positive and negative samples."""
+        """Prepare positive and negative samples with exact 1:1 balance."""
         self.samples = []
         
-        # Add positive samples
+        # Create positive samples
         for idx in range(self.num_edges):
+            # Positive sample
             self.samples.append({
                 'idx': idx,
                 'label': 1.0,
@@ -118,8 +119,9 @@ class TemporalDataset(Dataset):
                 'is_positive': True
             })
             
-            # Add ONE negative sample per positive sample (for evaluation)
+            # Negative sample (only for non-training splits OR balanced training)
             if self.split != 'train':
+                # For val/test: generate one negative per positive
                 if self.negative_sampling_strategy == "historical":
                     neg_src, neg_dst, neg_ts = self._generate_single_historical_negative(
                         self.edges[idx, 0].item(), 
@@ -138,7 +140,7 @@ class TemporalDataset(Dataset):
                         self.edges[idx, 1].item(), 
                         self.timestamps[idx].item()
                     )
-
+                    
                 self.samples.append({
                     'idx': -1,
                     'label': 0.0,
@@ -149,37 +151,55 @@ class TemporalDataset(Dataset):
                     'is_positive': False
                 })
         
-        # For training: use negative_sampling_ratio
-        # if self.split == 'train':
-        #     num_negative = int(self.num_edges * self.negative_sampling_ratio)
-            
-        #     if self.negative_sampling_strategy == "historical":
-        #         negative_samples = self._generate_historical_negatives(num_negative)
-        #     elif self.negative_sampling_strategy == "inductive":
-        #         negative_samples = self._generate_inductive_negatives(num_negative)
-        #     else:  # random
-        #         negative_samples = self._generate_random_negatives(num_negative)
-            
-        if self.split == "train":
-            num_negative = int(self.num_edges*self.negative_sampling_ratio)
-            negative_samples = self._generate_random_negatives(num_negative)
-
-            # negative_samples = self._generate_random_negatives(num_negative)
-            for src_node, dst_node, timestamp in negative_samples:
-                self.samples.append({
+        # For training: use exactly 1:1 ratio (same number of negatives as positives)
+        if self.split == 'train':
+            num_positives = self.num_edges
+            negative_samples = []
+            for i in range(num_positives):
+                pos_sample = {
+                    'src_node': self.edges[i, 0].item(),
+                    'dst_node': self.edges[i, 1].item(),
+                    'timestamp': self.timestamps[i].item()
+                }
+                
+                if self.negative_sampling_strategy == "historical":
+                    neg_src, neg_dst, neg_ts = self._generate_single_historical_negative(
+                        pos_sample['src_node'], pos_sample['dst_node'], pos_sample['timestamp']
+                    )
+                elif self.negative_sampling_strategy == "inductive":
+                    neg_src, neg_dst, neg_ts = self._generate_single_inductive_negative(
+                        pos_sample['src_node'], pos_sample['dst_node'], pos_sample['timestamp']
+                    )
+                else:
+                    neg_src, neg_dst, neg_ts = self._generate_single_negative_random(
+                        pos_sample['src_node'], pos_sample['dst_node'], pos_sample['timestamp']
+                    )
+                
+                negative_samples.append({
                     'idx': -1,
                     'label': 0.0,
-                    'src_node': src_node,
-                    'dst_node': dst_node,
-                    'timestamp': timestamp,
+                    'src_node': neg_src,
+                    'dst_node': neg_dst,
+                    'timestamp': neg_ts,
                     'edge_feature': None,
                     'is_positive': False
                 })
+            
+            self.samples.extend(negative_samples)
         
         # Shuffle only for training
         if self.split == 'train':
             indices = torch.randperm(len(self.samples))
             self.samples = [self.samples[i] for i in indices]
+
+        # Debug validation
+        if len(self.samples) > 0:
+            labels = [s['label'] for s in self.samples]
+            pos_ratio = sum(labels) / len(labels)
+            print(f"Split {self.split}: {len(self.samples)} samples, positive ratio = {pos_ratio:.3f}")
+            
+            # Ensure we have both classes
+            assert 0.4 <= pos_ratio <= 0.6, f"Label imbalance: {pos_ratio:.3f}"
             
     def _generate_single_historical_negative(self, pos_src, pos_dst, pos_timestamp):
         """Generate historical negative: (pos_src, w, pos_timestamp) where w is a past neighbor of pos_src ≠ pos_dst"""
@@ -248,21 +268,22 @@ class TemporalDataset(Dataset):
             return src, dst, future_timestamp
 
     def _generate_single_negative_random(self, pos_src, pos_dst, pos_timestamp):
-        """Helper method for random negative sampling without recursion"""
-        attempts = 0
+        """Generate valid random negative samples."""
         max_attempts = 100
-        while attempts < max_attempts:
+        for _ in range(max_attempts):
+            # Sample from actual node range (1 to num_nodes inclusive)
             src = torch.randint(1, self.num_nodes + 1, (1,)).item()
             dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+            
+            # Ensure valid edge (not self-loop and not positive edge)
             if src != dst and (src, dst) not in self.positive_edge_set:
                 return src, dst, pos_timestamp
-        attempts += 1
         
-        # Final fallback
-        src = torch.randint(1, self.num_nodes + 1, (1,)).item()
-        dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
-        while src == dst:
-            dst = torch.randint(1, self.num_nodes + 1, (1,)).item()
+        # Final fallback: use different destination
+        src = pos_src
+        dst = (pos_dst % self.num_nodes) + 1
+        if src == dst:
+            dst = (dst % self.num_nodes) + 1
         return src, dst, pos_timestamp
     
     def _generate_random_negatives(self, num_negative: int):

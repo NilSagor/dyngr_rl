@@ -14,8 +14,12 @@ class MergeLayer(nn.Module):
         torch.nn.init.xavier_normal_(self.fc1.weight)
         torch.nn.init.xavier_normal_(self.fc2.weight)
 
-    def forward(self, x1, x2):
-        x = torch.cat([x1, x2], dim=1)
+    def forward(self, x1, x2, x3=None, x4=None):
+        # Handle both 2-arg and 4-arg usage
+        if x3 is None:
+            x = torch.cat([x1, x2], dim=-1)
+        else:
+            x = torch.cat([x1, x2, x3, x4], dim=-1)
         h = self.act(self.fc1(x))
         return self.fc2(h)
 

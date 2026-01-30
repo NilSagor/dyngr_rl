@@ -16,7 +16,8 @@ import csv
 from datetime import datetime
 import argparse
 import yaml 
-import torch 
+import torch
+import numpy as np 
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
@@ -28,7 +29,7 @@ from src.models.tgn import TGN
 from src.utils.general_utils import set_seed, get_device
 from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
-
+from src.models.tgn_module.neighbor_finder import get_neighbor_finder
 
 # MODEL_REGISTRY={
 #     "DyGFormer": DyGFormer,
@@ -40,6 +41,16 @@ MODEL_REGISTRY={
     "DyGFormer": DyGFormer,
     "TGN": TGN,    
 }
+
+
+class DataWrapper:
+    def __init__(self, edges, timestamps):
+        self.sources = edges[:, 0].cpu().numpy()
+        self.destinations = edges[:, 1].cpu().numpy()
+        self.timestamps = timestamps.cpu().numpy()
+        self.edge_idxs = np.arange(len(edges))
+
+
 
 def load_config(config_path):
     with open(config_path, "r") as f:
@@ -210,10 +221,15 @@ def train_model(config: dict):
     # Initialize model
     model = setup_model(config, num_nodes)
     # Set raw features for models that need them
+    model.neighbor_finder = neighbor_finder.to(device)
+
     
     dataset_name = config['data']['dataset']
     if dataset_name in DATASET_LOADERS:
         data = DATASET_LOADERS[dataset_name]()
+
+        data_wrapper = DataWrapper(data['edges'], data['timestamps'])
+        neighbor_finder = get_neighbor_finder(data_wrapper, uniform=False)
         
         # Get features (handle both padded and unpadded)
         node_features = data.get('node_features', torch.zeros(num_nodes, 172))
@@ -230,22 +246,45 @@ def train_model(config: dict):
         # Set features based on model type
         if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
             model.set_raw_features(node_features, edge_features)
+        # elif config['model']['name'] == 'TGN':
+        #     # TGN uses UNPADDED edge features directly
+        #     unpadded_edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
+        #     # Set raw features (TGN should have set_raw_features method)
+        #     if hasattr(model, 'set_raw_features'):
+        #         model.set_raw_features(node_features, unpadded_edge_features)
+        #     else:
+        #         # Fallback: set attributes directly
+        #         model.node_raw_features = node_features.to(device)
+        #         model.edge_raw_features = unpadded_edge_features.to(device)
         elif config['model']['name'] == 'TGN':
-            # TGN uses UNPADDED edge features directly
-            unpadded_edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
-            # Set raw features (TGN should have set_raw_features method)
-            if hasattr(model, 'set_raw_features'):
-                model.set_raw_features(node_features, unpadded_edge_features)
+            # Load raw features with proper padding for 1-indexed nodes
+            actual_num_nodes = num_nodes  # This should be 9228 for Wikipedia
+            
+            # Get node features from dataset (should already be padded)
+            if 'node_features' in data:
+                node_features = data['node_features']
+                logger.info(f"Loaded node features shape: {node_features.shape}")
             else:
-                # Fallback: set attributes directly
-                model.node_raw_features = node_features.to(device)
-                model.edge_raw_features = unpadded_edge_features.to(device)  
+                # Wikipedia has NO node features - use learned embeddings instead
+                logger.warning("No node features available - using learned embeddings")
+                node_features = None
+
+            # Edge features (use unpadded version for TGN)
+            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
+            
+            model.set_raw_features(node_features, edge_features)
+            logger.info(f"Node feature stats - mean: {node_features.mean():.6f}, std: {node_features.std():.6f}")
+            logger.info(f"First 5 node features:\n{node_features[1:6]}") 
     
         logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
     logger.info(f"Model: {model.__class__.__name__}")
     logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    logger.info(f"Loaded node features shape: {node_features.shape}")
+    logger.info(f"Dataset num_nodes: {num_nodes}")
+    logger.info(f"Node ID range in data: {data['edges'].min()} to {data['edges'].max()}")
+
     # Setup trainer
     trainer = setup_trainer(config)
     
@@ -359,8 +398,10 @@ def main():
      # Update dynamic fields
     config['experiment']['name'] = f"{model_name}_{eval_type}_{neg_sample}"
     config['experiment']['description'] = f"{model_name} on Wikipedia | {eval_type} | {neg_sample}"
-    config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
-    config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
+    # config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
+    # config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
+    config['logging']['log_dir'] = f"./logs/{model_name}_{eval_type}_{neg_sample}"
+    config['logging']['checkpoint_dir'] = f"./checkpoints/{model_name}_{eval_type}_{neg_sample}"
     
     # Create directories
     os.makedirs(config['logging']['log_dir'], exist_ok=True)
@@ -377,6 +418,8 @@ def main():
     logger.info(f"Experiment: {config['experiment']['name']}")
     logger.info(f"Description: {config['experiment']['description']}")
     logger.info(f"Config file: {args.configs}")
+
+    
     
     for seed in args.seeds:
         config['experiment']['seed'] = seed

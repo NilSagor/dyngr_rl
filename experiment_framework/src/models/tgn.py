@@ -99,21 +99,42 @@ class TGN(BaseDynamicGNN):
         if self.use_memory and self.memory is not None:
             self.memory = self.memory.to(self.device)
 
-        # Link predictor
-        self.link_predictor = MergeLayer(
-            dim1=hidden_dim,
-            dim2=hidden_dim,
-            dim3=hidden_dim,
-            dim4=1
+       
+        self.link_predictor = nn.Sequential(
+            nn.Linear(hidden_dim*2, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # Add normalization
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1)
         )
+
+        # Initialize weights properly
+        self._init_weights()
 
         # Loss function
         self.loss_fn = nn.BCEWithLogitsLoss()
 
-        # Track messages separately from training
-        self.pending_messages = []
-        self._in_training_step = False
+        print(f"TGN initialized with use_memory={self.use_memory}")
+        if self.memory_updater is not None:
+            print("Memory updater: OK")
+        else:
+            print("Memory updater: NONE!")
 
+        # Add training state tracking
+        self.train_batch_counter = 0
+        self.last_batch_time = None
+
+        # self._pending_messages = None
+
+    def _init_weights(self):
+        """Initialize weights for better convergence."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    
     def _init_modules(self):
         """Initialize TGN modules"""
         device = self.device
@@ -159,7 +180,7 @@ class TGN(BaseDynamicGNN):
                 neighbor_finder=self.neighbor_finder,
                 time_encoder=self.time_encoder,
                 n_layers=self.num_layers,
-                n_node_features=self.node_features,
+                n_node_features=self.hidden_dim, # changed from self.node_features
                 n_edge_features=1,
                 n_time_features=self.time_encoding_dim,
                 embedding_dimension=self.hidden_dim,
@@ -180,8 +201,8 @@ class TGN(BaseDynamicGNN):
         self.node_raw_features = node_raw_features.to(self.device)
         self.edge_raw_features = edge_raw_features.to(self.device)
         
-        print(f"Node features shape: {self.node_raw_features.shape}")
-        print(f"Edge features shape: {self.edge_raw_features.shape}")
+        # print(f"Node features shape: {self.node_raw_features.shape}")
+        # print(f"Edge features shape: {self.edge_raw_features.shape}")
 
         # Update embedding module if it exists
         if hasattr(self, 'embedding_module') and self.embedding_module is not None:
@@ -198,9 +219,12 @@ class TGN(BaseDynamicGNN):
         if self.node_raw_features is not None and len(self.node_raw_features.shape) > 1:
             node_feat_dim = self.node_raw_features.shape[1]
         else:
-            node_feat_dim = self.node_features
+            node_feat_dim = self.hidden_dim # changed from self.node_features
             
+        # Raw message dimension: [src_features, dst_features, src_memory, dst_memory, time_enc]
         raw_message_dim = node_feat_dim * 2 + self.memory_dim * 2 + self.time_encoding_dim
+        # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
+        print(f"Message function input dim: {raw_message_dim} (node={node_feat_dim}, mem={self.memory_dim}, time={self.time_encoding_dim})")
         
         # Ensure raw_message_dim is positive
         if raw_message_dim <= 0:
@@ -218,141 +242,124 @@ class TGN(BaseDynamicGNN):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward pass of TGN."""
+        
+        # # Apply pending messages from PREVIOUS batch
+        # if self._pending_messages is not None:
+        #     with torch.no_grad():
+        #         nodes, messages, timestamps = self._pending_messages
+        #         if self.memory_updater is not None:
+        #             self.memory_updater.update_memory(nodes, messages, timestamps)
+        #     self._pending_messages = None
+        
+        # DEBUG: Check initial memory state
+        if self.train_batch_counter == 0 and self.training:
+            print(f"First training batch - Memory stats: "
+                  f"mean={self.memory.memory.mean():.6f}, "
+                  f"std={self.memory.memory.std():.6f}")
+        
+        # Update memory BEFORE forward pass for this batch
+        # (using previous batch's messages if needed)
+        if self.training and self.use_memory and self.memory is not None:
+            self._update_memory_for_batch(batch)
+        
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']
 
-        # Generate negative samples
-        negative_nodes = self._generate_negative_samples(
-            src_nodes.cpu().numpy(),
-            dst_nodes.cpu().numpy(),
-        )
+        # # Generate negative samples
+        # negative_nodes = self._generate_negative_samples(
+        #     src_nodes.cpu().numpy(),
+        #     dst_nodes.cpu().numpy(),
+        # )
 
+        # CRITICAL: Update memory from previous batch's messages before computing embeddings
+        # if self.use_memory and self.memory is not None:
+        #     self._process_pending_messages()
+
+        
         # Compute embeddings
-        source_embedding, destination_embedding, negative_embedding = self.compute_temporal_embeddings(
+        source_embedding, destination_embedding = self.compute_temporal_embeddings_pair(
             source_nodes=src_nodes.cpu().numpy(),
-            destination_nodes=dst_nodes.cpu().numpy(),
-            negative_nodes=negative_nodes,
-            edge_times=timestamps.cpu().numpy(),
+            destination_nodes=dst_nodes.cpu().numpy(),            
+            edge_times = timestamps.cpu().numpy(),
             n_neighbors=self.n_neighbors
         )
-        
+
+        # # DEBUG CHECKS (remove after fixing)
+        # if self.training and batch_idx == 0:  # First batch only
+        #     print(f"Source embedding stats: mean={source_embedding.mean():.4f}, std={source_embedding.std():.4f}")
+        #     print(f"Embedding range: [{source_embedding.min():.4f}, {source_embedding.max():.4f}]")
+        #     if source_embedding.std() < 0.01:
+        #         print("WARNING: Embeddings have near-zero variance! Check projection layer.")
+            
         # Link prediction
-        pos_scores = self.link_predictor(source_embedding, destination_embedding)
-        neg_scores = self.link_predictor(source_embedding, negative_embedding)
+        # pos_scores = self.link_predictor(source_embedding, destination_embedding)
+        # neg_scores = self.link_predictor(source_embedding, negative_embedding)
+        # Concatenate embeddings for link prediction
+        combined = torch.cat([source_embedding, destination_embedding], dim=-1)
+        scores = self.link_predictor(combined).squeeze(-1)
 
-        scores = torch.cat([pos_scores, neg_scores], dim=0)
-        return scores.squeeze()
+        # Increment batch counter for debugging
+        if self.training:
+            self.train_batch_counter += 1
+
+        return scores
         
-    def compute_temporal_embeddings(self, source_nodes: np.ndarray, 
+    def compute_temporal_embeddings_pair(self, source_nodes: np.ndarray,
                                    destination_nodes: np.ndarray,
-                                   negative_nodes: np.ndarray,
                                    edge_times: np.ndarray,
-                                   n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute temporal embeddings for sources, destinations, and negatives."""
+                                   n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
         n_samples = len(source_nodes)
-        
-        # Combine all nodes
-        all_nodes = np.concatenate([source_nodes, destination_nodes, negative_nodes])
-        all_timestamps = np.concatenate([edge_times, edge_times, edge_times])
-        all_nodes_tensor = torch.from_numpy(all_nodes).long().to(self.device)
-        
-        # Get memory if available
-        memory = None
-        time_diffs = None
-        
-        if self.use_memory and self.memory is not None:
-            if self.memory_update_at_start:
-                # self._update_memory_from_messages()
-                self._update_memory_safely()
-                
-            memory = self.memory.get_memory(all_nodes_tensor)
-            
-            # Compute time differences
-            last_update = self.memory.get_last_update(all_nodes_tensor)
-            edge_times_tensor = torch.from_numpy(all_timestamps).float().to(self.device)
-            time_diffs = edge_times_tensor - last_update
-            time_diffs = time_diffs.unsqueeze(-1)
+        src_tensor = torch.from_numpy(source_nodes).long().to(self.device)
+        dst_tensor = torch.from_numpy(destination_nodes).long().to(self.device)
 
-        # Compute embeddings
-        if self.embedding_module is not None:
-            node_embeddings = self.embedding_module.compute_embedding(
-                memory=memory,
-                source_nodes=all_nodes,
-                timestamps=all_timestamps,
-                n_layers=self.num_layers,
-                n_neighbors=n_neighbors,
-                time_diffs=time_diffs
-            )
+        # Get raw features
+        if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+            src_feat = self.node_raw_features[src_tensor]
+            dst_feat = self.node_raw_features[dst_tensor]
+            
+            # DEBUG: Check feature values
+            if self.training and self.train_batch_counter < 3:
+                print(f"Features - src mean: {src_feat.mean():.6f}, dst mean: {dst_feat.mean():.6f}")
+
         else:
-            # Fallback: use memory or node features
-            if memory is not None:
-                node_embeddings = memory
-            elif hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-                node_embeddings = self.node_raw_features[all_nodes_tensor]
-            else:
-                node_embeddings = torch.zeros(len(all_nodes), self.hidden_dim, device=self.device)
-        
-        # Split embeddings
-        source_emb = node_embeddings[:n_samples]
-        destination_emb = node_embeddings[n_samples:2*n_samples]
-        negative_emb = node_embeddings[2*n_samples:]
-        
-        return source_emb, destination_emb, negative_emb
-             
-    # def _update_memory_from_messages(self):
-    #     """Update memory from stored messages."""
-    #     if self.use_memory and self.memory is not None and self.memory_updater is not None:
-    #         node_ids = []
-    #         messages = []
-    #         timestamps = []
+            src_feat = self.node_embedding(src_tensor)
+            dst_feat = self.node_embedding(dst_tensor)
+
+        # CRITICAL: Incorporate memory WITHOUT detaching during training
+        if self.use_memory and self.memory is not None:
+            src_mem = self.memory.get_memory(src_tensor)
+            dst_mem = self.memory.get_memory(dst_tensor)
             
-    #         for node_id, node_messages in self.memory.messages.items():
-    #             if len(node_messages) > 0:
-    #                 node_ids.append(node_id)
-    #                 latest_msg = node_messages[-1]
-    #                 messages.append(latest_msg[0])
-    #                 timestamps.append(latest_msg[1])
+            # DEBUG: Check memory values at this point
+            if self.training and self.train_batch_counter < 3:
+                print(f"Memory in embeddings - src mean: {src_mem.mean():.6f}, "
+                      f"std: {src_mem.std():.6f}")
             
-    #         if node_ids:
-    #             node_ids_tensor = torch.tensor(node_ids, device=self.device)
-    #             messages_tensor = torch.stack(messages)
-    #             timestamps_tensor = torch.tensor(timestamps, device=self.device)
-                
-    #             self.memory_updater.update_memory(node_ids_tensor, messages_tensor, timestamps_tensor)
-    #             self.memory.clear_messages(node_ids)
+            # Only warn if memory is truly zero for many batches
+            if self.training and self.train_batch_counter > 10 and src_mem.abs().sum() < 1e-6:
+                print("WARNING: Memory is still all zeros after 10 batches!")
+
+            # Concatenate features + memory
+            src_emb = torch.cat([src_feat, src_mem], dim=-1)
+            dst_emb = torch.cat([dst_feat, dst_mem], dim=-1)
+            # Project to hidden_dim
+            if not hasattr(self, 'mem_proj'):
+                self.mem_proj = nn.Linear(src_emb.shape[-1], self.hidden_dim).to(self.device)
+            src_emb = self.mem_proj(src_emb)
+            dst_emb = self.mem_proj(dst_emb)
+        else:
+            # Fallback: use features only
+            src_emb = src_feat
+            dst_emb = dst_feat
+            if src_emb.shape[-1] != self.hidden_dim:
+                src_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
+                dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
+
+        return src_emb, dst_emb
     
-    def _update_memory_safely(self):
-        """Update memory safely without breaking gradient computation."""
-        if self.use_memory and self.memory is not None and self.memory_updater is not None:
-            with torch.no_grad():  # Detach from gradient computation
-                self._process_pending_messages()
     
-    def _process_pending_messages(self):
-        """Process pending messages to update memory."""
-        if not self.pending_messages:
-            return
-            
-        # Group messages by timestamp to process in order
-        self.pending_messages.sort(key=lambda x: x[2].min().item())
-        
-        for nodes, messages, timestamps in self.pending_messages:
-            # Detach messages from computation graph
-            nodes_detached = nodes.detach()
-            messages_detached = messages.detach()
-            timestamps_detached = timestamps.detach()
-            
-            # Update memory
-            if self.memory_updater is not None:
-                # Use the updater to update memory
-                self.memory_updater.update_memory(
-                    nodes_detached, 
-                    messages_detached, 
-                    timestamps_detached
-                )
-        
-        # Clear pending messages
-        self.pending_messages = []
+    
 
     
     def _generate_negative_samples(self, src_nodes: np.ndarray, 
@@ -368,130 +375,188 @@ class TGN(BaseDynamicGNN):
         return negative_nodes  
     
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        self._in_training_step = True
-        try:
-            # Forward pass
-            logits = self.forward(batch)
-            batch_size = len(batch['src_nodes'])
-            
-            # create labels
-            labels = torch.cat([
-                torch.ones(batch_size, device=self.device),
-                torch.zeros(batch_size, device=self.device),
-            ])
+             
+        # Forward pass
+        logits = self.forward(batch)
+        
+        labels = batch['labels'].float()
 
-            # compute loss
-            loss = self.loss_fn(logits, labels)
-            
-            # # Only store messages during training (for gradient safety)
-            # if self.training:
-            #     self._process_messages_for_batch(batch)
-            # else:
-            #     # Safe to update memory immediately during eval
-            #     self._process_messages_for_batch(batch)
-            #     # Update memory right away
-            #     if hasattr(self, 'pending_messages'):
-            #         for nodes, messages, timestamps in self.pending_messages:
-            #             self.memory_updater.update_memory(nodes, messages, timestamps)
-            #         self.pending_messages = []
-            # prepare message for memory update (but not update yet) 
-            self._process_messages_for_batch(batch)
-            return loss
-        finally:
-            self._in_training_step = False
+        # Debug: Check label distribution
+        if self.training:
+            pos_ratio = labels.mean().item()
+            if pos_ratio < 0.4 or pos_ratio > 0.6:
+                print(f"WARNING: Label imbalance detected. Positive ratio: {pos_ratio:.2f}")
+         
+
+        # compute loss
+        loss = self.loss_fn(logits, labels)
+                
+        # prepare message for memory update (but not update yet) 
+        # with torch.no_grad():
+        self._update_memory_for_batch(batch)
+        return loss
     
+    def _update_memory_for_batch(self, batch: Dict[str, torch.Tensor]):
+        """Update memory immediately after forward pass."""
+        if not self.use_memory or self.memory is None:
+            return
+            
+        with torch.no_grad():
+            src_nodes = batch['src_nodes'].to(self.device)
+            dst_nodes = batch['dst_nodes'].to(self.device)
+            timestamps = batch['timestamps'].to(self.device)
+
+            # Get features
+            if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+                src_features = self.node_raw_features[src_nodes]
+                dst_features = self.node_raw_features[dst_nodes]
+            else:
+                src_features = self.node_embedding(src_nodes)
+                dst_features = self.node_embedding(dst_nodes)
+
+            # Get current memory states
+            src_memory = self.memory.get_memory(src_nodes)
+            dst_memory = self.memory.get_memory(dst_nodes)
+            time_enc = self.time_encoder(timestamps)
+            
+            # Create message inputs
+            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc], dim=-1)
+            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc], dim=-1)
+            
+            # Generate messages
+            src_messages = self.message_fn(src_msg_input)
+            dst_messages = self.message_fn(dst_msg_input)
+            
+            # Update memory
+            all_messages = torch.cat([src_messages, dst_messages], dim=0)
+            all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
+            all_timestamps = torch.cat([timestamps, timestamps], dim=0)
+            
+            # if self.memory_updater is not None:
+            self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
+            
+            # DEBUG: Check if memory is updating
+            if self.training and self.train_batch_counter < 5:
+                updated_memory = self.memory.get_memory(src_nodes[:1])
+                print(f"Batch {self.train_batch_counter}: "
+                    f"Memory updated - mean={updated_memory.mean():.6f}, "
+                    f"std={updated_memory.std():.6f}")
+                print(f"Messages - mean={all_messages.mean():.6f}, "
+                    f"std={all_messages.std():.6f}")
+       
     
     def _process_messages_for_batch(self, batch: Dict[str, torch.Tensor]):
         """Update node memories after interaction."""
         if not self.use_memory or self.memory is None:
             return
         
-        src_nodes = batch['src_nodes'].to(self.device)
-        dst_nodes = batch['dst_nodes'].to(self.device)
-        timestamps = batch['timestamps'].to(self.device)
+        with torch.no_grad():
+            src_nodes = batch['src_nodes'].to(self.device)
+            dst_nodes = batch['dst_nodes'].to(self.device)
+            timestamps = batch['timestamps'].to(self.device)
 
+            # DEBUG: Check memory BEFORE update
+            mem_before = self.memory.memory[src_nodes].mean().item()
+            print(f"Memory before update: {mem_before:.6f}")
         # Debug: Check node ID bounds
-        max_node_id = self.node_raw_features.size(0) - 1  # 9228 for Wikipedia
+        # max_node_id = self.node_raw_features.size(0) - 1  # 9228 for Wikipedia
         # assert src_nodes.max() <= max_node_id, f"Source node {src_nodes.max()} > {max_node_id}"
         # assert dst_nodes.max() <= max_node_id, f"Destination node {dst_nodes.max()} > {max_node_id}"
         # assert src_nodes.min() >= 1, f"Source node {src_nodes.min()} < 1"
         # assert dst_nodes.min() >= 1, f"Destination node {dst_nodes.min()} < 1"
 
-        if src_nodes.min() < 1:
-            print(f"WARNING: Invalid source node {src_nodes.min()}, filtering...")
-            valid_mask = src_nodes >= 1
-            if valid_mask.sum() == 0:
-                return  # Skip invalid batch
-            src_nodes = src_nodes[valid_mask]
-            dst_nodes = dst_nodes[valid_mask]
-            timestamps = timestamps[valid_mask]
+        # if src_nodes.min() < 1:
+        #     print(f"WARNING: Invalid source node {src_nodes.min()}, filtering...")
+        #     valid_mask = src_nodes >= 1
+        #     if valid_mask.sum() == 0:
+        #         return  # Skip invalid batch
+        #     src_nodes = src_nodes[valid_mask]
+        #     dst_nodes = dst_nodes[valid_mask]
+        #     timestamps = timestamps[valid_mask]
 
 
-        # Get node features
-        if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-            src_features = self.node_raw_features[src_nodes]
-            dst_features = self.node_raw_features[dst_nodes]
-        else:
-            src_features = torch.zeros(len(src_nodes), self.hidden_dim, device=self.device)
-            dst_features = torch.zeros(len(dst_nodes), self.hidden_dim, device=self.device)
-                 
-        # Get memories
-        if self.use_memory:
+            # Get node features
+            if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+                src_features = self.node_raw_features[src_nodes]
+                dst_features = self.node_raw_features[dst_nodes]
+            else:
+                # src_features = torch.zeros(len(src_nodes), self.hidden_dim, device=self.device)
+                # dst_features = torch.zeros(len(dst_nodes), self.hidden_dim, device=self.device)
+                # Use hidden_dim for embedding lookup
+                src_features = self.node_embedding(src_nodes)
+                dst_features = self.node_embedding(dst_nodes)
+
+            # Get memories
+            # if self.use_memory:
+            #     src_memory = self.memory.get_memory(src_nodes).detach()
+            #     dst_memory = self.memory.get_memory(dst_nodes).detach()
+            # else:
+            #     src_memory = torch.zeros(len(src_nodes), self.memory_dim, device=self.device)
+            #     dst_memory = torch.zeros(len(dst_nodes), self.memory_dim, device=self.device)
+
             src_memory = self.memory.get_memory(src_nodes)
             dst_memory = self.memory.get_memory(dst_nodes)
-        else:
-            src_memory = torch.zeros_like(src_features)
-            dst_memory = torch.zeros_like(dst_features)
-        
-        # Time encoding - should be [batch_size, time_dim]
-        # Time encoding
-        time_enc = self.time_encoder(timestamps)
-        
-        # # Edge features (if available)
-        # if 'edge_features' in batch:
-        #     edge_features = batch['edge_features']
-        #     edge_features_expanded = edge_features.unsqueeze(1).repeat(1, 2, 1).view(-1, edge_features.size(-1))
-        # else:
-        #     edge_features_expanded = torch.zeros(len(src_nodes) * 2, self.message_dim - (src_features.size(-1) * 2 + src_memory.size(-1) * 2 + time_enc.size(-1)), device=self.device)
+            
+            
+            
+            
+            # Time encoding - should be [batch_size, time_dim]
+            # Time encoding
+            time_enc = self.time_encoder(timestamps)
+            
+      
+            # Debug: Print shapes
+            # print(f"src_features: {src_features.shape}")
+            # print(f"dst_features: {dst_features.shape}")  
+            # print(f"src_memory: {src_memory.shape}")
+            # print(f"dst_memory: {dst_memory.shape}")
+            # print(f"time_enc: {time_enc.shape}")
+            
+            
+            
+            # Create message inputs
+            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc], dim=-1)
+            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc], dim=-1)
+            
+            # Generate messages        
+            src_messages = self.message_fn(src_msg_input)
+            dst_messages = self.message_fn(dst_msg_input)
+            
+            # Combine messages
+            all_messages = torch.cat([src_messages, dst_messages], dim=0)
+            all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
+            all_timestamps = torch.cat([timestamps, timestamps], dim=0)
 
-        # Debug: Print shapes
-        # print(f"src_features: {src_features.shape}")
-        # print(f"dst_features: {dst_features.shape}")  
-        # print(f"src_memory: {src_memory.shape}")
-        # print(f"dst_memory: {dst_memory.shape}")
-        # print(f"time_enc: {time_enc.shape}")
-        
-        
-        
-        # Create message inputs
-        src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc], dim=-1)
-        dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc], dim=-1)
-        
-        # Generate messages
-        src_messages = self.message_fn(src_msg_input)
-        dst_messages = self.message_fn(dst_msg_input)
-        
-        # Combine messages
-        all_messages = torch.cat([src_messages, dst_messages], dim=0)
-        all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
-        all_timestamps = torch.cat([timestamps, timestamps], dim=0)
+            print(f"Messages shape: {all_messages.shape}, expected last dim: {self.message_dim}")
+            
+            with torch.no_grad():
+                if self.memory_updater is not None:
+                    self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
+            
+            # Debug: Check memory values
+            if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
+                memory_mean = self.memory.memory.mean().item()
+                memory_std = self.memory.memory.std().item()
+                print(f"Memory stats - mean: {memory_mean:.4f}, std: {memory_std:.4f}")
+                
+                # Should NOT be zero after first few batches
+                if memory_std < 1e-6:
+                    print("WARNING: Memory has near-zero variance! Not updating properly.")
 
-        # # Update memories
-        # if self.use_memory:
-        #     self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
-        # Store in model state for later processing
-        # if not hasattr(self, 'pending_messages'):
-        #     self.pending_messages = []
-        self.pending_messages.append((all_nodes, all_messages, all_timestamps))
+            if self.memory_updater is not None:
+                self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
+                
+                # DEBUG: Check memory AFTER update
+                mem_after = self.memory.memory[src_nodes].mean().item()
+                print(f"Memory after update: {mem_after:.6f}")
+                if abs(mem_after - mem_before) < 1e-8:
+                    print("WARNING: Memory not changing! Updater not working.")        
 
     def _compute_metrics(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Compute evaluation metrics."""
         logits = self.forward(batch)
-        batch_size = len(batch['src_nodes'])
-        labels = torch.cat([
-            torch.ones(batch_size, device=self.device),
-            torch.zeros(batch_size, device=self.device),
-        ]).float()
+        
+        labels = batch['labels'].float()
         
         probs = torch.sigmoid(logits)
         predictions = (probs > 0.5).float()
@@ -522,64 +587,61 @@ class TGN(BaseDynamicGNN):
             'loss': loss
         }
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Update memory after backward pass."""
-        super().on_train_batch_end(outputs, batch, batch_idx)
-        with torch.no_grad():
-            self._process_pending_messages()
+    # def on_train_batch_end(self, outputs, batch, batch_idx):
+    #     super().on_train_batch_end(outputs, batch, batch_idx)
+    #     if hasattr(self, '_pending_messages'):
+    #         nodes, messages, timestamps = self._pending_messages
+    #         with torch.no_grad():
+    #             if self.memory_updater is not None:
+    #                 self.memory_updater.update_memory(nodes, messages, timestamps)
+    #         delattr(self, '_pending_messages')
+            
+    #         # Debug: Check if memory is updating
+    #         if batch_idx == 0 and self.current_epoch == 0:
+    #             mem_std = self.memory.memory.std().item()
+    #             print(f"Memory std after first batch: {mem_std:.6f}")
+        
 
-    def on_validation_batch_end(self, outputs, batch, batch_idx):
-        """Update memory after backward pass."""
-        super().on_validation_batch_end(outputs, batch, batch_idx)
-        with torch.no_grad():
-            self._process_pending_messages()
+    # def on_validation_batch_end(self, outputs, batch, batch_idx):
+    #     """Update memory after backward pass."""
+    #     # super().on_validation_batch_end(outputs, batch, batch_idx)
+    #     with torch.no_grad():
+    #         self._process_messages_for_batch(batch)
+    #         self._process_pending_messages()
 
-    def on_test_batch_end(self, outputs, batch, batch_idx):
-        """Update memory after backward pass."""
-        super().on_test_batch_end(outputs, batch, batch_idx)
-        with torch.no_grad():
-            self._process_pending_messages()
+    # def on_test_batch_end(self, outputs, batch, batch_idx):
+    #     """Update memory after backward pass."""
+    #     super().on_test_batch_end(outputs, batch, batch_idx)
+    #     with torch.no_grad():
+    #         self._process_pending_messages()
     
     
     def on_train_epoch_start(self):
-        """Reset memory at start of train epoch."""
+        """DO NOT reset memory at start of train epoch."""
         super().on_train_epoch_start()
-        if self.use_memory and self.memory is not None:
-            self.memory.__init_memory__()
-            self.pending_messages = []
+        # Memory should persist across training batches
+        self.train_batch_counter = 0  # Reset counter for debugging
+        print(f"Starting training epoch - Memory initialized: "
+              f"mean={self.memory.memory.mean():.6f}")
 
     def on_validation_epoch_start(self):
         """Reset memory at start of validation epoch."""
         super().on_validation_epoch_start()
-        if self.use_memory and self.memory is not None:
+        # if self.use_memory and self.memory is not None:
+        if self.use_memory:
             self.memory.__init_memory__()
-            self.pending_messages = []
+            # self.pending_messages = [] # clear any stale message
+            print("Memory reset for validation")
 
     def on_test_epoch_start(self):
         """Reset memory at start of test epoch."""
         super().on_test_epoch_start()
-        if self.use_memory and self.memory is not None:
+        # if self.use_memory and self.memory is not None:
+        if self.use_memory:
             self.memory.__init_memory__()
-            self.pending_messages = []
+            # self.pending_messages = []
+            print("Memory reset for test")
 
     
 
 
-# class LinkPredictor(nn.Module):
-#     """Link prediction head."""
-#     def __init__(self, hidden_dim, dropout):
-#         super().__init__()
-#         self.mlp = nn.Sequential(
-#             nn.Linear(2 * hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim, hidden_dim // 2),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim // 2, 1)
-#         )
-
-#     def forward(self, src_embeddings, dst_embeddings):
-#         combined = torch.cat([src_embeddings, dst_embeddings], dim=-1)
-#         logits = self.mlp(combined).squeeze(-1)
-#         return logits

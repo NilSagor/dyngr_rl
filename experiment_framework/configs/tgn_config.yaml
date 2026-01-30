@@ -11,6 +11,7 @@ model:
   message_dim: 172
   num_layers: 1
   dropout: 0.1
+  use_memory: true
   
 # Training parameters
 training:
