@@ -32,9 +32,9 @@ data:
   
 # Experiment parameters
 experiment:
-  name: "tgn_experiment"
-  description: "TGN baseline experiment"
-  seed: 42
+  # name: "${model.name}_${data.evaluation_type}_${data.negative_sampling_strategy}"
+  # description: "${model.name} on ${data.dataset} |${data.evaluation_type}|${data.negative_sampling_strategy}"
+  seed: 42  
   device: "auto"  # auto, cpu, cuda
   precision: 32
   

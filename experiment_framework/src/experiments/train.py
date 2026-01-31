@@ -182,7 +182,7 @@ def resolve_config(config, context=None):
 
 def train_model(config: dict):
     """Main training function."""
-    
+    start_time = datetime.now()
     # Set random seed
     set_seed(config['experiment']['seed'])
     
@@ -218,10 +218,7 @@ def train_model(config: dict):
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
     logger.info(f"GPU count: {torch.cuda.device_count() if torch.cuda.is_available() else 0}")
     
-    # Initialize model
-    model = setup_model(config, num_nodes)
-    # Set raw features for models that need them
-    model.neighbor_finder = neighbor_finder.to(device)
+    
 
     
     dataset_name = config['data']['dataset']
@@ -233,14 +230,23 @@ def train_model(config: dict):
         
         # Get features (handle both padded and unpadded)
         node_features = data.get('node_features', torch.zeros(num_nodes, 172))
-        if 'edge_features_padded' in data:
-            edge_features = data['edge_features_padded']
+        # Handle features correctly
+        if dataset_name == "wikipedia":
+            # Wikipedia has NO node features - use None
+            node_features = None
+            # Edge features are already correct shape [num_edges, 172]
+            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
         else:
-            # Create padded version for consistency
-            unpadded = data.get('edge_features', torch.zeros(len(data['edges']), 1))
-            padded = torch.zeros(len(unpadded) + 1, unpadded.shape[1])
-            padded[1:] = unpadded
-            edge_features = padded
+            # Other datasets may have node features
+            node_features = data.get('node_features', None)
+            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
+        
+        
+        
+        # Initialize model
+        model = setup_model(config, num_nodes)
+        # Set raw features for models that need them
+        model.neighbor_finder = neighbor_finder
         
         # FIX: Load and set raw features
         # Set features based on model type
@@ -274,7 +280,7 @@ def train_model(config: dict):
             
             model.set_raw_features(node_features, edge_features)
             logger.info(f"Node feature stats - mean: {node_features.mean():.6f}, std: {node_features.std():.6f}")
-            logger.info(f"First 5 node features:\n{node_features[1:6]}") 
+            # logger.info(f"First 5 node features:\n{node_features[1:6]}") 
     
         logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
@@ -323,7 +329,10 @@ def train_model(config: dict):
         'test_accuracy': test_results[0].get('test_accuracy', 0.0),
         'test_ap': test_results[0].get('test_ap', 0.0),
         'test_auc': test_results[0].get('test_auc', 0.0),
-        'test_loss': test_results[0].get('test_loss', 0.0),        
+        'test_loss': test_results[0].get('test_loss', 0.0),
+        'val_loss': trainer.callback_metrics.get('val_loss', 0.0),
+        'training_time': (datetime.now() - start_time).total_seconds(),
+        'num_parameters': sum(p.numel() for p in model.parameters()),        
         'timestamp': datetime.now().isoformat()
     }
 
@@ -366,7 +375,7 @@ def main():
         "--seeds",
         type=int,
         nargs="+",
-        default=[42],
+        default=None,
         help="List of random seeds to run"
     )
 
@@ -394,10 +403,11 @@ def main():
     model_name = config['model'].get('name', 'dygformer')
     eval_type = config['data'].get('evaluation_type', 'transductive')
     neg_sample = config['data'].get('negative_sampling_strategy', 'random')
+    data_name = config['data'].get('dataset', 'wikipedia')
 
      # Update dynamic fields
     config['experiment']['name'] = f"{model_name}_{eval_type}_{neg_sample}"
-    config['experiment']['description'] = f"{model_name} on Wikipedia | {eval_type} | {neg_sample}"
+    config['experiment']['description'] = f"{model_name} on {data_name} | {eval_type} | {neg_sample}"
     # config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
     # config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
     config['logging']['log_dir'] = f"./logs/{model_name}_{eval_type}_{neg_sample}"

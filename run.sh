@@ -1,7 +1,8 @@
-#!/bin/bash
+!/bin/bash
 set -e
 
-CONFIG="experiment_framework/configs/dygformer_config.yaml"
+# CONFIG="experiment_framework/configs/dygformer_config.yaml"
+CONFIG="experiment_framework/configs/tgn_config.yaml"
 SCRIPT="experiment_framework/src/experiments/train.py"
 
 DATASETS=("wikipedia" "reddit" "mooc" "lastfm" "uci")
@@ -60,7 +61,7 @@ done
 # done
 
 
-# MODELS=("DyGFormer" "TGN" "TAWRMAC")
+# MODELS=("DyGFormer" "TGN" )
 # DATASETS=("wikipedia" "reddit" "mooc" "lastfm" "uci")
 # EVAL_TYPES=("transductive" "inductive")
 # NEG_STRATS=("random" "historical" "inductive")

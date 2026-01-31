@@ -1,28 +1,33 @@
 # experiment_log.md
 
-## Run: DyGFormer-Wikipedia-Historical (2026-01-21)
+## Run: Dynamic Graph Link Prediction (Updated: 2026/01/30)
 
-### Configuration
-- **Model**: DyGFormer
-- **Dataset**: Wikipedia (ml_wikipedia)
+- **Model**: DyGFormer, TGN
+- **Dataset**: Wikipedia, Reddit, MOOC, Lastfm, UCI
+- **Evaluation Type**: Transductive/Inductive
 - **Negative Sampling**: random/historical/inductive
-- **Evaluation Type**: transductive/inductive
-- **Seed**: 42
-- **Config File**: `configs/dygformer_config.yaml`
+- **Seed**: 42, 43, 44
+- **Config File**: `configs/dygformer_config.yaml`, `configs/tgn_config.yaml`
 - **GPU**: RTX 4060ti 16g
+
+
+
 ### Results
-|Model Name|Dataset  |EvaluationType|Sampling Strategy|Test AP|TEST AUC|Test Acc|Test Loss|Notes  |
-|----------|-------  |----------    |---------        |-------|----    |--------|---------|---    |
-|          |         |              |Random           |0.9811 |0.9711  |0.9239  |0.2147   |       |
-|          |         |              |Historical       |0.4794 |0.4376  |0.4276  |5.0051   |       |   
-| DyGFormer|Wikipedia|Inductive     |inductive        |0.9801 |0.9706  |0.9260  |0.2285   |       | 
-|          |         |              |Random           |0.9811 |0.9711  |0.9239  |0.2147   |       |
-|          |         |              |Historical       |0.4794 |0.4376  |0.4276  |5.0051   |       |
-|          |         |Transductive  |inductive        |0.9801 |0.9706  |0.9260  |0.2285   |       |
-|          |uci      |Inductive     |inductive        |0.9472 |0.9252  |0.8731  |0.3328   |       |
-|          |lastfm   |Inductive     |inductive        |0.8783 |0.8566  |0.6756  |1.4696   |       |
-|          |mooc     |Inductive     |inductive        |0.9829 |0.9849  |0.9445  |0.2268   |       |
-|          |reddit   |Inductive     |inductive        |0.9884 |0.9862  |0.9357  |0.1665   |       |
+- **GPU**: RTX 4060ti 16g
+
+
+
+#### DyGFormer Performance (Wikipedia)
+
+| Model Name | Dataset   | Evaluation Type | Sampling Strategy | Test AP | Test AUC | Test Acc | Test Loss | Notes |
+|------------|-----------|-----------------|-------------------|---------|----------|----------|-----------|-------|
+| DyGFormer  | Wikipedia | Inductive       | Random            | 0.9811  | 0.9711   | 0.9239   | 0.2147    |       |
+| DyGFormer  | Wikipedia | Inductive       | Historical        | 0.4794  | 0.4376   | 0.4276   | 5.0051    |       |
+| DyGFormer  | Wikipedia | Inductive       | Inductive         | 0.9801  | 0.9706   | 0.9260   | 0.2285    |       |
+| DyGFormer  | Wikipedia | Transductive    | Random            | 0.9811  | 0.9711   | 0.9239   | 0.2147    |       |
+| DyGFormer  | Wikipedia | Transductive    | Historical        | 0.4794  | 0.4376   | 0.4276   | 5.0051    |       |
+| DyGFormer  | Wikipedia | Transductive    | Inductive         | 0.9801  | 0.9706   | 0.9260   | 0.2285    |       |
+
 
 
 ### Analysis

@@ -181,7 +181,7 @@ class TGN(BaseDynamicGNN):
                 time_encoder=self.time_encoder,
                 n_layers=self.num_layers,
                 n_node_features=self.hidden_dim, # changed from self.node_features
-                n_edge_features=1,
+                n_edge_features=172,
                 n_time_features=self.time_encoding_dim,
                 embedding_dimension=self.hidden_dim,
                 device=device,
@@ -327,27 +327,44 @@ class TGN(BaseDynamicGNN):
             dst_feat = self.node_embedding(dst_tensor)
 
         # CRITICAL: Incorporate memory WITHOUT detaching during training
-        if self.use_memory and self.memory is not None:
-            src_mem = self.memory.get_memory(src_tensor)
-            dst_mem = self.memory.get_memory(dst_tensor)
+        # if self.use_memory and self.memory is not None:
+        #     src_mem = self.memory.get_memory(src_tensor)
+        #     dst_mem = self.memory.get_memory(dst_tensor)
             
-            # DEBUG: Check memory values at this point
-            if self.training and self.train_batch_counter < 3:
-                print(f"Memory in embeddings - src mean: {src_mem.mean():.6f}, "
-                      f"std: {src_mem.std():.6f}")
+        #     # DEBUG: Check memory values at this point
+        #     if self.training and self.train_batch_counter < 3:
+        #         print(f"Memory in embeddings - src mean: {src_mem.mean():.6f}, "
+        #               f"std: {src_mem.std():.6f}")
             
-            # Only warn if memory is truly zero for many batches
-            if self.training and self.train_batch_counter > 10 and src_mem.abs().sum() < 1e-6:
-                print("WARNING: Memory is still all zeros after 10 batches!")
+        #     # Only warn if memory is truly zero for many batches
+        #     if self.training and self.train_batch_counter > 10 and src_mem.abs().sum() < 1e-6:
+        #         print("WARNING: Memory is still all zeros after 10 batches!")
 
-            # Concatenate features + memory
-            src_emb = torch.cat([src_feat, src_mem], dim=-1)
-            dst_emb = torch.cat([dst_feat, dst_mem], dim=-1)
-            # Project to hidden_dim
-            if not hasattr(self, 'mem_proj'):
-                self.mem_proj = nn.Linear(src_emb.shape[-1], self.hidden_dim).to(self.device)
-            src_emb = self.mem_proj(src_emb)
-            dst_emb = self.mem_proj(dst_emb)
+        #     # Concatenate features + memory
+        #     src_emb = torch.cat([src_feat, src_mem], dim=-1)
+        #     dst_emb = torch.cat([dst_feat, dst_mem], dim=-1)
+        #     # Project to hidden_dim
+        #     if not hasattr(self, 'mem_proj'):
+        #         self.mem_proj = nn.Linear(src_emb.shape[-1], self.hidden_dim).to(self.device)
+        #     src_emb = self.mem_proj(src_emb)
+        #     dst_emb = self.mem_proj(dst_emb)
+        if self.embedding_module is not None:
+            # Use full attention-based embeddings with neighbor sampling
+            source_emb = self.embedding_module.compute_embedding(
+                memory=self.memory.get_memory(torch.from_numpy(source_nodes).long().to(self.device)),
+                source_nodes=source_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+            destination_emb = self.embedding_module.compute_embedding(
+                memory=self.memory.get_memory(torch.from_numpy(destination_nodes).long().to(self.device)),
+                source_nodes=destination_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+            return source_emb, destination_emb
         else:
             # Fallback: use features only
             src_emb = src_feat
@@ -486,6 +503,17 @@ class TGN(BaseDynamicGNN):
                 src_features = self.node_embedding(src_nodes)
                 dst_features = self.node_embedding(dst_nodes)
 
+            # Get edge features if available
+            if 'edge_features' in batch and batch['edge_features'] is not None:
+                edge_feats = batch['edge_features']
+                # Expand to match source/destination
+                src_edge_feats = edge_feats
+                dst_edge_feats = edge_feats
+            else:
+                src_edge_feats = torch.zeros(len(src_nodes), self.message_dim - (src_features.size(-1) * 2 + src_memory.size(-1) * 2 + time_enc.size(-1)), device=self.device)
+                dst_edge_feats = src_edge_feats
+            
+            
             # Get memories
             # if self.use_memory:
             #     src_memory = self.memory.get_memory(src_nodes).detach()
@@ -515,8 +543,8 @@ class TGN(BaseDynamicGNN):
             
             
             # Create message inputs
-            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc], dim=-1)
-            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc], dim=-1)
+            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc, src_edge_feats], dim=-1)
+            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc, dst_edge_feats], dim=-1)
             
             # Generate messages        
             src_messages = self.message_fn(src_msg_input)
