@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import lightning as L
 from abc import ABC, abstractmethod
-# from torch_geometric.data import Data
+
 
 
 class BaseDynamicGNN(L.LightningModule, ABC):
@@ -14,11 +14,10 @@ class BaseDynamicGNN(L.LightningModule, ABC):
                  num_layers = 2, 
                  dropout=0.1, 
                  learning_rate=1e-4, 
-                 weight_decay=1e-5, 
-                 **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
+                 weight_decay=1e-5,             
+                ):
+        super().__init__() 
+        # Store all parameters as instance attributes
         self.num_nodes = num_nodes
         self.node_features = node_features
         self.hidden_dim = hidden_dim
@@ -28,7 +27,10 @@ class BaseDynamicGNN(L.LightningModule, ABC):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         
-        self.time_encoder = self._init_time_encoder()
+        # Initialize modules
+        self.time_encoder = TimeEncoder(self.time_encoding_dim)
+
+        # self.time_encoder = self._init_time_encoder()
         
         if node_features>0:
             self.node_embedding = nn.Embedding(num_nodes, node_features)

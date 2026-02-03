@@ -1,17 +1,5 @@
 import numpy as np
 
-class SimpleNeighborFinder:
-    def __init__(self, adj_list=None):
-        self.adj_list = adj_list
-
-    def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
-        """Return dummy neighbors for compatibility"""
-        batch_size = len(source_nodes)
-        neighbors = np.zeros((batch_size, n_neighbors), dtype=np.int64)
-        edge_idxs = np.zeros((batch_size, n_neighbors), dtype=np.int64)
-        edge_times = np.zeros((batch_size, n_neighbors), dtype=np.int64)
-
-        return neighbors, edge_idxs, edge_times
 
 
 def get_neighbor_finder(data, uniform, max_node_idx=None):

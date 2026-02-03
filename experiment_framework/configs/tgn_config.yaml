@@ -3,14 +3,16 @@
 # Model parameters
 model:
   name: "TGN"
-  num_nodes: null  # Will be set based on dataset
-  node_features: 0  # Use learned embeddings
+  # num_nodes: null  # Will be set based on dataset
+  # node_features: 0  # Use learned embeddings
   hidden_dim: 172
   time_encoding_dim: 32
   memory_dim: 172
   message_dim: 172
+  edge_features_dim: 172
   num_layers: 1
   dropout: 0.1
+  embedding_module_type: "graph_attention"  
   use_memory: true
   
 # Training parameters

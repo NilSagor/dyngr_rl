@@ -18,6 +18,8 @@ class Memory(nn.Module):
 
     self.combination_method = combination_method
 
+    
+
     self.__init_memory__()
 
   def __init_memory__(self):

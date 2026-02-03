@@ -23,6 +23,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from loguru import logger
 
+import hashlib
+
 from src.models.dygformer import DyGFormer
 from src.models.tgn import TGN
 
@@ -59,18 +61,64 @@ def load_config(config_path):
 
 def setup_model(config: dict, num_nodes: int):    
     model_config = config['model'].copy()
+    model_name = model_config.pop('name')  # Remove non-parameter 'name'
+    
+    # CRITICAL: Set num_nodes BEFORE instantiating model
+    # TGN requires this parameter (positional or keyword)
     model_config['num_nodes'] = num_nodes
     
-    model_name = model_config.pop('name')
-    
+    logger.info(f" Initializing {model_name} with num_nodes={num_nodes}")
+
+    # Pass neighbor_finder if available
+    # if neighbor_finder is not None:
+    #     model_config['neighbor_finder'] = neighbor_finder
+
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model: {model_name}. "
                         f"Available models: {list(MODEL_REGISTRY.keys())}")
     
     model_class = MODEL_REGISTRY[model_name]
-    model = model_class(**model_config)
+    model = model_class(
+        num_nodes=num_nodes,        
+        node_features=model_config.get('node_features', 0),
+        hidden_dim=model_config.get('hidden_dim', 172),
+        time_encoding_dim=model_config.get('time_encoding_dim', 32),
+        memory_dim=model_config.get('memory_dim', 172),
+        message_dim=model_config.get('message_dim', 172),
+        edge_features_dim=model_config.get('edge_features_dim', 172),
+        num_layers=model_config.get('num_layers', 1),
+        dropout=model_config.get('dropout', 0.1),
+        learning_rate=model_config.get('learning_rate', 1e-4),
+        weight_decay=model_config.get('weight_decay', 1e-5),
+        n_heads=model_config.get('n_heads', 2),
+        n_neighbors=model_config.get('n_neighbors', 20),
+        use_memory=model_config.get('use_memory', True),
+        embedding_module_type=model_config.get('embedding_module_type', 'graph_attention'),
+    )
+
+    # POST-INIT VALIDATION
+    if hasattr(model, 'memory') and model.memory is not None:
+        actual_size = model.memory.memory.shape[0]
+        logger.info(f"✓ TGN memory allocated: {actual_size} slots")
+        assert actual_size == num_nodes, \
+            f"Memory size mismatch! Expected {num_nodes}, got {actual_size}"
     
-    logger.info(f"Initialized {model_name} model with {num_nodes} nodes")
+    # DEBUG: Verify we're passing correct num_nodes
+    logger.info(f"Initializing {model_name} with num_nodes={num_nodes} (max expected node ID: {num_nodes - 1})")
+    logger.info(f"Model config keys: {list(model_config.keys())}")
+    
+    
+    # POST-INIT VALIDATION: Verify memory size matches expected nodes
+    if hasattr(model, 'memory') and hasattr(model.memory, 'memory'):
+        actual_memory_size = model.memory.memory.shape[0]
+        logger.info(f"TGN memory allocated size: {actual_memory_size}")
+        if actual_memory_size != num_nodes:
+            raise RuntimeError(
+                f"TGN memory size ({actual_memory_size}) != num_nodes ({num_nodes}). "
+                f"Check TGN constructor parameter handling."
+            )
+    
+    logger.info(f"✓ Initialized {model_name} with {num_nodes} nodes | Parameters: {sum(p.numel() for p in model.parameters()):,}")
     return model
 
 
@@ -141,6 +189,7 @@ def setup_trainer(config: dict):
         log_every_n_steps=10,
         val_check_interval=0.25,
         enable_progress_bar=True,
+        # resume_from_checkpoint=None,
     )
     
     return trainer
@@ -195,11 +244,49 @@ def train_model(config: dict):
     eval_type = config["data"].get("evaluation_type", "transductive")
     logger.info(f"Evaluation type: {eval_type}")
     
-    train_loader, val_loader, test_loader, num_nodes = get_dataset_loader(
+    # logger.info(f"Dataset '{config['data']['dataset']}' has {num_nodes} nodes (max node ID in edges: {data['edges'].max()})")
+    # assert num_nodes > 1000, f"Unexpectedly small num_nodes={num_nodes}. Check dataset loader."
+
+    train_loader, val_loader, test_loader, num_unique_nodes = get_dataset_loader(
         config,
         negative_sampling_strategy=config['data'].get('negative_sampling_strategy', 'random')    
     )
     
+    # logger.info(f"Dataset '{config['data']['dataset']}' has {num_nodes} nodes (max node ID in edges: {data['edges'].max()})")
+    # assert num_nodes > 1000, f"Unexpectedly small num_nodes={num_nodes}. Check dataset loader."
+    
+    # CRITICAL FIX: Compute required memory size for 1-indexed datasets
+    data = DATASET_LOADERS[config['data']['dataset']]()
+    max_node_id = int(data['edges'].max().item())
+    num_nodes_for_model = max_node_id + 1  # For 1-indexed IDs: allocate [0..max_id]
+
+    logger.info(f"Unique nodes in dataset: {num_unique_nodes}")
+    logger.info(f"Max node ID in edges: {max_node_id}")
+    logger.info(f"Allocating memory for {num_nodes_for_model} nodes (max_id + 1)")
+        
+    # Override loader's num_nodes with correct memory size
+    num_nodes = num_nodes_for_model
+
+    # Verify consistency
+    assert num_nodes > max_node_id, f"num_nodes ({num_nodes}) must be > max_node_id ({max_node_id})"
+    if config['data']['dataset'] == 'wikipedia':
+        assert num_nodes == 9228, f"Wikipedia requires num_nodes=9228 (max_id=9227 + 1), got {num_nodes}"
+        logger.info("✓ Wikipedia memory size verified (9228 slots for IDs 1-9227)")
+    
+    # DEBUG: Verify num_nodes is correct for Wikipedia (should be 9228)
+    logger.info(f"✓ Dataset loader returned num_nodes = {num_nodes}")
+    if config['data']['dataset'] == 'wikipedia':
+        assert num_nodes == 9228, f"Wikipedia should have 9228 nodes, got {num_nodes}"
+        logger.info("✓ Wikipedia node count verified (9228)")
+
+    # # Also verify against actual max node ID in edges
+    # data = DATASET_LOADERS[config['data']['dataset']]()
+    # max_node_id = int(data['edges'].max().item())
+    # logger.info(f"Max node ID in edge list: {max_node_id}")
+    # assert num_nodes > max_node_id, f"num_nodes ({num_nodes}) must be > max node ID ({max_node_id})"
+
+
+
     # DEBUG: Verify temporal splits
     train_timestamps = train_loader.dataset.timestamps
     val_timestamps = val_loader.dataset.timestamps
@@ -241,12 +328,23 @@ def train_model(config: dict):
             node_features = data.get('node_features', None)
             edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
         
+        # For TGN with no node features, pass zeros but handle in model
+        if config['model']['name'] == 'TGN' and node_features is None:
+            # Create dummy node features (will use learned embeddings instead)
+            node_features = torch.zeros(num_nodes + 1, 1)  # 1-dim dummy features
         
         
         # Initialize model
         model = setup_model(config, num_nodes)
-        # Set raw features for models that need them
-        model.neighbor_finder = neighbor_finder
+
+        # Validate parameters
+        validate_model_parameters(model, config, num_nodes)
+        # # Set raw features for models that need them
+        # model.neighbor_finder = neighbor_finder
+
+        # # Initialize embedding module
+        # if model.neighbor_finder is not None:
+        #     model._init_modules()
         
         # FIX: Load and set raw features
         # Set features based on model type
@@ -279,6 +377,7 @@ def train_model(config: dict):
             edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
             
             model.set_raw_features(node_features, edge_features)
+            model.set_neighbor_finder(neighbor_finder)
             logger.info(f"Node feature stats - mean: {node_features.mean():.6f}, std: {node_features.std():.6f}")
             # logger.info(f"First 5 node features:\n{node_features[1:6]}") 
     
@@ -291,6 +390,38 @@ def train_model(config: dict):
     logger.info(f"Dataset num_nodes: {num_nodes}")
     logger.info(f"Node ID range in data: {data['edges'].min()} to {data['edges'].max()}")
 
+    # Verify hparams preserved num_nodes correctly
+    logger.info(f"Model num_nodes: {model.num_nodes}")
+    logger.info(f"hparams.num_nodes: {model.hparams.num_nodes}")
+    logger.info(f"Memory size: {model.memory.memory.shape[0]}")
+
+    assert model.hparams.num_nodes == num_nodes, \
+        f"hparams lost num_nodes! Expected {num_nodes}, got {model.hparams.num_nodes}"
+    assert model.memory.memory.shape[0] == num_nodes, \
+        f"Memory size mismatch! Expected {num_nodes}, got {model.memory.memory.shape[0]}"
+
+    # AFTER model initialization but BEFORE trainer.fit()
+    logger.info("=== HYPERPARAMETER VALIDATION ===")
+    logger.info(f"Dataset: {config['data']['dataset']}")
+    logger.info(f"Computed num_nodes: {num_nodes}")
+    logger.info(f"hparams.num_nodes: {model.hparams.num_nodes}")
+    logger.info(f"hparams.edge_features_dim: {model.hparams.edge_features_dim}")
+    logger.info(f"Memory size: {model.memory.memory.shape[0]}")
+    logger.info("=== END VALIDATION ===")
+
+    # DYNAMIC VALIDATION: Compare against ACTUAL computed num_nodes (not hardcoded 9228)
+    assert model.hparams.num_nodes == num_nodes, \
+        f"RECONSTRUCTION FAILURE: hparams.num_nodes={model.hparams.num_nodes} != computed num_nodes={num_nodes}. " \
+        f"This happens when **kwargs leaks parameters during reconstruction. " \
+        f"FIX: Remove **kwargs from ALL constructor signatures."
+
+    assert model.hparams.edge_features_dim == 172, \
+        f"edge_features_dim corrupted: {model.hparams.edge_features_dim} (expected 172 for Wikipedia/Reddit)"
+
+    assert model.memory.memory.shape[0] == num_nodes, \
+        f"Memory size mismatch: {model.memory.memory.shape[0]} != {num_nodes}"
+        
+    
     # Setup trainer
     trainer = setup_trainer(config)
     
@@ -347,7 +478,29 @@ def train_model(config: dict):
             writer.writeheader()
         writer.writerow(result_row)
 
-
+def validate_model_parameters(model, config, num_nodes):
+    """Validate model parameters after initialization."""
+    logger.info("=== MODEL PARAMETER VALIDATION ===")
+    
+    # Check num_nodes
+    if hasattr(model, 'num_nodes'):
+        logger.info(f"model.num_nodes: {model.num_nodes}")
+        assert model.num_nodes == num_nodes, f"model.num_nodes mismatch: {model.num_nodes} != {num_nodes}"
+    
+    # Check hparams
+    if hasattr(model, 'hparams'):
+        if 'num_nodes' in model.hparams:
+            logger.info(f"hparams.num_nodes: {model.hparams['num_nodes']}")
+            assert model.hparams['num_nodes'] == num_nodes
+    
+    # Check memory size for TGN
+    if hasattr(model, 'memory') and model.memory is not None:
+        if hasattr(model.memory, 'memory'):
+            mem_size = model.memory.memory.shape[0]
+            logger.info(f"Memory size: {mem_size}")
+            assert mem_size == num_nodes, f"Memory size mismatch: {mem_size} != {num_nodes}"
+    
+    logger.info("=== VALIDATION PASSED ===")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -410,8 +563,13 @@ def main():
     config['experiment']['description'] = f"{model_name} on {data_name} | {eval_type} | {neg_sample}"
     # config['logging']['log_dir'] = f"./logs/dygformer_{eval_type}_{neg_sample}"
     # config['logging']['checkpoint_dir'] = f"./checkpoints/dygformer_{eval_type}_{neg_sample}"
+    
+    config_str = str(sorted(config['model'].items()))
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:6]
+    
     config['logging']['log_dir'] = f"./logs/{model_name}_{eval_type}_{neg_sample}"
-    config['logging']['checkpoint_dir'] = f"./checkpoints/{model_name}_{eval_type}_{neg_sample}"
+    # config['logging']['checkpoint_dir'] = f"./checkpoints/{model_name}_{eval_type}_{neg_sample}"
+    config['logging']['checkpoint_dir'] = f"./checkpoints/{model_name}_{eval_type}_{neg_sample}_{config_hash}"
     
     # Create directories
     os.makedirs(config['logging']['log_dir'], exist_ok=True)
@@ -431,14 +589,33 @@ def main():
 
     
     
-    for seed in args.seeds:
-        config['experiment']['seed'] = seed
+    # for seed in args.seeds:
+    #     config['experiment']['seed'] = seed
 
-        # Start training
+    #     # Start training
+    #     try:
+    #         train_model(config)
+    #     except Exception as e:
+    #         logger.error(f"Training failed with error {seed} : {e}")
+    #         raise
+
+    # Determine which seeds to use
+    if args.seeds is not None:
+        # Use seeds from command line argument
+        seeds_to_run = args.seeds
+    else:
+        # Use seed from config (which might have been set by --override or config file)
+        seeds_to_run = [config['experiment'].get('seed', 42)]
+    
+    for seed in seeds_to_run:
+        config['experiment']['seed'] = seed
+        logger.info(f"Running with seed: {seed}")
+
         try:
             train_model(config)
+            
         except Exception as e:
-            logger.error(f"Training failed with error {seed} : {e}")
+            logger.error(f"Training failed with seed {seed}: {e}")
             raise
 
 
