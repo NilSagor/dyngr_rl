@@ -2,6 +2,8 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
+
+
 class PositionEncoder(torch.nn.Module):
 
     def __init__(self, position_feat_dim: int, walk_length: int, device: str = 'cpu'):

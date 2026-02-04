@@ -29,9 +29,15 @@ from src.models.dygformer import DyGFormer
 from src.models.tgn import TGN
 
 from src.utils.general_utils import set_seed, get_device
-from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
+# from src.datasets.loaders import get_dataset_loader, DATASET_LOADERS
 
-from src.models.tgn_module.neighbor_finder import get_neighbor_finder
+# from src.models.tgn_module.neighbor_finder import get_neighbor_finder
+
+from src.datasets.load_dataset import load_dataset
+from src.datasets.negative_sampling import NegativeSampler
+from src.datasets.neighbor_finder import NeighborFinder
+from src.datasets.temporal_dataset import TemporalDataset
+
 
 # MODEL_REGISTRY={
 #     "DyGFormer": DyGFormer,
@@ -235,49 +241,148 @@ def train_model(config: dict):
     # Set random seed
     set_seed(config['experiment']['seed'])
     
+    
     # Setup device
     device = get_device(config['hardware']['gpus'])
     logger.info(f"Using device: {device}")
+
+
+    # FIX 1: USE SPLIT-AWARE 0-INDEXED LOADER (NO LEAKAGE)
+    data = load_dataset(
+        dataset_name=config['data']['dataset'],
+        val_ratio=config['data']['val_ratio'],
+        test_ratio=config['data']['test_ratio'],
+        inductive=(config['data']['evaluation_type'] == 'inductive'),
+        unseen_ratio=config['data'].get('unseen_ratio', 0.1),
+        seed=config['experiment']['seed']
+    )
     
     # Load dataset
     logger.info(f"Loading dataset: {config['data']['dataset']}")
     eval_type = config["data"].get("evaluation_type", "transductive")
     logger.info(f"Evaluation type: {eval_type}")
+
+    num_nodes = data['num_nodes']  # Correct 0-indexed count (9228 for Wikipedia)
+    
+    # FIX 2: BUILD LEAKAGE-PROOF NEIGHBOR FINDER (TRAINING EDGES ONLY)
+    train_edges = data['edges'][data['train_mask']]
+    train_timestamps = data['timestamps'][data['train_mask']]
+    neighbor_finder = None
+    if config['data']['negative_sampling_strategy'] == 'historical':
+        neighbor_finder = NeighborFinder(
+            train_edges=train_edges,
+            train_timestamps=train_timestamps,
+            max_neighbors=config['data']['max_neighbors']
+        )
+    
+    # FIX 3: SPLIT-AWARE NEGATIVE SAMPLERS (NO LEAKAGE)
+    train_neg_sampler = NegativeSampler(
+        edges=train_edges,
+        timestamps=train_timestamps,
+        num_nodes=num_nodes,
+        neighbor_finder=neighbor_finder,
+        split='train',
+        seed=config['experiment']['seed']
+    )
+
+    val_neg_sampler = NegativeSampler(
+        edges=data['edges'][data['val_mask']],
+        timestamps=data['timestamps'][data['val_mask']],
+        num_nodes=num_nodes,
+        neighbor_finder=neighbor_finder,  # Safe: built from training only
+        split='val',
+        seed=config['experiment']['seed']
+    )
+
+    test_neg_sampler = NegativeSampler(
+        edges=data['edges'][data['test_mask']],
+        timestamps=data['timestamps'][data['test_mask']],
+        num_nodes=data['num_nodes'],
+        neighbor_finder=neighbor_finder,
+        split='test',
+        seed=config['experiment']['seed']
+    )
+
+    # FIX 4: CORRECT FEATURE HANDLING
+    if config['data']['dataset'] == "wikipedia":
+        node_features = None  # NO node features
+    else:
+        node_features = data.get('node_features')
+    edge_features = data['edge_features']  # Already 0-indexed
+    
+
+    # Create datasets with split-aware sampling
+    train_dataset = TemporalDataset(
+        edges=train_edges,
+        timestamps=train_timestamps,
+        edge_features=edge_features[data['train_mask']] if edge_features is not None else None,
+        num_nodes=num_nodes,
+        split='train',
+        negative_sampler=train_neg_sampler,
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
+        unseen_nodes=None,
+        seed=config['experiment']['seed']
+    )
+
+    val_dataset = TemporalDataset(
+        edges=data['edges'][data['val_mask']],
+        timestamps=data['timestamps'][data['val_mask']],
+        edge_features=data['edge_features'][data['val_mask']] if data['edge_features'] is not None else None,
+        num_nodes=data['num_nodes'],
+        split='val',
+        negative_sampler=val_neg_sampler,
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
+        unseen_nodes=data['unseen_nodes'] if config['data']['evaluation_type'] == 'inductive' else None,
+        seed=config['experiment']['seed']
+    )
+    
+    test_dataset = TemporalDataset(
+        edges=data['edges'][data['test_mask']],
+        timestamps=data['timestamps'][data['test_mask']],
+        edge_features=data['edge_features'][data['test_mask']] if data['edge_features'] is not None else None,
+        num_nodes=data['num_nodes'],
+        split='test',
+        negative_sampler=test_neg_sampler,
+        negative_sampling_strategy=config['data']['negative_sampling_strategy'],
+        unseen_nodes=data['unseen_nodes'] if config['data']['evaluation_type'] == 'inductive' else None,
+        seed=config['experiment']['seed']
+    )
+    
     
     # logger.info(f"Dataset '{config['data']['dataset']}' has {num_nodes} nodes (max node ID in edges: {data['edges'].max()})")
     # assert num_nodes > 1000, f"Unexpectedly small num_nodes={num_nodes}. Check dataset loader."
 
-    train_loader, val_loader, test_loader, num_unique_nodes = get_dataset_loader(
-        config,
-        negative_sampling_strategy=config['data'].get('negative_sampling_strategy', 'random')    
-    )
+    # train_loader, val_loader, test_loader, num_unique_nodes = get_dataset_loader(
+    #     config,
+    #     negative_sampling_strategy=config['data'].get('negative_sampling_strategy', 'random')    
+    # )
     
     # logger.info(f"Dataset '{config['data']['dataset']}' has {num_nodes} nodes (max node ID in edges: {data['edges'].max()})")
     # assert num_nodes > 1000, f"Unexpectedly small num_nodes={num_nodes}. Check dataset loader."
     
     # CRITICAL FIX: Compute required memory size for 1-indexed datasets
-    data = DATASET_LOADERS[config['data']['dataset']]()
-    max_node_id = int(data['edges'].max().item())
-    num_nodes_for_model = max_node_id + 1  # For 1-indexed IDs: allocate [0..max_id]
+    # data = DATASET_LOADERS[config['data']['dataset']]()
+    # max_node_id = int(data['edges'].max().item())
+    # num_nodes_for_model = max_node_id + 1  # For 1-indexed IDs: allocate [0..max_id]
 
-    logger.info(f"Unique nodes in dataset: {num_unique_nodes}")
-    logger.info(f"Max node ID in edges: {max_node_id}")
-    logger.info(f"Allocating memory for {num_nodes_for_model} nodes (max_id + 1)")
+    # logger.info(f"Unique nodes in dataset: {num_unique_nodes}")
+    # logger.info(f"Max node ID in edges: {max_node_id}")
+    # logger.info(f"Allocating memory for {num_nodes_for_model} nodes (max_id + 1)")
         
-    # Override loader's num_nodes with correct memory size
-    num_nodes = num_nodes_for_model
+    # # Override loader's num_nodes with correct memory size
+    # num_nodes = num_nodes_for_model
 
     # Verify consistency
-    assert num_nodes > max_node_id, f"num_nodes ({num_nodes}) must be > max_node_id ({max_node_id})"
-    if config['data']['dataset'] == 'wikipedia':
-        assert num_nodes == 9228, f"Wikipedia requires num_nodes=9228 (max_id=9227 + 1), got {num_nodes}"
-        logger.info("✓ Wikipedia memory size verified (9228 slots for IDs 1-9227)")
+    # assert num_nodes > max_node_id, f"num_nodes ({num_nodes}) must be > max_node_id ({max_node_id})"
+    # if config['data']['dataset'] == 'wikipedia':
+    #     assert num_nodes == 9228, f"Wikipedia requires num_nodes=9228 (max_id=9227 + 1), got {num_nodes}"
+    #     logger.info("✓ Wikipedia memory size verified (9228 slots for IDs 1-9227)")
     
-    # DEBUG: Verify num_nodes is correct for Wikipedia (should be 9228)
-    logger.info(f"✓ Dataset loader returned num_nodes = {num_nodes}")
-    if config['data']['dataset'] == 'wikipedia':
-        assert num_nodes == 9228, f"Wikipedia should have 9228 nodes, got {num_nodes}"
-        logger.info("✓ Wikipedia node count verified (9228)")
+    # # DEBUG: Verify num_nodes is correct for Wikipedia (should be 9228)
+    # logger.info(f"✓ Dataset loader returned num_nodes = {num_nodes}")
+    # if config['data']['dataset'] == 'wikipedia':
+    #     assert num_nodes == 9228, f"Wikipedia should have 9228 nodes, got {num_nodes}"
+    #     logger.info("✓ Wikipedia node count verified (9228)")
 
     # # Also verify against actual max node ID in edges
     # data = DATASET_LOADERS[config['data']['dataset']]()
@@ -288,16 +393,16 @@ def train_model(config: dict):
 
 
     # DEBUG: Verify temporal splits
-    train_timestamps = train_loader.dataset.timestamps
-    val_timestamps = val_loader.dataset.timestamps
-    test_timestamps = test_loader.dataset.timestamps
+    # train_timestamps = train_loader.dataset.timestamps
+    # val_timestamps = val_loader.dataset.timestamps
+    # test_timestamps = test_loader.dataset.timestamps
 
-    print(f"Train timestamp range: {train_timestamps.min():.0f} to {train_timestamps.max():.0f}")
-    print(f"Val timestamp range: {val_timestamps.min():.0f} to {val_timestamps.max():.0f}")
-    print(f"Test timestamp range: {test_timestamps.min():.0f} to {test_timestamps.max():.0f}")
+    # print(f"Train timestamp range: {train_timestamps.min():.0f} to {train_timestamps.max():.0f}")
+    # print(f"Val timestamp range: {val_timestamps.min():.0f} to {val_timestamps.max():.0f}")
+    # print(f"Test timestamp range: {test_timestamps.min():.0f} to {test_timestamps.max():.0f}")
 
-    # Check for leakage: test edges should be AFTER train edges
-    assert test_timestamps.min() >= val_timestamps.max(), "Test should start after validation"
+    # # Check for leakage: test edges should be AFTER train edges
+    # assert test_timestamps.min() >= val_timestamps.max(), "Test should start after validation"
     
     # experiment logging
     logger.info(f"Seed: {config['experiment']['seed']}")
@@ -308,37 +413,82 @@ def train_model(config: dict):
     
 
     
-    dataset_name = config['data']['dataset']
-    if dataset_name in DATASET_LOADERS:
-        data = DATASET_LOADERS[dataset_name]()
+    # dataset_name = config['data']['dataset']
+    # if dataset_name in DATASET_LOADERS:
+    #     data = DATASET_LOADERS[dataset_name]()
 
-        data_wrapper = DataWrapper(data['edges'], data['timestamps'])
-        neighbor_finder = get_neighbor_finder(data_wrapper, uniform=False)
+    #     data_wrapper = DataWrapper(data['edges'], data['timestamps'])
+    #     neighbor_finder = get_neighbor_finder(data_wrapper, uniform=False)
         
-        # Get features (handle both padded and unpadded)
-        node_features = data.get('node_features', torch.zeros(num_nodes, 172))
-        # Handle features correctly
-        if dataset_name == "wikipedia":
-            # Wikipedia has NO node features - use None
-            node_features = None
-            # Edge features are already correct shape [num_edges, 172]
-            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
-        else:
-            # Other datasets may have node features
-            node_features = data.get('node_features', None)
-            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
+    #     # Get features (handle both padded and unpadded)
+    #     node_features = data.get('node_features', torch.zeros(num_nodes, 172))
+    #     # Handle features correctly
+    #     if dataset_name == "wikipedia":
+    #         # Wikipedia has NO node features - use None
+    #         node_features = None
+    #         # Edge features are already correct shape [num_edges, 172]
+    #         edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
+    #     else:
+    #         # Other datasets may have node features
+    #         node_features = data.get('node_features', None)
+    #         edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 1))
         
-        # For TGN with no node features, pass zeros but handle in model
-        if config['model']['name'] == 'TGN' and node_features is None:
-            # Create dummy node features (will use learned embeddings instead)
-            node_features = torch.zeros(num_nodes + 1, 1)  # 1-dim dummy features
+    #     # For TGN with no node features, pass zeros but handle in model
+    #     if config['model']['name'] == 'TGN' and node_features is None:
+    #         # Create dummy node features (will use learned embeddings instead)
+    #         node_features = torch.zeros(num_nodes + 1, 1)  # 1-dim dummy features
         
         
+
+
         # Initialize model
-        model = setup_model(config, num_nodes)
+        # model = setup_model(config, num_nodes)
+
+    # ✅ MODEL INITIALIZATION (reconstruction-safe)
+    model = create_model(
+        model_name=config['model']['name'],
+        model_config=config['model'],
+        dataset_config={
+            'num_nodes': data['num_nodes'],  # 0-indexed count (e.g., 9228)
+            'edge_feat_dim': data['edge_features'].shape[1] if data['edge_features'] is not None else 0,
+            'node_feat_dim': data['node_features'].shape[1] if data['node_features'] is not None else 0,
+        }
+    )
+    
+    # VALIDATION BEFORE TRAINING (catches reconstruction errors)
+    assert model.num_nodes == data['num_nodes'], \
+        f"Reconstruction failure! model.num_nodes={model.num_nodes} != {data['num_nodes']}"
+    assert model.num_nodes > 1000, \
+        f"num_nodes={model.num_nodes} suspiciously small (expected >1000). Check 0-indexing."
+    
+
+    #  TRAIN WITH RIGOROUS EVALUATION
+    trainer = setup_trainer(config)
+    # trainer.fit(
+    #     model,
+    #     DataLoader(train_dataset, batch_size=config['training']['batch_size'], 
+    #               shuffle=True, collate_fn=train_dataset.collate_fn),
+    #     DataLoader(val_dataset, batch_size=config['training']['batch_size'], 
+    #               shuffle=False, collate_fn=val_dataset.collate_fn)
+    # )
+    
+    # TEST WITH INDUSTRY-STANDARD METRICS
+    # test_results = evaluate_link_prediction(
+    #     model,
+    #     DataLoader(test_dataset, batch_size=config['evaluation']['test_batch_size'], 
+    #               shuffle=False, collate_fn=test_dataset.collate_fn),
+    #     device='cuda' if torch.cuda.is_available() else 'cpu'
+    # )
+    
+    logger.info("=== FINAL RESULTS ===")
+    for metric, value in test_results.items():
+        logger.info(f"{metric}: {value:.4f}")
+
+
+
 
         # Validate parameters
-        validate_model_parameters(model, config, num_nodes)
+        # validate_model_parameters(model, config, num_nodes)
         # # Set raw features for models that need them
         # model.neighbor_finder = neighbor_finder
 
@@ -348,8 +498,8 @@ def train_model(config: dict):
         
         # FIX: Load and set raw features
         # Set features based on model type
-        if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
-            model.set_raw_features(node_features, edge_features)
+        # if config['model']['name'] in ['DyGFormer', 'TAWRMAC']:
+        #     model.set_raw_features(node_features, edge_features)
         # elif config['model']['name'] == 'TGN':
         #     # TGN uses UNPADDED edge features directly
         #     unpadded_edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))

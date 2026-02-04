@@ -1,0 +1,550 @@
+"""
+train.py - Clean, modular training pipeline for temporal graph models.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Setup path before other imports
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import argparse
+import csv
+import hashlib
+import string
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+
+import yaml
+import torch
+import numpy as np
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
+from torch.utils.data import DataLoader
+from loguru import logger
+
+# Local imports
+from src.models.dygformer import DyGFormer
+from src.models.tgn import TGN
+from src.utils.general_utils import set_seed, get_device
+from src.datasets.load_dataset import load_dataset, DATA_ROOT
+from src.datasets.negative_sampling import NegativeSampler
+from src.datasets.neighbor_finder import NeighborFinder
+from src.datasets.temporal_dataset import TemporalDataset
+
+# Constants
+MODEL_REGISTRY = {
+    "DyGFormer": DyGFormer,
+    "TGN": TGN,
+}
+
+DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load YAML configuration."""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def resolve_config_placeholders(config: Dict, context: Optional[Dict] = None) -> Dict:
+    """Resolve ${key.subkey} placeholders in config."""
+    if context is None:
+        context = config
+    
+    def flatten_dict(d: Dict, parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, new_key, sep=sep).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
+    
+    def replace_value(value):
+        if isinstance(value, str) and '${' in value:
+            try:
+                # Handle ${var} syntax
+                template = string.Template(value.replace('${', '$'))
+                return template.substitute(flatten_dict(context))
+            except (KeyError, ValueError):
+                pass
+        return value
+    
+    def recurse(obj):
+        if isinstance(obj, dict):
+            return {k: recurse(replace_value(v)) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [recurse(item) for item in obj]
+        return replace_value(obj)
+    
+    return recurse(config)
+
+
+def apply_overrides(config: Dict, overrides: List[str]) -> Dict:
+    """Apply command-line overrides to config."""
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(f"Override must be key=value format: {override}")
+        key, value = override.split("=", 1)
+        keys = key.split('.')
+        
+        current = config
+        for k in keys[:-1]:
+            if k not in current:
+                current[k] = {}
+            current = current[k]
+        
+        # Try to parse as literal, fallback to string
+        try:
+            import ast
+            current[keys[-1]] = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            current[keys[-1]] = value
+    
+    return config
+
+
+def build_experiment_config(config: Dict, seed: int) -> Dict:
+    """Build final experiment configuration with derived fields."""
+    model_name = config['model']['name']
+    eval_type = config['data']['evaluation_type']
+    neg_sample = config['data']['negative_sampling_strategy']
+    dataset = config['data']['dataset']
+    
+    # Generate hash for unique checkpoint naming
+    config_str = str(sorted(config['model'].items()))
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:6]
+    
+    exp_name = f"{model_name}_{eval_type}_{neg_sample}"
+    
+    config['experiment'].update({
+        'name': exp_name,
+        'description': f"{model_name} on {dataset} | {eval_type} | {neg_sample}",
+        'seed': seed,
+    })
+    
+    config['logging'].update({
+        'log_dir': str(DEFAULT_LOG_DIR / exp_name),
+        'checkpoint_dir': str(DEFAULT_CHECKPOINT_DIR / f"{exp_name}_{config_hash}"),
+    })
+    
+    return config
+
+
+# ============================================================================
+# DATA PIPELINE
+# ============================================================================
+
+class DataPipeline:
+    """Encapsulates all data-related setup."""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+        self.data: Optional[Dict] = None
+        self.neighbor_finder: Optional[NeighborFinder] = None
+        self.samplers: Dict[str, NegativeSampler] = {}
+        self.datasets: Dict[str, TemporalDataset] = {}
+        self.loaders: Dict[str, DataLoader] = {}
+    
+    def load(self) -> 'DataPipeline':
+        """Load raw dataset."""
+        logger.info(f"Loading dataset: {self.config['data']['dataset']}")
+        
+        self.data = load_dataset(
+            dataset_name=self.config['data']['dataset'],
+            val_ratio=self.config['data']['val_ratio'],
+            test_ratio=self.config['data']['test_ratio'],
+            inductive=(self.config['data']['evaluation_type'] == 'inductive'),
+            unseen_ratio=self.config['data'].get('unseen_ratio', 0.1),
+            seed=self.config['experiment']['seed'],
+        )
+        
+        logger.info(f"Loaded: {self.data['num_nodes']} nodes, {self.data['statistics']['num_edges']} edges")
+        return self
+    
+    def build_neighbor_finder(self) -> 'DataPipeline':
+        """Build neighbor finder from training edges only."""
+        if self.config['data']['negative_sampling_strategy'] != 'historical':
+            return self
+        
+        train_edges = self.data['edges'][self.data['train_mask']]
+        train_ts = self.data['timestamps'][self.data['train_mask']]
+        
+        self.neighbor_finder = NeighborFinder(
+            train_edges=train_edges,
+            train_timestamps=train_ts,
+            max_neighbors=self.config['data']['max_neighbors']
+        )
+        
+        logger.info(f"Built NeighborFinder from {len(train_edges)} training edges")
+        return self
+    
+    def build_samplers(self) -> 'DataPipeline':
+        """Build negative samplers for each split."""
+        splits = ['train', 'val', 'test']
+        masks = ['train_mask', 'val_mask', 'test_mask']
+        
+        for split, mask_key in zip(splits, masks):
+            edges = self.data['edges'][self.data[mask_key]]
+            timestamps = self.data['timestamps'][self.data[mask_key]]
+            
+            self.samplers[split] = NegativeSampler(
+                edges=edges,
+                timestamps=timestamps,
+                num_nodes=self.data['num_nodes'],
+                neighbor_finder=self.neighbor_finder,
+                seed=self.config['experiment']['seed']
+            )
+        
+        logger.info(f"Built samplers for: {list(self.samplers.keys())}")
+        return self
+    
+    def build_datasets(self) -> 'DataPipeline':
+        """Build TemporalDatasets for each split."""
+        splits = ['train', 'val', 'test']
+        masks = ['train_mask', 'val_mask', 'test_mask']
+        
+        is_inductive = self.config['data']['evaluation_type'] == 'inductive'
+        
+        for split, mask_key in zip(splits, masks):
+            mask = self.data[mask_key]
+            
+            # Handle features
+            edge_feats = self.data['edge_features']
+            if edge_feats is not None:
+                edge_feats = edge_feats[mask]
+            
+            unseen_nodes = self.data['unseen_nodes'] if (is_inductive and split != 'train') else None
+            
+            self.datasets[split] = TemporalDataset(
+                edges=self.data['edges'][mask],
+                timestamps=self.data['timestamps'][mask],
+                edge_features=edge_feats,
+                num_nodes=self.data['num_nodes'],
+                split=split,
+                negative_sampler=self.samplers[split],
+                negative_sampling_strategy=self.config['data']['negative_sampling_strategy'],
+                unseen_nodes=unseen_nodes,
+                seed=self.config['experiment']['seed']
+            )
+        
+        logger.info(f"Built datasets: { {k: len(v) for k, v in self.datasets.items()} }")
+        return self
+    
+    def build_loaders(self) -> 'DataPipeline':
+        """Wrap datasets in DataLoaders."""
+        batch_size = self.config['training']['batch_size']
+        num_workers = self.config['hardware'].get('num_workers', 0)
+        
+        for split, dataset in self.datasets.items():
+            shuffle = (split == 'train')
+            self.loaders[split] = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                collate_fn=TemporalDataset.collate_fn,
+                pin_memory=self.config['hardware'].get('pin_memory', False),
+            )
+        
+        return self
+    
+    def get_features(self) -> Dict[str, Optional[torch.Tensor]]:
+        """Get node/edge features for model initialization."""
+        # Dataset-specific handling
+        if self.config['data']['dataset'] == "wikipedia":
+            node_features = None  # Wikipedia has no node features
+        else:
+            node_features = self.data.get('node_features')
+        
+        return {
+            'node_features': node_features,
+            'edge_features': self.data['edge_features'],
+            'num_nodes': self.data['num_nodes'],
+            'edge_feat_dim': self.data['edge_features'].shape[1] if self.data['edge_features'] is not None else 0,
+            'node_feat_dim': node_features.shape[1] if node_features is not None else 0,
+        }
+    
+    @property
+    def num_nodes(self) -> int:
+        return self.data['num_nodes']
+
+
+# ============================================================================
+# MODEL
+# ============================================================================
+
+class ModelFactory:
+    """Factory for creating and validating models."""
+    
+    @staticmethod
+    def create(config: Dict, data_info: Dict) -> torch.nn.Module:
+        """Create model with proper parameter handling."""
+        model_config = config['model'].copy()
+        model_name = model_config.pop('name')
+        
+        if model_name not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown model: {model_name}")
+        
+        model_class = MODEL_REGISTRY[model_name]
+        
+        # Prepare arguments
+        model_args = {
+            'num_nodes': data_info['num_nodes'],
+            'node_features': data_info.get('node_feat_dim', 0),
+            'hidden_dim': model_config.get('hidden_dim', 172),
+            'time_encoding_dim': model_config.get('time_encoding_dim', 32),
+            'memory_dim': model_config.get('memory_dim', 172),
+            'message_dim': model_config.get('message_dim', 172),
+            'edge_features_dim': data_info.get('edge_feat_dim', 172),
+            'num_layers': model_config.get('num_layers', 1),
+            'dropout': model_config.get('dropout', 0.1),
+            'learning_rate': model_config.get('learning_rate', 1e-4),
+            'weight_decay': model_config.get('weight_decay', 1e-5),
+            'n_heads': model_config.get('n_heads', 2),
+            'n_neighbors': model_config.get('n_neighbors', 20),
+            'use_memory': model_config.get('use_memory', True),
+            'embedding_module_type': model_config.get('embedding_module_type', 'graph_attention'),
+        }
+        
+        model = model_class(**model_args)
+        
+        # Validation
+        ModelFactory.validate(model, data_info)
+        
+        num_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"✓ Created {model_name}: {num_params:,} parameters")
+        
+        return model
+    
+    @staticmethod
+    def validate(model: torch.nn.Module, data_info: Dict):
+        """Validate model matches data specifications."""
+        num_nodes = data_info['num_nodes']
+        
+        # Check num_nodes consistency
+        if hasattr(model, 'num_nodes'):
+            assert model.num_nodes == num_nodes, \
+                f"model.num_nodes mismatch: {model.num_nodes} != {num_nodes}"
+        
+        # Check hyperparameters preserved
+        if hasattr(model, 'hparams'):
+            if 'num_nodes' in model.hparams:
+                assert model.hparams.num_nodes == num_nodes, \
+                    f"hparams.num_nodes mismatch: {model.hparams.num_nodes} != {num_nodes}"
+        
+        # Check memory size for TGN
+        if hasattr(model, 'memory') and model.memory is not None:
+            mem_size = model.memory.memory.shape[0]
+            assert mem_size == num_nodes, \
+                f"Memory size mismatch: {mem_size} != {num_nodes}"
+        
+        logger.debug("Model validation passed")
+
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+class TrainerSetup:
+    """Encapsulates trainer configuration."""
+    
+    @staticmethod
+    def create(config: Dict) -> L.Trainer:
+        """Create PyTorch Lightning trainer."""
+        callbacks = [
+            ModelCheckpoint(
+                dirpath=config['logging']['checkpoint_dir'],
+                filename='{epoch}-{val_loss:.2f}',
+                monitor=config['logging']['monitor'],
+                mode=config['logging']['mode'],
+                save_top_k=config['logging']['save_top_k'],
+                verbose=True,
+            ),
+            EarlyStopping(
+                monitor=config['logging']['monitor'],
+                patience=config['training']['patience'],
+                mode=config['logging']['mode'],
+                verbose=True,
+            ),
+            LearningRateMonitor(logging_interval='epoch'),
+        ]
+        
+        loggers = [
+            CSVLogger(
+                save_dir=config['logging']['log_dir'],
+                name=config['experiment']['name']
+            ),
+        ]
+        
+        if config.get('logger', 'tensorboard') == 'tensorboard':
+            loggers.append(
+                TensorBoardLogger(
+                    save_dir=config['logging']['log_dir'],
+                    name=config['experiment']['name']
+                )
+            )
+        
+        accelerator = 'gpu' if config['hardware']['gpus'] else 'cpu'
+        devices = config['hardware']['gpus'] if config['hardware']['gpus'] else 'auto'
+        
+        return L.Trainer(
+            max_epochs=config['training']['max_epochs'],
+            accelerator=accelerator,
+            devices=devices,
+            callbacks=callbacks,
+            logger=loggers,
+            precision=config['experiment']['precision'],
+            gradient_clip_val=config['training']['gradient_clip_val'],
+            log_every_n_steps=10,
+            val_check_interval=0.25,
+            enable_progress_bar=True,
+        )
+
+
+class ExperimentLogger:
+    """Handles result logging to CSV."""
+    
+    def __init__(self, log_dir: str):
+        self.log_dir = Path(log_dir)
+        self.csv_path = self.log_dir.parent / 'all_results.csv'
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    def log(self, config: Dict, test_results: List[Dict], training_time: float):
+        """Log results to CSV."""
+        model = test_results[0].get('model', None)
+        num_params = sum(p.numel() for p in model.parameters()) if model else 0
+        
+        row = {
+            'model': config['model']['name'],
+            'dataset': config['data']['dataset'],
+            'evaluation_type': config['data']['evaluation_type'],
+            'negative_sampling_strategy': config['data']['negative_sampling_strategy'],
+            'seed': config['experiment']['seed'],
+            'test_accuracy': test_results[0].get('test_accuracy', 0.0),
+            'test_ap': test_results[0].get('test_ap', 0.0),
+            'test_auc': test_results[0].get('test_auc', 0.0),
+            'test_loss': test_results[0].get('test_loss', 0.0),
+            'training_time': training_time,
+            'num_parameters': num_params,
+            'timestamp': datetime.now().isoformat(),
+        }
+        
+        file_exists = self.csv_path.exists()
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        
+        logger.info(f"Results saved to {self.csv_path}")
+
+
+# ============================================================================
+# MAIN TRAINING LOOP
+# ============================================================================
+
+def train_single_run(config: Dict) -> Dict[str, Any]:
+    """Execute single training run."""
+    start_time = datetime.now()
+    seed = config['experiment']['seed']
+    set_seed(seed)
+    
+    logger.info(f"{'='*50}")
+    logger.info(f"Starting training: {config['experiment']['name']}")
+    logger.info(f"Seed: {seed}")
+    logger.info(f"{'='*50}")
+    
+    # Data pipeline
+    pipeline = (DataPipeline(config)
+        .load()
+        .build_neighbor_finder()
+        .build_samplers()
+        .build_datasets()
+        .build_loaders())
+    
+    # Model
+    features = pipeline.get_features()
+    model = ModelFactory.create(config, features)
+    
+    # Setup trainer
+    trainer = TrainerSetup.create(config)
+    
+    # Train
+    logger.info("Starting training...")
+    trainer.fit(
+        model=model,
+        train_dataloaders=pipeline.loaders['train'],
+        val_dataloaders=pipeline.loaders['val'],
+    )
+    
+    # Test
+    logger.info("Running evaluation...")
+    test_results = trainer.test(
+        model=model, 
+        dataloaders=pipeline.loaders['test']
+    )
+    
+    # Log results
+    training_time = (datetime.now() - start_time).total_seconds()
+    exp_logger = ExperimentLogger(config['logging']['log_dir'])
+    exp_logger.log(config, test_results, training_time)
+    
+    # Save checkpoint
+    final_path = Path(config['logging']['checkpoint_dir']) / 'final_model.ckpt'
+    trainer.save_checkpoint(str(final_path))
+    
+    logger.info(f"Training complete in {training_time:.1f}s")
+    logger.info(f"Final model: {final_path}")
+    
+    return {
+        'test_results': test_results,
+        'training_time': training_time,
+        'model': model,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train temporal graph models')
+    parser.add_argument('--config', '-c', required=True, help='Config file path')
+    parser.add_argument('--seeds', '-s', type=int, nargs='+', help='Random seeds')
+    parser.add_argument('--override', '-o', nargs='*', default=[], help='Config overrides')
+    args = parser.parse_args()
+    
+    # Load and prepare config
+    config = load_config(args.config)
+    config = resolve_config_placeholders(config)
+    config = apply_overrides(config, args.override)
+    
+    # Determine seeds to run
+    seeds = args.seeds if args.seeds else [config['experiment'].get('seed', 42)]
+    
+    # Run experiments
+    for seed in seeds:
+        config = build_experiment_config(config, seed)
+        
+        # Setup logging
+        log_path = Path(config['logging']['log_dir']) / 'train.log'
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(str(log_path), rotation="10 MB", level="INFO")
+        
+        try:
+            results = train_single_run(config)
+        except Exception as e:
+            logger.exception(f"Training failed with seed {seed}")
+            raise
+
+
+if __name__ == "__main__":
+    main()
