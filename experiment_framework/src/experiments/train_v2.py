@@ -316,7 +316,7 @@ class ModelFactory:
             'learning_rate': model_config.get('learning_rate', 1e-4),
             'weight_decay': model_config.get('weight_decay', 1e-5),
             'n_heads': model_config.get('n_heads', 2),
-            'n_neighbors': model_config.get('n_neighbors', 20),
+            'n_neighbors': model_config.get('n_neighbors', 10),
             'use_memory': model_config.get('use_memory', True),
             'embedding_module_type': model_config.get('embedding_module_type', 'graph_attention'),
         }
@@ -494,6 +494,13 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     if hasattr(model, 'embedding_module'):
         print(f"Embedding module initialized: {model.embedding_module is not None}")
 
+    print(f"1. embedding_module exists: {model.embedding_module is not None}")
+    print(f"2. memory_updater exists: {model.memory_updater is not None}")
+    print(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
+    print(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
+    print(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
+        
+    
     # Setup trainer
     trainer = TrainerSetup.create(config)
     

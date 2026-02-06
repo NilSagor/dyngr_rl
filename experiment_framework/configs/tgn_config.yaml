@@ -10,10 +10,12 @@ model:
   memory_dim: 172
   message_dim: 172
   edge_features_dim: 172
-  num_layers: 1
+  num_layers: 2
+  n_heads: 2
   dropout: 0.1
   embedding_module_type: "graph_attention"  
   use_memory: true
+  n_neighbors: 10
   
 # Training parameters
 training:

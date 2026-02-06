@@ -65,22 +65,23 @@ class TemporalDataset(Dataset):
         
         # Negative samples (exactly 1 per positive)
         neg_srcs = self.edges[:, 0].numpy()
-
-        neg_timestamps = []
-        for i, ts in enumerate(self.timestamps.numpy()):
-            # Add small random offset (e.g., 1-10 seconds)
-            offset = self.rng.uniform(1, 10)
-            neg_timestamps.append(ts + offset)
+        neg_timestamps = self.timestamps.numpy()
+        # neg_timestamps = []
+        # for i, ts in enumerate(self.timestamps.numpy()):
+        #     # Add small random offset (e.g., 1-10 seconds)
+        #     offset = self.rng.uniform(1, 10)
+        #     neg_timestamps.append(ts + offset)
         
-        neg_timestamps = np.array(neg_timestamps)
+        # neg_timestamps = np.array(neg_timestamps)
         
         neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
         
         for i in range(num_positives):
-            if self.edge_features is not None:
-                edge_feat = self.edge_features[i]  # Keep the same edge features
-            else:
-                edge_feat = None
+            edge_feat = torch.zeros_like(self.edge_features[i]) if self.edge_features is not None else None
+            # if self.edge_features is not None:
+            #     edge_feat = self.edge_features[i]  # Keep the same edge features
+            # else:
+            #     edge_feat = None
 
             self.samples.append({
                 'src': int(neg_srcs[i]),
@@ -91,8 +92,15 @@ class TemporalDataset(Dataset):
                 'is_positive': False
             })
         
-        # Shuffle training only
-        if self.split == 'train':
+        # CRITICAL FIX #1: INTERLEAVE positives/negatives for val/test to guarantee per-batch balance
+        if self.split != 'train':
+            interleaved = []
+            for i in range(num_positives):
+                interleaved.append(self.samples[i])           # Positive
+                interleaved.append(self.samples[i + num_positives])  # Negative
+            self.samples = interleaved
+        else:
+            # Shuffle training only (temporal order not critical for training)
             self.rng.shuffle(self.samples)
         
         # Validation

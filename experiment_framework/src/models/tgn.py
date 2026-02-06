@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 from abc import ABC, abstractmethod
 from loguru import logger
-
+from collections import defaultdict
 
 from .base_model import BaseDynamicGNN
 from .tgn_module.temporal_attention import TemporalAttentionLayer, MergeLayer
@@ -111,6 +111,12 @@ class TGN(BaseDynamicGNN):
         # Memory management for TGN (lagged update)
         self._pending_messages = None
         self._memory_initialized = False
+
+        # Add message store as in original TGN
+        self.message_store = defaultdict(list)
+        
+        # Add layer norm to attention
+        self.attention_norm = nn.LayerNorm(hidden_dim)
         
         # Initialize modules
         self._init_modules()
@@ -250,9 +256,16 @@ class TGN(BaseDynamicGNN):
             if not hasattr(neighbor_finder, method):
                 raise ValueError(f"NeighborFinder missing: {method}")
         
-        
-        if self.node_raw_features is not None and self.edge_raw_features is not None:
+        # FIXED: Initialize even without node features
+        if self.edge_raw_features is not None and neighbor_finder is not None:
             self._init_embedding_module()
+        else:
+            logger.warning(f"Cannot initialize embedding module: "
+                        f"edge_raw_features={self.edge_raw_features is not None}, "
+                        f"neighbor_finder={neighbor_finder is not None}")
+        
+        # if self.node_raw_features is not None and self.edge_raw_features is not None:
+        #     self._init_embedding_module()
 
     def _init_embedding_module(self):
         """Initialize embedding module with CORRECT feature dimensions."""
@@ -260,9 +273,19 @@ class TGN(BaseDynamicGNN):
         
         logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
         
+        # Handle Wikipedia (no node features)
+        # CRITICAL FIX: Handle case where node features are None (Wikipedia)
+        if self.node_raw_features is None:
+            logger.warning("Node features are None! Using node embedding layer for embedding module.")
+            # Use the node embedding layer's weight as node features
+            node_features = self.node_embedding.weight  # Shape: [num_nodes, hidden_dim]
+        else:
+            node_features = self.node_raw_features
+        logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
+
         self.embedding_module = get_embedding_module(
             module_type=self.embedding_module_type,
-            node_features=self.node_raw_features,
+            node_features=node_features,
             edge_features=self.edge_raw_features,
             memory=self.memory,
             neighbor_finder=self.neighbor_finder,
@@ -278,6 +301,7 @@ class TGN(BaseDynamicGNN):
             n_neighbors=self.n_neighbors,
             use_memory=self.use_memory
         )
+        logger.info(f"Embedding module initialized: {self.embedding_module is not None}")
 
     def _init_modules(self):
         """Initialize TGN modules"""
@@ -296,6 +320,9 @@ class TGN(BaseDynamicGNN):
         #         f"Current hparams: {getattr(self, 'hparams', 'MISSING')}"
         #     )
         
+        # CRITICAL DEBUG
+        print(f"DEBUG: use_memory={self.use_memory}, memory_updater_type={self.memory_updater_type}")
+
         # Memory module
         if self.use_memory:
             self.memory = Memory(
@@ -325,6 +352,7 @@ class TGN(BaseDynamicGNN):
                 device=device
             )
         else:
+            self.memory = None
             self.memory_updater = None        
 
         self.embedding_module = None
@@ -357,9 +385,9 @@ class TGN(BaseDynamicGNN):
         
         # CRITICAL FIX: NEVER call _init_modules() here - causes double initialization with corrupted state
         # Update embedding module features directly if it exists
-        if hasattr(self, 'embedding_module') and self.embedding_module is not None:
-            self.embedding_module.node_features = self.node_raw_features
-            self.embedding_module.edge_features = self.edge_raw_features
+        # if hasattr(self, 'embedding_module') and self.embedding_module is not None:
+        #     self.embedding_module.node_features = self.node_raw_features
+        #     self.embedding_module.edge_features = self.edge_raw_features
         
         # Initialize message function (safe - doesn't reinit modules)
         self._init_message_function()
@@ -422,11 +450,29 @@ class TGN(BaseDynamicGNN):
         # if self.training and self.use_memory and self.memory is not None:
         #     # self._update_memory_for_batch(batch)
         
-        # PHASE 1: Apply pending memory updates from PREVIOUS batch
-        if self.use_memory and self.memory is not None:
-            if self._memory_initialized and self._pending_messages is not None:
-                with torch.no_grad():
-                    self._apply_pending_memory_update()
+        # DEBUG: Check if embedding module exists
+        if self.embedding_module is None:
+            logger.error("CRITICAL: Embedding module is None! Using fallback features only.")
+            logger.error(f"node_raw_features: {self.node_raw_features is not None}")
+            logger.error(f"edge_raw_features: {self.edge_raw_features is not None}")
+            logger.error(f"neighbor_finder: {self.neighbor_finder is not None}")
+        
+        
+        # PHASE 0: Update memory from previous batch's messages
+        if self.training and self.use_memory and self._pending_messages is not None:
+            with torch.no_grad():
+                self._apply_pending_memory_update()
+
+        # # PHASE 1: Compute messages for CURRENT batch
+        # if self.training and self.use_memory:
+        #     self._compute_and_store_messages(batch)
+        
+        
+        # # PHASE 1: Apply pending memory updates from PREVIOUS batch
+        # if self.use_memory and self.memory is not None:
+        #     if self._memory_initialized and self._pending_messages is not None:
+        #         with torch.no_grad():
+        #             self._apply_pending_memory_update()
         
         
         
@@ -459,6 +505,10 @@ class TGN(BaseDynamicGNN):
             edge_times=timestamps.cpu().numpy(),
             n_neighbors=self.n_neighbors
         )
+        
+        # DEBUG: Check embeddings
+        if torch.all(source_emb == 0) or torch.all(dest_emb == 0):
+            logger.warning("All-zero embeddings detected!")
         
         # PHASE 3: Predict
         combined = torch.cat([source_emb, dest_emb], dim=-1)
@@ -507,11 +557,20 @@ class TGN(BaseDynamicGNN):
 
     def _compute_and_store_messages(self, batch):
         """Compute messages from this batch for NEXT memory update."""
+        if not self.use_memory or self.memory is None:
+            print("WARNING: Trying to store messages but use_memory=False or memory=None")
+            return
+        
         device = self.device
         
         src_nodes = batch['src_nodes'].to(device)
         dst_nodes = batch['dst_nodes'].to(device)
         timestamps = batch['timestamps'].to(device)
+        
+        # print(f"DEBUG: Storing messages for {len(src_nodes)} source nodes")
+        # print(f"DEBUG: Message function exists: {self.message_fn is not None}")
+        # print(f"DEBUG: Memory exists: {self.memory is not None}")
+        
         
         # Get features
         if self.node_raw_features is not None:
@@ -623,17 +682,17 @@ class TGN(BaseDynamicGNN):
         return src_emb, dst_emb
     
         
-    def _generate_negative_samples(self, src_nodes: np.ndarray, 
-                                  dst_nodes: np.ndarray) -> np.ndarray:
-        """Generate negative samples for link prediction."""
-        n_samples = len(src_nodes)
-        negative_nodes = np.random.choice(self.num_nodes, size=n_samples, replace=True)
+    # def _generate_negative_samples(self, src_nodes: np.ndarray, 
+    #                               dst_nodes: np.ndarray) -> np.ndarray:
+    #     """Generate negative samples for link prediction."""
+    #     n_samples = len(src_nodes)
+    #     negative_nodes = np.random.choice(self.num_nodes, size=n_samples, replace=True)
         
-        for i in range(n_samples):
-            if negative_nodes[i] == dst_nodes[i]:
-                negative_nodes[i] = (negative_nodes[i] + 1) % self.num_nodes
+    #     for i in range(n_samples):
+    #         if negative_nodes[i] == dst_nodes[i]:
+    #             negative_nodes[i] = (negative_nodes[i] + 1) % self.num_nodes
                 
-        return negative_nodes  
+    #     return negative_nodes  
     
     
     
@@ -716,7 +775,7 @@ class TGN(BaseDynamicGNN):
 
         # Check for constant predictions
         if torch.all(probs == probs[0]):
-            print(f"WARNING: All predictions are {probs[0].item():.4f}")
+            # print(f"WARNING: All predictions are {probs[0].item():.4f}")
             # Add small noise to break symmetry
             probs = probs + torch.randn_like(probs) * 1e-4
 
@@ -755,6 +814,21 @@ class TGN(BaseDynamicGNN):
             mem_std = self.memory.memory.std().item()
             if batch_idx % 100 == 0:
                 logger.info(f"Batch {batch_idx}: memory mean={mem_mean:.4f}, std={mem_std:.4f}")
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Check if gradients are flowing."""
+        if batch_idx % 100 == 0:
+            total_grad_norm = 0
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    total_grad_norm += param.grad.norm().item()
+            
+            print(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
+            
+            # Check memory updates
+            if self.use_memory and self.memory is not None:
+                mem_update = torch.norm(self.memory.memory - self.memory.memory.clone().detach())
+                print(f"Memory update norm = {mem_update:.4f}")  
     
     def _reset_memory(self, phase: str):
         """Reset memory state."""
@@ -769,15 +843,21 @@ class TGN(BaseDynamicGNN):
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self.train_batch_counter = 0
-        self._reset_memory("training")
+        logger.info(f"✓ Training epoch start - Memory state preserved (size={self.memory.memory.shape[0]})")
 
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
-        self._reset_memory("validation")
+        # self._reset_memory("validation")
+        if self.use_memory:
+            self.memory.__init_memory__()
+            logger.info(" Memory reset for validation (prevents training leakage)")
 
     def on_test_epoch_start(self):
         super().on_test_epoch_start()
-        self._reset_memory("test")
+        # self._reset_memory("test")
+        if self.use_memory:
+            self.memory.__init_memory__()
+            logger.info(" Memory reset for test (prevents training leakage)")
 
     
 
