@@ -1,6 +1,7 @@
 from typing import Set, Tuple, Optional, TYPE_CHECKING
 import numpy as np
 import torch
+from loguru import logger
 
 if TYPE_CHECKING:
     from .neighbor_finder import NeighborFinder
@@ -83,7 +84,14 @@ class NegativeSampler:
             ])
             
             if len(candidates) == 0:
-                raise ValueError(f"No valid negative samples for node {src}")
+                # DENSE GRAPH FALLBACK: Allow positive edges as negatives
+                # This is necessary for datasets like SocialEvo
+                logger.warning(f"Dense graph: node {src} connected to all others. "
+                            f"Sampling from positive edges.")
+                candidates = [n for n in range(self.num_nodes) if n != src]
+                
+                if len(candidates) == 0:
+                    raise ValueError(f"Isolated node {src}, cannot sample negative")
             
             neg_dst[i] = self.rng.choice(candidates)
         
@@ -120,8 +128,10 @@ class NegativeSampler:
             
             # Query historical neighbors before timestamp ts
             # FIXED: Use correct method name and unpack 2 values
+            # Use DEFAULT neighbor count from finder
+            n_neighbors = self.neighbor_finder.max_neighbors
             neighbors_list, _ = self.neighbor_finder.find_neighbors(
-                [src], [float(ts)], n_neighbors=20
+                [src], [float(ts)], n_neighbors=n_neighbors
             )
             neighbors = neighbors_list[0]  # Unwrap batch dimension
             

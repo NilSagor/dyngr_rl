@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 import torch
 import bisect
+import numpy as np
 
 class NeighborFinder:
     """
@@ -14,13 +15,16 @@ class NeighborFinder:
                  train_edges: torch.Tensor, 
                  train_timestamps: torch.Tensor,
                  max_neighbors: int = 20,
-                 undirected: bool = True):
+                 undirected: bool = True,
+                 seed: Optional[int] = None):
         """
         Args:
             train_edges: [E_train, 2] LongTensor of 0-indexed training edges ONLY
             train_timestamps: [E_train] FloatTensor of training timestamps ONLY
             max_neighbors: maximum neighbors to store per node
             undirected: if True, add reverse edges (default: True)
+            undirected: if True, add reverse edges
+            seed: random seed for reproducibility
         """
         if not isinstance(train_edges, torch.Tensor):
             raise TypeError(f"train_edges must be torch.Tensor, got {type(train_edges)}")
@@ -130,13 +134,40 @@ class NeighborFinder:
         sampled = valid_neighbors[start_idx:cutoff_idx]
         
         # Reverse to get most recent first
-        sampled.reverse()
+        # sampled.reverse()
         
         if not sampled:
             return [], []
         
         neighbors, times = zip(*sampled)
         return list(neighbors), list(times)
+    
+    def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
+        """
+        TGN-compatible interface. Returns (neighbors, edge_idxs, edge_times).
+        edge_idxs are dummy indices (0,1,2...) for each neighbor position.
+        """
+        # Get neighbors and times using your existing method
+        neighbors_list, times_list = self.find_neighbors(
+            source_nodes, timestamps, n_neighbors=n_neighbors
+        )
+        
+        # TGN expects numpy arrays with shape [batch_size, n_neighbors]
+        # Pad to fixed size and create edge indices
+        batch_size = len(source_nodes)
+        
+        neighbors = np.zeros((batch_size, n_neighbors), dtype=np.int64)
+        edge_idxs = np.zeros((batch_size, n_neighbors), dtype=np.int64)
+        edge_times = np.zeros((batch_size, n_neighbors), dtype=np.float32)
+        
+        for i, (nbrs, tms) in enumerate(zip(neighbors_list, times_list)):
+            if len(nbrs) > 0:
+                actual_n = min(len(nbrs), n_neighbors)
+                neighbors[i, :actual_n] = nbrs[:actual_n]
+                edge_idxs[i, :actual_n] = np.arange(actual_n)  # Dummy indices
+                edge_times[i, :actual_n] = tms[:actual_n]
+        
+        return neighbors, edge_idxs, edge_times
     
     def get_statistics(self) -> Dict[str, Union[int, float]]:
         """Return construction statistics."""

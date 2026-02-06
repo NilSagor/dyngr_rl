@@ -3,25 +3,103 @@ import torch.nn as nn
 
 # from utils.utils import MergeLayer
 
-
 class MergeLayer(nn.Module):
-    def __init__(self, dim1, dim2, dim3, dim4):
+    """
+    Robust tensor merging layer for temporal attention mechanisms.
+    
+    Industry standard usage (TGN ICML 2020):
+    - ONLY supports 2-input merging (x1, x2)
+    - Total input dim = dim(x1) + dim(x2)
+    - Hidden dim and output dim explicitly specified
+    
+    Why no 4-arg support?
+    - Original TGN paper ONLY uses 2-input merging
+    - 4-arg pattern causes dimension mismatches (e.g., 204 vs 208 errors)
+    - Safer to enforce strict 2-input interface
+    """
+    
+    def __init__(self, input_dim1: int, input_dim2: int, hidden_dim: int, output_dim: int):
         super().__init__()
-        self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
-        self.fc2 = torch.nn.Linear(dim3, dim4)
-        self.act = torch.nn.ReLU()
-
-        torch.nn.init.xavier_normal_(self.fc1.weight)
-        torch.nn.init.xavier_normal_(self.fc2.weight)
-
-    def forward(self, x1, x2, x3=None, x4=None):
-        # Handle both 2-arg and 4-arg usage
-        if x3 is None:
-            x = torch.cat([x1, x2], dim=-1)
-        else:
-            x = torch.cat([x1, x2, x3, x4], dim=-1)
+        
+        # CRITICAL FIX 1: Explicit dimension validation
+        if input_dim1 <= 0 or input_dim2 <= 0:
+            raise ValueError(f"Input dimensions must be positive: {input_dim1}, {input_dim2}")
+        if hidden_dim <= 0 or output_dim <= 0:
+            raise ValueError(f"Hidden/output dimensions must be positive: {hidden_dim}, {output_dim}")
+        
+        total_input_dim = input_dim1 + input_dim2
+        
+        self.fc1 = nn.Linear(total_input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.ReLU()
+        
+        # CRITICAL FIX 2: Proper weight initialization (with bias handling)
+        nn.init.xavier_normal_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)  # Explicit bias initialization
+        nn.init.xavier_normal_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+        
+        # Store dimensions for debugging/validation
+        self.input_dim1 = input_dim1
+        self.input_dim2 = input_dim2
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+    
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """
+        Merge two tensors via concatenation + MLP.
+        
+        Args:
+            x1: Tensor of shape [..., input_dim1]
+            x2: Tensor of shape [..., input_dim2]
+        
+        Returns:
+            Tensor of shape [..., output_dim]
+        
+        Raises:
+            ValueError: If input dimensions don't match expected sizes
+        """
+        # CRITICAL FIX 3: Runtime dimension validation
+        if x1.size(-1) != self.input_dim1:
+            raise ValueError(
+                f"x1 dimension mismatch: expected {self.input_dim1}, got {x1.size(-1)}. "
+                f"Check attention layer configuration."
+            )
+        if x2.size(-1) != self.input_dim2:
+            raise ValueError(
+                f"x2 dimension mismatch: expected {self.input_dim2}, got {x2.size(-1)}. "
+                f"This causes attention shape errors (e.g., 204 vs 208)."
+            )
+        
+        # Safe concatenation
+        x = torch.cat([x1, x2], dim=-1)
         h = self.act(self.fc1(x))
         return self.fc2(h)
+
+
+
+
+
+
+
+# class MergeLayer(nn.Module):
+#     def __init__(self, dim1, dim2, dim3, dim4):
+#         super().__init__()
+#         self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
+#         self.fc2 = torch.nn.Linear(dim3, dim4)
+#         self.act = torch.nn.ReLU()
+
+#         torch.nn.init.xavier_normal_(self.fc1.weight)
+#         torch.nn.init.xavier_normal_(self.fc2.weight)
+
+#     def forward(self, x1, x2, x3=None, x4=None):
+#         # Handle both 2-arg and 4-arg usage
+#         if x3 is None:
+#             x = torch.cat([x1, x2], dim=-1)
+#         else:
+#             x = torch.cat([x1, x2, x3, x4], dim=-1)
+#         h = self.act(self.fc1(x))
+#         return self.fc2(h)
 
 
 

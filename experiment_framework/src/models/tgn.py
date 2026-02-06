@@ -53,8 +53,7 @@ class TGN(BaseDynamicGNN):
         embedding_module_type: str = "graph_attention",
         message_function_type: str = "mlp",
         aggregator_type: str = "last", 
-        memory_updater_type: str = "gru",
-        # neighbor_finder: Optional[nn.Module] = None,        
+        memory_updater_type: str = "gru",               
     ):        
         super().__init__(
             num_nodes=num_nodes,
@@ -68,11 +67,21 @@ class TGN(BaseDynamicGNN):
         )
         self.save_hyperparameters(ignore=['neighbor_finder'])
         # VALIDATE num_nodes immediately
-        if num_nodes < 1000:  # Wikipedia needs 9228
-            raise ValueError(
-                f"CRITICAL: TGN initialized with num_nodes={num_nodes}! "
-                f"Expected >=1000 for real datasets. Check config/model reconstruction."
-            )
+        # if num_nodes < 1000:  # Wikipedia needs 9228
+        #     raise ValueError(
+        #         f"CRITICAL: TGN initialized with num_nodes={num_nodes}! "
+        #         f"Expected >=1000 for real datasets. Check config/model reconstruction."
+        #     )
+
+        # RELAXED check - only catch obviously wrong values
+        if num_nodes < 2:  # Minimum for a graph
+            raise ValueError(f"CRITICAL: TGN initialized with num_nodes={num_nodes}! Must be >= 2")
+        
+        # Optional warning for small datasets
+        if num_nodes < 100:
+            logger.warning(f"Small dataset detected: num_nodes={num_nodes}. "
+                        f"Verify this is expected (UNvote=201, USLegis=225, etc.)")
+
 
         self.memory_dim = memory_dim
         self.message_dim = message_dim
@@ -92,16 +101,16 @@ class TGN(BaseDynamicGNN):
         
 
         # # Store raw features as buffers        
-        self.node_raw_features = None
-        self.edge_raw_features = None 
-
-        # Time shift normalization (not used in basic TGN)
-        # self.register_buffer("mean_time_shift_src", torch.tensor(0.0))
-        # self.register_buffer("std_time_shift_src", torch.tensor(1.0))
-        # self.register_buffer("mean_time_shift_dst", torch.tensor(0.0))
-        # self.register_buffer("std_time_shift_dst", torch.tensor(1.0))
-
+        # Register buffers (will be filled later)
+        self.register_buffer('_node_raw_features', None)
+        self.register_buffer('_edge_raw_features', None)      
         
+        self.node_raw_features = None  # Will point to buffer
+        self.edge_raw_features = None
+        
+        # Memory management for TGN (lagged update)
+        self._pending_messages = None
+        self._memory_initialized = False
         
         # Initialize modules
         self._init_modules()
@@ -109,6 +118,9 @@ class TGN(BaseDynamicGNN):
         # Ensure memory is on correct device
         if self.use_memory and self.memory is not None:
             self.memory = self.memory.to(self.device)
+
+        if self.use_memory and self.node_features == 0:
+            self.node_embedding = nn.Embedding(self.num_nodes, self.hidden_dim)
 
        
         self.link_predictor = nn.Sequential(
@@ -118,6 +130,7 @@ class TGN(BaseDynamicGNN):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
         )
+        
 
         # Initialize weights properly
         self._init_weights()
@@ -125,17 +138,19 @@ class TGN(BaseDynamicGNN):
         # Loss function
         self.loss_fn = nn.BCEWithLogitsLoss()
 
-        print(f"TGN initialized with use_memory={self.use_memory}")
-        if self.memory_updater is not None:
-            print("Memory updater: OK")
-        else:
-            print("Memory updater: NONE!")
-
         # Add training state tracking
         self.train_batch_counter = 0
-        self.last_batch_time = None
+        logger.info(f"TGN initialized with use_memory={self.use_memory}")
+        # if self.memory_updater is not None:
+        #     print("Memory updater: OK")
+        # else:
+        #     print("Memory updater: NONE!")
 
-        # self._pending_messages = None
+        
+        # self.last_batch_time = None
+        # self._memory_initialized = False
+
+        
 
     # Add these methods to your TGN class (after __init__)
     def __getstate__(self):
@@ -144,6 +159,7 @@ class TGN(BaseDynamicGNN):
         # Backup critical parameters that Lightning often corrupts
         state['_num_nodes_backup'] = self.num_nodes
         state['_edge_features_dim_backup'] = self.edge_features_dim
+        state.pop('_memory_initialized', None)
         return state
 
     def __setstate__(self, state):
@@ -151,41 +167,65 @@ class TGN(BaseDynamicGNN):
         # Extract backups BEFORE updating state
         num_nodes_backup = state.pop('_num_nodes_backup', None)
         edge_dim_backup = state.pop('_edge_features_dim_backup', None)
+
+        # if num_nodes_backup is not None:
+        #     self.num_nodes = num_nodes_backup
+        # if edge_dim_backup is not None:
+        #     self.edge_features_dim = edge_dim_backup
         
         # Update instance dictionary
         self.__dict__.update(state)
+        self._pending_messages = None
+        self._memory_initialized = False
         
-        # CRITICAL: Detect and repair corrupted num_nodes (<1000 indicates reconstruction failure)
-        if num_nodes_backup is not None and (not hasattr(self, 'num_nodes') or self.num_nodes < 1000):
-            print(f"RECONSTRUCTION CORRUPTION DETECTED! "
-                f"Restoring num_nodes from {self.num_nodes} → {num_nodes_backup}")
-            self.num_nodes = num_nodes_backup
+        # # CRITICAL: Detect and repair corrupted num_nodes (<1000 indicates reconstruction failure)
+        # if num_nodes_backup is not None and (not hasattr(self, 'num_nodes') or self.num_nodes < 1000):
+        #     print(f"RECONSTRUCTION CORRUPTION DETECTED! "
+        #         f"Restoring num_nodes from {self.num_nodes} → {num_nodes_backup}")
+        #     self.num_nodes = num_nodes_backup
             
-            # Reinitialize memory with CORRECT size
-            if hasattr(self, 'memory') and self.memory is not None and self.use_memory:
-                device = self.memory.memory.device
-                # Create new memory tensor with correct size
-                new_memory = torch.zeros(
-                    num_nodes_backup, 
-                    self.memory.memory_dimension, 
-                    device=device
-                )
-                # Preserve existing values where possible
-                min_size = min(self.memory.memory.shape[0], num_nodes_backup)
-                new_memory[:min_size] = self.memory.memory[:min_size]
-                self.memory.memory = new_memory
-                self.memory.last_update = torch.zeros(
-                    num_nodes_backup, 
-                    dtype=torch.float32, 
-                    device=device
-                )
-                print(f"Memory reinitialized with size {num_nodes_backup}")
+        #     # Reinitialize memory with CORRECT size
+        #     if hasattr(self, 'memory') and self.memory is not None and self.use_memory:
+        #         device = self.memory.memory.device
+        #         # Create new memory tensor with correct size
+        #         new_memory = torch.zeros(
+        #             num_nodes_backup, 
+        #             self.memory.memory_dimension, 
+        #             device=device
+        #         )
+        #         # Preserve existing values where possible
+        #         min_size = min(self.memory.memory.shape[0], num_nodes_backup)
+        #         new_memory[:min_size] = self.memory.memory[:min_size]
+        #         self.memory.memory = new_memory
+        #         self.memory.last_update = torch.zeros(
+        #             num_nodes_backup, 
+        #             dtype=torch.float32, 
+        #             device=device
+        #         )
+        #         print(f"Memory reinitialized with size {num_nodes_backup}")
         
+
+        if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
+            self.num_nodes = num_nodes_backup
+            if self.use_memory and hasattr(self, 'memory'):
+                self._init_modules()
+
+
         # Restore edge dimension if corrupted
-        if edge_dim_backup is not None and hasattr(self, 'edge_features_dim'):
-            if self.edge_features_dim != edge_dim_backup:
-                print(f"Restoring edge_features_dim from {self.edge_features_dim} → {edge_dim_backup}")
-                self.edge_features_dim = edge_dim_backup
+        # if edge_dim_backup is not None and hasattr(self, 'edge_features_dim'):
+        #     if self.edge_features_dim != edge_dim_backup:
+        #         print(f"Restoring edge_features_dim from {self.edge_features_dim} → {edge_dim_backup}")
+        #         self.edge_features_dim = edge_dim_backup
+
+        if edge_dim_backup is not None:
+            self.edge_features_dim = edge_dim_backup
+
+        # self._memory_initialized = False
+        # self._init_modules()
+        # if self.node_raw_features is not None and self.edge_raw_features is not None:
+        #     self.set_raw_features(self.node_raw_features, self.edge_raw_features)
+        
+        
 
 
 
@@ -202,7 +242,16 @@ class TGN(BaseDynamicGNN):
         self.neighbor_finder = neighbor_finder
         
         # Only initialize embedding module if features are already set
-        if self.embedding_module is None and neighbor_finder is not None and self.node_raw_features is not None:
+        # if self.embedding_module is None and neighbor_finder is not None and self.node_raw_features is not None:
+        #     self._init_embedding_module()
+        # Validate interface
+        required = ['find_neighbors', 'get_temporal_neighbor']
+        for method in required:
+            if not hasattr(neighbor_finder, method):
+                raise ValueError(f"NeighborFinder missing: {method}")
+        
+        
+        if self.node_raw_features is not None and self.edge_raw_features is not None:
             self._init_embedding_module()
 
     def _init_embedding_module(self):
@@ -230,24 +279,22 @@ class TGN(BaseDynamicGNN):
             use_memory=self.use_memory
         )
 
-
-
     def _init_modules(self):
         """Initialize TGN modules"""
         device = self.device
         
         # CRITICAL DEBUG: Log actual num_nodes during initialization
-        print(f"DEBUG: _init_modules() called with num_nodes={self.num_nodes}, "
-          f"device={device}, has_neighbor_finder={self.neighbor_finder is not None}")
+        # print(f"DEBUG: _init_modules() called with num_nodes={self.num_nodes}, "
+        #   f"device={device}, has_neighbor_finder={self.neighbor_finder is not None}")
         
         
-        if self.num_nodes < 1000:
-            raise RuntimeError(
-                f"TGN._init_modules() called with num_nodes={self.num_nodes}! "
-                f"This indicates BaseDynamicGNN still calls save_hyperparameters(). "
-                f"FIX: Remove self.save_hyperparameters() from BaseDynamicGNN.__init__(). "
-                f"Current hparams: {getattr(self, 'hparams', 'MISSING')}"
-            )
+        # if self.num_nodes < 1000:
+        #     raise RuntimeError(
+        #         f"TGN._init_modules() called with num_nodes={self.num_nodes}! "
+        #         f"This indicates BaseDynamicGNN still calls save_hyperparameters(). "
+        #         f"FIX: Remove self.save_hyperparameters() from BaseDynamicGNN.__init__(). "
+        #         f"Current hparams: {getattr(self, 'hparams', 'MISSING')}"
+        #     )
         
         # Memory module
         if self.use_memory:
@@ -278,90 +325,35 @@ class TGN(BaseDynamicGNN):
                 device=device
             )
         else:
-            self.memory_updater = None
-        
-        # # Embedding module
-        # if self.neighbor_finder is not None:
-
-        #     # Validate neighbor_finder is actual object, not string
-        #     assert hasattr(self.neighbor_finder, 'get_temporal_neighbor'), \
-        #         f"neighbor_finder must be NeighborFinder object, got {type(self.neighbor_finder)}"
-            
-
-        #     self.embedding_module = get_embedding_module(
-        #         module_type=self.embedding_module_type,
-        #         node_features=self.node_raw_features,
-        #         edge_features=self.edge_raw_features,
-        #         memory=self.memory,
-        #         neighbor_finder=self.neighbor_finder,
-        #         time_encoder=self.time_encoder,
-        #         n_layers=self.num_layers,
-        #         n_node_features=self.hidden_dim, # changed from self.node_features
-        #         n_edge_features=172,
-        #         n_time_features=self.time_encoding_dim,
-        #         embedding_dimension=self.hidden_dim,
-        #         device=device,
-        #         n_heads=self.n_heads,
-        #         dropout=self.dropout,
-        #         n_neighbors=self.n_neighbors,
-        #         use_memory=self.use_memory
-        #     )
-        # else:
-        #     self.embedding_module = None
+            self.memory_updater = None        
 
         self.embedding_module = None
         # Message function will be initialized after raw features are set
         self.message_fn = None
 
     def set_raw_features(self, node_raw_features: torch.Tensor, edge_raw_features: torch.Tensor):
-        # """Set raw features from dataset."""
-        # device = self.device
-        
-        # self.node_raw_features = node_raw_features.to(device) if node_raw_features is not None else None
-        # self.edge_raw_features = edge_raw_features.to(device)
-        
-        # actual_edge_dim = self.edge_raw_features.shape[1]
-        # print(f"Setting raw features - Node: {self.node_raw_features.shape if self.node_raw_features is not None else None}, Edge: {self.edge_raw_features.shape}")
-        
-        # # Check if embedding module needs reinitialization due to dimension mismatch
-        # reinit_needed = False
-        # if hasattr(self, 'embedding_module') and self.embedding_module is not None:
-        #     # Check current configured edge dim
-        #     if len(self.embedding_module.attention_models) > 0:
-        #         attn_layer = self.embedding_module.attention_models[0]
-        #         # key_dim = n_neighbors_features + n_edge_features + time_dim
-        #         configured_edge_dim = attn_layer.key_dim - attn_layer.feat_dim - attn_layer.time_dim
-                
-        #         if configured_edge_dim != actual_edge_dim:
-        #             print(f"Edge dim mismatch: model expects {configured_edge_dim}, got {actual_edge_dim}. Reinitializing...")
-        #             reinit_needed = True
-        
-        # # Update or reinitialize embedding module
-        # if reinit_needed or not hasattr(self, 'embedding_module') or self.embedding_module is None:
-        #     # Update config for reinitialization
-        #     self.n_edge_features = actual_edge_dim
-            
-        #     # Reinitialize modules with correct dimensions
-        #     self._init_modules()
-            
-        #     # Set features again after reinit
-        #     if self.embedding_module is not None:
-        #         self.embedding_module.node_features = self.node_raw_features
-        #         self.embedding_module.edge_features = self.edge_raw_features
-        # else:
-        #     # Just update features
-        #     self.embedding_module.node_features = self.node_raw_features
-        #     self.embedding_module.edge_features = self.edge_raw_features
-        
-        # # Create message function with correct dimensions
-        # self._init_message_function()
+        # """Set raw features from dataset."""        
         """Set raw features WITHOUT reinitializing modules (critical fix)."""
         device = self.device
         
-        self.node_raw_features = node_raw_features.to(device) if node_raw_features is not None else None
-        self.edge_raw_features = edge_raw_features.to(device)
+        # self.node_raw_features = node_raw_features.to(device) if node_raw_features is not None else None
+        # self.edge_raw_features = edge_raw_features.to(device)
+        # Direct assignment works for registered buffers
+        # Store in buffers for proper device handling
+        if node_raw_features is not None:
+            self._node_features_buffer = node_raw_features.to(device)
+            self.node_raw_features = self._node_features_buffer
+        else:
+            self.node_raw_features = None
+            
+        if edge_raw_features is not None:
+            self._edge_features_buffer = edge_raw_features.to(device)
+            self.edge_raw_features = self._edge_features_buffer
+        else:
+            self.edge_raw_features = None
         
-        print(f"✓ Setting raw features - Node: {self.node_raw_features.shape if self.node_raw_features is not None else None}, Edge: {self.edge_raw_features.shape}")
+        logger.info(f"Set raw features: Node={self.node_raw_features.shape if self.node_raw_features is not None else None}, "
+                   f"Edge={self.edge_raw_features.shape if self.edge_raw_features is not None else None}")
         
         # CRITICAL FIX: NEVER call _init_modules() here - causes double initialization with corrupted state
         # Update embedding module features directly if it exists
@@ -372,9 +364,12 @@ class TGN(BaseDynamicGNN):
         # Initialize message function (safe - doesn't reinit modules)
         self._init_message_function()
 
+        # Verify it worked
+        if self.message_fn is None:
+            raise RuntimeError("Failed to initialize message_fn in set_raw_features")
+
     def _init_message_function(self):
-        """Initialize message function with correct dimensions."""
-        # Calculate actual message dimension
+        """Initialize message function with correct dimensions."""        
         # Calculate actual message dimension
         if self.node_raw_features is not None and len(self.node_raw_features.shape) > 1:
             node_feat_dim = self.node_raw_features.shape[1]
@@ -391,14 +386,22 @@ class TGN(BaseDynamicGNN):
             self.time_encoding_dim + # time encoding
             edge_feat_dim # edge features
         )
-        # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
-        print(f"Message function input dim: {raw_message_dim} "
-          f"(node={node_feat_dim}, mem={self.memory_dim}, "
-          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")
         
         # Ensure raw_message_dim is positive
         if raw_message_dim <= 0:
             raw_message_dim = self.message_dim
+
+        # logger.info(f"Message function: input_dim={raw_message_dim}")
+        
+        
+        # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
+        logger.info(f"Message function input dim: {raw_message_dim} "
+          f"(node={node_feat_dim}, mem={self.memory_dim}, "
+          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")
+        
+        
+        # if raw_message_dim <= 0:
+        #     raw_message_dim = self.message_dim
 
 
         self.message_fn = get_message_function(
@@ -406,144 +409,203 @@ class TGN(BaseDynamicGNN):
             raw_message_dimension=raw_message_dim,
             message_dimension=self.message_dim
         )
-        self.message_fn = self.message_fn.to(self.device)
 
-        # self.add_module("message_fn", message_fn)
+        if self.message_fn is None:
+            raise RuntimeError("get_message_function returned None")
+
+        self.message_fn = self.message_fn.to(self.device)
+        # print(f" Message function initialized: {self.message_fn}")        
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Forward pass of TGN."""
+        """Forward pass of TGN."""       
+        device = self.device
+        # if self.training and self.use_memory and self.memory is not None:
+        #     # self._update_memory_for_batch(batch)
         
-        # # Apply pending messages from PREVIOUS batch
-        # if self._pending_messages is not None:
-        #     with torch.no_grad():
-        #         nodes, messages, timestamps = self._pending_messages
-        #         if self.memory_updater is not None:
-        #             self.memory_updater.update_memory(nodes, messages, timestamps)
-        #     self._pending_messages = None
+        # PHASE 1: Apply pending memory updates from PREVIOUS batch
+        if self.use_memory and self.memory is not None:
+            if self._memory_initialized and self._pending_messages is not None:
+                with torch.no_grad():
+                    self._apply_pending_memory_update()
         
-        # DEBUG: Check initial memory state
-        # if self.train_batch_counter == 0 and self.training:
-        #     print(f"First training batch - Memory stats: "
-        #           f"mean={self.memory.memory.mean():.6f}, "
-        #           f"std={self.memory.memory.std():.6f}")
         
-        # Update memory BEFORE forward pass for this batch
-        # (using previous batch's messages if needed)
-        if self.training and self.use_memory and self.memory is not None:
-            self._update_memory_for_batch(batch)
         
+        # if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+        #     if self.node_raw_features.device != device:
+        #         self.node_raw_features = self.node_raw_features.to(device)
+        # if hasattr(self, 'edge_raw_features') and self.edge_raw_features is not None:
+        #     if self.edge_raw_features.device != device:
+        #         self.edge_raw_features = self.edge_raw_features.to(device)
+        
+        
+        
+        # Guard: ensure message_fn is initialized
+        # if self.message_fn is None:
+        #     raise RuntimeError(
+        #         "message_fn is not initialized! "
+        #         "Ensure set_raw_features() is called before forward(). "
+        #         f"node_raw_features: {self.node_raw_features is not None}, "
+        #         f"edge_raw_features: {self.edge_raw_features is not None}"
+        #     )
+        
+        # PHASE 2: Compute embeddings with current memory
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']
-
-        # # Generate negative samples
-        # negative_nodes = self._generate_negative_samples(
-        #     src_nodes.cpu().numpy(),
-        #     dst_nodes.cpu().numpy(),
-        # )
-
-        # CRITICAL: Update memory from previous batch's messages before computing embeddings
-        # if self.use_memory and self.memory is not None:
-        #     self._process_pending_messages()
-
         
-        # Compute embeddings
-        source_embedding, destination_embedding = self.compute_temporal_embeddings_pair(
+        source_emb, dest_emb = self.compute_temporal_embeddings_pair(
             source_nodes=src_nodes.cpu().numpy(),
-            destination_nodes=dst_nodes.cpu().numpy(),            
-            edge_times = timestamps.cpu().numpy(),
+            destination_nodes=dst_nodes.cpu().numpy(),
+            edge_times=timestamps.cpu().numpy(),
             n_neighbors=self.n_neighbors
         )
-
-        # # DEBUG CHECKS (remove after fixing)
-        # if self.training and batch_idx == 0:  # First batch only
-        #     print(f"Source embedding stats: mean={source_embedding.mean():.4f}, std={source_embedding.std():.4f}")
-        #     print(f"Embedding range: [{source_embedding.min():.4f}, {source_embedding.max():.4f}]")
-        #     if source_embedding.std() < 0.01:
-        #         print("WARNING: Embeddings have near-zero variance! Check projection layer.")
-            
-        # Link prediction
-        # pos_scores = self.link_predictor(source_embedding, destination_embedding)
-        # neg_scores = self.link_predictor(source_embedding, negative_embedding)
-        # Concatenate embeddings for link prediction
-        combined = torch.cat([source_embedding, destination_embedding], dim=-1)
+        
+        # PHASE 3: Predict
+        combined = torch.cat([source_emb, dest_emb], dim=-1)
         scores = self.link_predictor(combined).squeeze(-1)
-
-        # Increment batch counter for debugging
-        if self.training:
+        
+        # PHASE 4: Store messages for NEXT batch (don't apply yet)
+        if self.training and self.use_memory and self.memory is not None:
+            with torch.no_grad():
+                self._compute_and_store_messages(batch)
+            self._memory_initialized = True
             self.train_batch_counter += 1
 
-        return scores
         
+        # # Update memory from PREVIOUS batch's interactions
+        # if self.use_memory and self.memory is not None and self._memory_initialized:
+        #     with torch.no_grad():  # Memory update is not part of gradient computation
+        #         self._update_memory_for_batch(batch)
+
+
+        # src_nodes = batch['src_nodes']
+        # dst_nodes = batch['dst_nodes']
+        # timestamps = batch['timestamps']       
+        
+        # # Compute embeddings
+        # source_embedding, destination_embedding = self.compute_temporal_embeddings_pair(
+        #     source_nodes=src_nodes.cpu().numpy(),
+        #     destination_nodes=dst_nodes.cpu().numpy(),            
+        #     edge_times = timestamps.cpu().numpy(),
+        #     n_neighbors=self.n_neighbors
+        # )
+        
+        # # Concatenate embeddings for link prediction
+        # combined = torch.cat([source_embedding, destination_embedding], dim=-1)
+        # scores = self.link_predictor(combined).squeeze(-1)
+
+        # # Mark memory as initialized AFTER first forward completes
+        # if not self._memory_initialized:
+        #     self._memory_initialized = True
+        
+        # # Increment batch counter for debugging
+        # if self.training:
+        #     self.train_batch_counter += 1
+        
+
+        return scores
+
+    def _compute_and_store_messages(self, batch):
+        """Compute messages from this batch for NEXT memory update."""
+        device = self.device
+        
+        src_nodes = batch['src_nodes'].to(device)
+        dst_nodes = batch['dst_nodes'].to(device)
+        timestamps = batch['timestamps'].to(device)
+        
+        # Get features
+        if self.node_raw_features is not None:
+            src_features = self.node_raw_features[src_nodes]
+            dst_features = self.node_raw_features[dst_nodes]
+        else:
+            src_features = self.node_embedding(src_nodes)
+            dst_features = self.node_embedding(dst_nodes)
+        
+        # Use SAME edge features for both directions (TGN standard)
+        if 'edge_features' in batch and batch['edge_features'] is not None:
+            edge_feats = batch['edge_features']
+        else:
+            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=device)
+        
+        # Get memory states
+        src_memory = self.memory.get_memory(src_nodes)
+        dst_memory = self.memory.get_memory(dst_nodes)
+        time_enc = self.time_encoder(timestamps)
+        
+        # Compute messages
+        src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc, edge_feats], dim=-1)
+        dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc, edge_feats], dim=-1)
+        
+        src_messages = self.message_fn(src_msg_input)
+        dst_messages = self.message_fn(dst_msg_input)
+        
+        # Store for next batch
+        self._pending_messages = {
+            'nodes': torch.cat([src_nodes, dst_nodes]),
+            'messages': torch.cat([src_messages, dst_messages]),
+            'timestamps': torch.cat([timestamps, timestamps])
+        }   
+    
+    def _apply_pending_memory_update(self):
+        """Apply stored messages to memory."""
+        if self._pending_messages is None or self.memory_updater is None:
+            return
+        
+        self.memory_updater.update_memory(
+            self._pending_messages['nodes'],
+            self._pending_messages['messages'],
+            self._pending_messages['timestamps']
+        )
+        self._pending_messages = None
+    
     def compute_temporal_embeddings_pair(self, source_nodes: np.ndarray,
                                    destination_nodes: np.ndarray,
                                    edge_times: np.ndarray,
                                    n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = self.device
+        
         n_samples = len(source_nodes)
-        src_tensor = torch.from_numpy(source_nodes).long().to(self.device)
-        dst_tensor = torch.from_numpy(destination_nodes).long().to(self.device)
-        edge_time_tensor = torch.from_numpy(edge_times).long().to(self.device)
+        src_tensor = torch.from_numpy(source_nodes).long().to(device)
+        dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
+        # edge_time_tensor = torch.from_numpy(edge_times).float().to(device)
 
+        # node_raw_features = self.node_raw_features.to(device) if self.node_raw_features is not None else None
+        # edge_raw_features = self.edge_raw_features.to(device) if self.edge_raw_features is not None else None
+        
+        
         # Get raw features
         if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
             src_feat = self.node_raw_features[src_tensor]
-            dst_feat = self.node_raw_features[dst_tensor]
-            
-            # # DEBUG: Check feature values
-            # if self.training and self.train_batch_counter < 3:
-            #     print(f"Features - src mean: {src_feat.mean():.6f}, dst mean: {dst_feat.mean():.6f}")
-
+            dst_feat = self.node_raw_features[dst_tensor]            
         else:
             src_feat = self.node_embedding(src_tensor)
             dst_feat = self.node_embedding(dst_tensor)
 
-        # CRITICAL: Incorporate memory WITHOUT detaching during training
-        # if self.use_memory and self.memory is not None:
-        #     src_mem = self.memory.get_memory(src_tensor)
-        #     dst_mem = self.memory.get_memory(dst_tensor)
-            
-        #     # DEBUG: Check memory values at this point
-        #     if self.training and self.train_batch_counter < 3:
-        #         print(f"Memory in embeddings - src mean: {src_mem.mean():.6f}, "
-        #               f"std: {src_mem.std():.6f}")
-            
-        #     # Only warn if memory is truly zero for many batches
-        #     if self.training and self.train_batch_counter > 10 and src_mem.abs().sum() < 1e-6:
-        #         print("WARNING: Memory is still all zeros after 10 batches!")
-
-        #     # Concatenate features + memory
-        #     src_emb = torch.cat([src_feat, src_mem], dim=-1)
-        #     dst_emb = torch.cat([dst_feat, dst_mem], dim=-1)
-        #     # Project to hidden_dim
-        #     if not hasattr(self, 'mem_proj'):
-        #         self.mem_proj = nn.Linear(src_emb.shape[-1], self.hidden_dim).to(self.device)
-        #     src_emb = self.mem_proj(src_emb)
-        #     dst_emb = self.mem_proj(dst_emb)
-        if self.embedding_module is not None:
-            
+        
+        if self.embedding_module is not None:           
             
             # Ensure we're passing tensors on the correct device
-            source_nodes_tensor = torch.from_numpy(source_nodes).long().to(self.device)
-            destination_nodes_tensor = torch.from_numpy(destination_nodes).long().to(self.device)
+            # source_nodes_tensor = torch.from_numpy(source_nodes).long().to(device)
+            # destination_nodes_tensor = torch.from_numpy(destination_nodes).long().to(device)
             
             # Get memory for source and destination nodes
-            source_memory = self.memory.get_memory(source_nodes_tensor)
-            destination_memory = self.memory.get_memory(destination_nodes_tensor)
+            # source_memory = self.memory.get_memory(source_nodes_tensor)
+            # destination_memory = self.memory.get_memory(destination_nodes_tensor)
 
-            # full_memory = self.memory.memory    
+            full_memory = self.memory.memory if self.memory is not None else None   
             
             # Use full attention-based embeddings with neighbor sampling
             source_emb = self.embedding_module.compute_embedding(
-                # memory= self.memory,
-                memory= source_memory,
+                memory= full_memory,
+                # memory= source_memory,
                 source_nodes=source_nodes,
                 timestamps=edge_times,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
             destination_emb = self.embedding_module.compute_embedding(
-                # memory= self.memory,
-                memory= destination_memory,
+                memory= full_memory,
+                # memory= destination_memory,
                 source_nodes=destination_nodes,
                 timestamps=edge_times,
                 n_layers=self.num_layers,
@@ -560,10 +622,7 @@ class TGN(BaseDynamicGNN):
 
         return src_emb, dst_emb
     
-    
-    
-
-    
+        
     def _generate_negative_samples(self, src_nodes: np.ndarray, 
                                   dst_nodes: np.ndarray) -> np.ndarray:
         """Generate negative samples for link prediction."""
@@ -576,27 +635,7 @@ class TGN(BaseDynamicGNN):
                 
         return negative_nodes  
     
-    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-             
-        # Forward pass
-        logits = self.forward(batch)
-        
-        labels = batch['labels'].float()
-
-        # # Debug: Check label distribution
-        # if self.training:
-        #     pos_ratio = labels.mean().item()
-        #     if pos_ratio < 0.4 or pos_ratio > 0.6:
-        #         print(f"WARNING: Label imbalance detected. Positive ratio: {pos_ratio:.2f}")
-         
-
-        # compute loss
-        loss = self.loss_fn(logits, labels)
-                
-        # prepare message for memory update (but not update yet) 
-        # with torch.no_grad():
-        self._update_memory_for_batch(batch)
-        return loss
+    
     
     def _update_memory_for_batch(self, batch: Dict[str, torch.Tensor]):
         """Update memory immediately after forward pass."""
@@ -622,7 +661,12 @@ class TGN(BaseDynamicGNN):
             if 'edge_features' in batch and batch['edge_features'] is not None:
                 edge_feats = batch['edge_features']
             else:
-                edge_feats = torch.zeros(len(src_nodes), 172, device=self.device) 
+                # FIXED: Use configured dimension
+                edge_feats = torch.zeros(
+                    len(src_nodes), 
+                    self.edge_features_dim,  # NOT 172
+                    device=self.device
+                )
 
             # Get current memory states
             src_memory = self.memory.get_memory(src_nodes)
@@ -644,135 +688,24 @@ class TGN(BaseDynamicGNN):
             
             # if self.memory_updater is not None:
             self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
-            
-            # # DEBUG: Check if memory is updating
-            # if self.training and self.train_batch_counter < 5:
-            #     updated_memory = self.memory.get_memory(src_nodes[:1])
-            #     print(f"Batch {self.train_batch_counter}: "
-            #         f"Memory updated - mean={updated_memory.mean():.6f}, "
-            #         f"std={updated_memory.std():.6f}")
-            #     print(f"Messages - mean={all_messages.mean():.6f}, "
-            #         f"std={all_messages.std():.6f}")
-       
-    
-    def _process_messages_for_batch(self, batch: Dict[str, torch.Tensor]):
-        """Update node memories after interaction."""
-        if not self.use_memory or self.memory is None:
-            return
+     
+    def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+             
+        # Forward pass
+        logits = self.forward(batch)
         
-        with torch.no_grad():
-            src_nodes = batch['src_nodes'].to(self.device)
-            dst_nodes = batch['dst_nodes'].to(self.device)
-            timestamps = batch['timestamps'].to(self.device)
-
-            # # DEBUG: Check memory BEFORE update
-            # mem_before = self.memory.memory[src_nodes].mean().item()
-            # print(f"Memory before update: {mem_before:.6f}")
-        # Debug: Check node ID bounds
-        # max_node_id = self.node_raw_features.size(0) - 1  # 9228 for Wikipedia
-        # assert src_nodes.max() <= max_node_id, f"Source node {src_nodes.max()} > {max_node_id}"
-        # assert dst_nodes.max() <= max_node_id, f"Destination node {dst_nodes.max()} > {max_node_id}"
-        # assert src_nodes.min() >= 1, f"Source node {src_nodes.min()} < 1"
-        # assert dst_nodes.min() >= 1, f"Destination node {dst_nodes.min()} < 1"
-
-        # if src_nodes.min() < 1:
-        #     print(f"WARNING: Invalid source node {src_nodes.min()}, filtering...")
-        #     valid_mask = src_nodes >= 1
-        #     if valid_mask.sum() == 0:
-        #         return  # Skip invalid batch
-        #     src_nodes = src_nodes[valid_mask]
-        #     dst_nodes = dst_nodes[valid_mask]
-        #     timestamps = timestamps[valid_mask]
+        labels = batch['labels'].float()
 
 
-            # Get node features
-            if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-                src_features = self.node_raw_features[src_nodes]
-                dst_features = self.node_raw_features[dst_nodes]
-            else:
-                # src_features = torch.zeros(len(src_nodes), self.hidden_dim, device=self.device)
-                # dst_features = torch.zeros(len(dst_nodes), self.hidden_dim, device=self.device)
-                # Use hidden_dim for embedding lookup
-                src_features = self.node_embedding(src_nodes)
-                dst_features = self.node_embedding(dst_nodes)
-
-            # Get edge features if available
-            if 'edge_features' in batch and batch['edge_features'] is not None:
-                edge_feats = batch['edge_features']
-                # Expand to match source/destination
-                src_edge_feats = edge_feats
-                dst_edge_feats = edge_feats
-            else:
-                src_edge_feats = torch.zeros(len(src_nodes), self.message_dim - (src_features.size(-1) * 2 + src_memory.size(-1) * 2 + time_enc.size(-1)), device=self.device)
-                dst_edge_feats = src_edge_feats
-            
-            
-            # Get memories
-            # if self.use_memory:
-            #     src_memory = self.memory.get_memory(src_nodes).detach()
-            #     dst_memory = self.memory.get_memory(dst_nodes).detach()
-            # else:
-            #     src_memory = torch.zeros(len(src_nodes), self.memory_dim, device=self.device)
-            #     dst_memory = torch.zeros(len(dst_nodes), self.memory_dim, device=self.device)
-
-            src_memory = self.memory.get_memory(src_nodes)
-            dst_memory = self.memory.get_memory(dst_nodes)
-            
-            
-            
-            
-            # Time encoding - should be [batch_size, time_dim]
-            # Time encoding
-            time_enc = self.time_encoder(timestamps)
-            
-      
-            # Debug: Print shapes
-            # print(f"src_features: {src_features.shape}")
-            # print(f"dst_features: {dst_features.shape}")  
-            # print(f"src_memory: {src_memory.shape}")
-            # print(f"dst_memory: {dst_memory.shape}")
-            # print(f"time_enc: {time_enc.shape}")
-            
-            
-            
-            # Create message inputs
-            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc, src_edge_feats], dim=-1)
-            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc, dst_edge_feats], dim=-1)
-            
-            # Generate messages        
-            src_messages = self.message_fn(src_msg_input)
-            dst_messages = self.message_fn(dst_msg_input)
-            
-            # Combine messages
-            all_messages = torch.cat([src_messages, dst_messages], dim=0)
-            all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
-            all_timestamps = torch.cat([timestamps, timestamps], dim=0)
-
-            # print(f"Messages shape: {all_messages.shape}, expected last dim: {self.message_dim}")
-            
-            with torch.no_grad():
-                if self.memory_updater is not None:
-                    self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
-            
-            # # Debug: Check memory values
-            # if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
-            #     memory_mean = self.memory.memory.mean().item()
-            #     memory_std = self.memory.memory.std().item()
-            #     print(f"Memory stats - mean: {memory_mean:.4f}, std: {memory_std:.4f}")
+        # compute loss
+        loss = self.loss_fn(logits, labels)
                 
-            #     # Should NOT be zero after first few batches
-            #     if memory_std < 1e-6:
-            #         print("WARNING: Memory has near-zero variance! Not updating properly.")
-
-            if self.memory_updater is not None:
-                self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
-                
-                # # DEBUG: Check memory AFTER update
-                # mem_after = self.memory.memory[src_nodes].mean().item()
-                # print(f"Memory after update: {mem_after:.6f}")
-                # if abs(mem_after - mem_before) < 1e-8:
-                #     print("WARNING: Memory not changing! Updater not working.")        
-
+        # prepare message for memory update (but not update yet) 
+        # with torch.no_grad():
+        # self._update_memory_for_batch(batch)
+        return loss
+             
+              
     def _compute_metrics(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Compute evaluation metrics."""
         logits = self.forward(batch)
@@ -780,6 +713,13 @@ class TGN(BaseDynamicGNN):
         labels = batch['labels'].float()
         
         probs = torch.sigmoid(logits)
+
+        # Check for constant predictions
+        if torch.all(probs == probs[0]):
+            print(f"WARNING: All predictions are {probs[0].item():.4f}")
+            # Add small noise to break symmetry
+            probs = probs + torch.randn_like(probs) * 1e-4
+
         predictions = (probs > 0.5).float()
         accuracy = (predictions == labels).float().mean()
         
@@ -807,68 +747,37 @@ class TGN(BaseDynamicGNN):
             'auc': auc_tensor,
             'loss': loss
         }
-
-    # def on_train_batch_end(self, outputs, batch, batch_idx):
-    #     super().on_train_batch_end(outputs, batch, batch_idx)
-    #     if hasattr(self, '_pending_messages'):
-    #         nodes, messages, timestamps = self._pending_messages
-    #         with torch.no_grad():
-    #             if self.memory_updater is not None:
-    #                 self.memory_updater.update_memory(nodes, messages, timestamps)
-    #         delattr(self, '_pending_messages')
-            
-    #         # Debug: Check if memory is updating
-    #         if batch_idx == 0 and self.current_epoch == 0:
-    #             mem_std = self.memory.memory.std().item()
-    #             print(f"Memory std after first batch: {mem_std:.6f}")
+    
+    def on_train_batch_start(self, batch, batch_idx):
+        """Verify memory is updating."""
+        if self.use_memory and self.memory is not None:
+            mem_mean = self.memory.memory.mean().item()
+            mem_std = self.memory.memory.std().item()
+            if batch_idx % 100 == 0:
+                logger.info(f"Batch {batch_idx}: memory mean={mem_mean:.4f}, std={mem_std:.4f}")
+    
+    def _reset_memory(self, phase: str):
+        """Reset memory state."""
+        if not self.use_memory or self.memory is None:
+            return
         
+        self.memory.__init_memory__()
+        self._pending_messages = None
+        self._memory_initialized = False
+        logger.info(f"Memory reset for {phase}")
 
-    # def on_validation_batch_end(self, outputs, batch, batch_idx):
-    #     """Update memory after backward pass."""
-    #     # super().on_validation_batch_end(outputs, batch, batch_idx)
-    #     with torch.no_grad():
-    #         self._process_messages_for_batch(batch)
-    #         self._process_pending_messages()
-
-    # def on_test_batch_end(self, outputs, batch, batch_idx):
-    #     """Update memory after backward pass."""
-    #     super().on_test_batch_end(outputs, batch, batch_idx)
-    #     with torch.no_grad():
-    #         self._process_pending_messages()
-    
-    
     def on_train_epoch_start(self):
-        """DO NOT reset memory at start of train epoch."""
         super().on_train_epoch_start()
-        # Memory should persist across training batches
-        self.train_batch_counter = 0  # Reset counter for debugging
-        print(f"Starting training epoch - Memory initialized: "
-              f"mean={self.memory.memory.mean():.6f}")
-        if self.use_memory:
-            # self.memory.__init_memory__()
-            # self.pending_messages = [] # clear any stale message
-            self.memory.memory.data.zero_()
-            self.memory.last_update.data.zero_()
+        self.train_batch_counter = 0
+        self._reset_memory("training")
 
     def on_validation_epoch_start(self):
-        """Reset memory at start of validation epoch."""
         super().on_validation_epoch_start()
-        # if self.use_memory and self.memory is not None:
-        if self.use_memory:
-            self.memory.__init_memory__()
-            # self.pending_messages = [] # clear any stale message
-            self.memory.memory.data.zero_()
-            self.memory.last_update.data.zero_()
-            print("Memory reset for validation")
+        self._reset_memory("validation")
 
     def on_test_epoch_start(self):
-        """Reset memory at start of test epoch."""
         super().on_test_epoch_start()
-        # if self.use_memory and self.memory is not None:
-        if self.use_memory:
-            self.memory.__init_memory__()
-            # self.pending_messages = []
-            print("Memory reset for test")
+        self._reset_memory("test")
 
     
 

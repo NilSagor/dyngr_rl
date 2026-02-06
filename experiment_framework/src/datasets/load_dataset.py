@@ -157,14 +157,14 @@ def load_dataset(
         unseen_nodes_tensor = torch.from_numpy(unseen_nodes_arr).long()
         
         # Identify edges containing unseen nodes
-        has_unseen = np.array([
+        has_both_unseen = np.array([
             (e[0] in unseen_set) or (e[1] in unseen_set) 
             for e in edges
         ])
         
         # Training edges: must be in train window AND no unseen nodes
         train_candidates = np.arange(total_edges) < train_end
-        train_mask = train_candidates & (~has_unseen)
+        train_mask = train_candidates & (~has_both_unseen)
         
         # Adjust train_end to actual used boundary for consistent val/test
         actual_train_end = train_end  # Keep original temporal boundaries
@@ -218,7 +218,7 @@ def load_dataset(
         'seed': seed,
     }
     
-    logger.info(f"✓ Loaded {dataset_name}: {num_nodes} nodes, {total_edges} edges")
+    logger.info(f" Loaded {dataset_name}: {num_nodes} nodes, {total_edges} edges")
     logger.info(f"  Split: train={stats['num_edges_train']}, val={stats['num_edges_val']}, test={stats['num_edges_test']}")
     if inductive:
         logger.info(f"  Inductive: {stats['num_unseen_nodes']} unseen nodes")

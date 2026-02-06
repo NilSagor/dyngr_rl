@@ -23,7 +23,8 @@ class EmbeddingModule(nn.Module):
 
     def compute_embedding(self, memory, source_nodes, timestamps, n_layers, n_neighbors=20, time_diffs=None):
         return NotImplemented
-
+    
+    
 
 class IdentityEmbedding(EmbeddingModule):
     def compute_embedding(self, memory, source_nodes, timestamps, n_layers, n_neighbors=20, time_diffs=None):

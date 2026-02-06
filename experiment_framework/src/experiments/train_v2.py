@@ -175,11 +175,14 @@ class DataPipeline:
     
     def build_neighbor_finder(self) -> 'DataPipeline':
         """Build neighbor finder from training edges only."""
-        if self.config['data']['negative_sampling_strategy'] != 'historical':
-            return self
+        # if self.config['data']['negative_sampling_strategy'] != 'historical':
+        #     return self
         
         train_edges = self.data['edges'][self.data['train_mask']]
         train_ts = self.data['timestamps'][self.data['train_mask']]
+        
+        # Create edge indices (0-indexed)
+        train_edge_idxs = torch.arange(len(train_edges))
         
         self.neighbor_finder = NeighborFinder(
             train_edges=train_edges,
@@ -324,7 +327,7 @@ class ModelFactory:
         ModelFactory.validate(model, data_info)
         
         num_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"✓ Created {model_name}: {num_params:,} parameters")
+        logger.info(f"Created {model_name}: {num_params:,} parameters")
         
         return model
     
@@ -478,6 +481,19 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     features = pipeline.get_features()
     model = ModelFactory.create(config, features)
     
+    # CRITICAL ORDER: set features first, then neighbor finder
+    model.set_raw_features(features['node_features'], features['edge_features'])
+    
+    model.set_neighbor_finder(pipeline.neighbor_finder)
+    
+    # CRITICAL: Set neighbor finder for TGN
+    # if hasattr(model, 'set_neighbor_finder'):
+    #     model.set_neighbor_finder(pipeline.neighbor_finder)
+
+    # Debug: Verify embedding module initialized
+    if hasattr(model, 'embedding_module'):
+        print(f"Embedding module initialized: {model.embedding_module is not None}")
+
     # Setup trainer
     trainer = TrainerSetup.create(config)
     
