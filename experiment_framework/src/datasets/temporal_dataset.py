@@ -1,6 +1,6 @@
 """Temporal dataset class for dynamic graph learning."""
 
-from typing import Dict, Any, Optional, List, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, List, TYPE_CHECKING
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -37,6 +37,8 @@ class TemporalDataset(Dataset):
         self.negative_sampling_strategy = negative_sampling_strategy
         self.unseen_nodes = unseen_nodes.numpy() if unseen_nodes is not None else None
         
+        self.undirected = False
+        
         # Local RNG to avoid global state pollution
         self.rng = np.random.default_rng(seed)
         torch.manual_seed(seed)
@@ -60,39 +62,37 @@ class TemporalDataset(Dataset):
                 'timestamp': ts,
                 'edge_feature': edge_feat,
                 'label': 1.0,
-                'is_positive': True
+                'is_positive': True,
             })
         
         # Negative samples (exactly 1 per positive)
         neg_srcs = self.edges[:, 0].numpy()
-        neg_timestamps = self.timestamps.numpy()
-        # neg_timestamps = []
-        # for i, ts in enumerate(self.timestamps.numpy()):
-        #     # Add small random offset (e.g., 1-10 seconds)
-        #     offset = self.rng.uniform(1, 10)
-        #     neg_timestamps.append(ts + offset)
-        
-        # neg_timestamps = np.array(neg_timestamps)
-        
-        neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
-        
-        for i in range(num_positives):
-            edge_feat = torch.zeros_like(self.edge_features[i]) if self.edge_features is not None else None
-            # if self.edge_features is not None:
-            #     edge_feat = self.edge_features[i]  # Keep the same edge features
-            # else:
-            #     edge_feat = None
+        neg_timestamps = self.timestamps.numpy()     
+    
+        # Get negative destinations with appropriate edge features
+        if self.negative_sampling_strategy == 'historical':
+            neg_dsts, neg_edge_features = self._sample_historical_with_features(
+                neg_srcs, neg_timestamps
+            )
+        else:
+            # Random or inductive sampling - use zero features
+            neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
+            neg_edge_features = [
+                torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
+                for _ in range(num_positives)
+            ]
 
+        for i in range(num_positives):
             self.samples.append({
                 'src': int(neg_srcs[i]),
                 'dst': int(neg_dsts[i]),
                 'timestamp': float(neg_timestamps[i]),
-                'edge_feature': edge_feat,
+                'edge_feature': neg_edge_features[i],  # Use the retrieved features!
                 'label': 0.0,
-                'is_positive': False
+                'is_positive': False,
             })
         
-        # CRITICAL FIX #1: INTERLEAVE positives/negatives for val/test to guarantee per-batch balance
+        # CRITICAL FIX: INTERLEAVE positives/negatives for val/test to guarantee per-batch balance
         if self.split != 'train':
             interleaved = []
             for i in range(num_positives):
@@ -100,7 +100,7 @@ class TemporalDataset(Dataset):
                 interleaved.append(self.samples[i + num_positives])  # Negative
             self.samples = interleaved
         else:
-            # Shuffle training only (temporal order not critical for training)
+            # Shuffle training only
             self.rng.shuffle(self.samples)
         
         # Validation
@@ -108,6 +108,120 @@ class TemporalDataset(Dataset):
         assert abs(pos_ratio - 0.5) <= BALANCE_TOLERANCE, \
             f"Label imbalance in {self.split}: {pos_ratio:.3f}"
         logger.info(f"{self.split} split: {len(self.samples)} samples (pos_ratio={pos_ratio:.3f})")
+    
+    def _get_historical_negatives_with_features(self, src_nodes, timestamps, positive_edge_features):
+        """Get historical negatives with real edge features."""
+        num_samples = len(src_nodes)
+        neg_dsts = np.empty(num_samples, dtype=np.int64)
+        neg_edge_features = []
+        
+        for i, (src, ts) in enumerate(zip(src_nodes, timestamps)):
+            src = int(src)
+            ts = float(ts)
+            
+            # Get historical neighbors with edge IDs
+            if hasattr(self.negative_sampler, 'historical_with_edge_ids'):
+                neighbors, neighbor_times, edge_ids = self.negative_sampler.historical_with_edge_ids(
+                    src, ts
+                )
+                
+                if neighbors:
+                    # Choose random historical neighbor
+                    idx = self.rng.integers(0, len(neighbors))
+                    neg_dsts[i] = neighbors[idx]
+                    
+                    # Get the actual edge features from the historical edge
+                    if edge_ids[idx] >= 0 and edge_ids[idx] < len(self.edge_features):
+                        edge_feat = self.edge_features[edge_ids[idx]]
+                    else:
+                        # Fallback to features from a similar edge
+                        edge_feat = self._get_similar_edge_features(src, neighbors[idx], positive_edge_features)
+                else:
+                    # Fallback to random
+                    neg_dsts[i] = self.negative_sampler.random(np.array([src]))[0]
+                    edge_feat = torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
+            else:
+                # Old method without edge IDs
+                neighbors = self.negative_sampler.historical(np.array([src]), np.array([ts]))
+                neg_dsts[i] = neighbors[0]
+                
+                # Try to find real edge features for this (src, dst) pair
+                dst = int(neg_dsts[i])
+                edge_feat = self._get_similar_edge_features(src, dst, positive_edge_features)
+            
+            neg_edge_features.append(edge_feat)
+        
+        return neg_dsts, neg_edge_features
+    
+    def _get_similar_edge_features(self, src, dst, positive_edge_features):
+        """Get edge features from a similar edge when exact match not found."""
+        if self.edge_features is None:
+            return None
+        
+        # Try exact match first
+        if (src, dst) in positive_edge_features:
+            return positive_edge_features[(src, dst)][0]
+        
+        # Try reverse direction
+        if (dst, src) in positive_edge_features:
+            return positive_edge_features[(dst, src)][0]
+        
+        # Use average of src's edge features
+        src_features = []
+        for (s, d), (feat, _) in positive_edge_features.items():
+            if s == src:
+                src_features.append(feat)
+        
+        if src_features:
+            return torch.stack(src_features).mean(dim=0)
+        
+        # Use average of dst's edge features
+        dst_features = []
+        for (s, d), (feat, _) in positive_edge_features.items():
+            if d == dst:
+                dst_features.append(feat)
+        
+        if dst_features:
+            return torch.stack(dst_features).mean(dim=0)
+        
+        # Final fallback: global average
+        all_features = [feat for feat, _ in positive_edge_features.values()]
+        if all_features:
+            return torch.stack(all_features).mean(dim=0)
+        
+        # Last resort: zeros
+        return torch.zeros_like(self.edge_features[0])
+    
+    def _sample_historical_with_features(
+        self, 
+        src_nodes: np.ndarray, 
+        timestamps: np.ndarray
+    ) -> Tuple[np.ndarray, List[Optional[torch.Tensor]]]:
+        """
+        Historical sampling with real edge features from historical edges.
+        """
+        num_samples = len(src_nodes)
+        
+        # Get negative destinations with edge IDs
+        neg_dsts, edge_ids = self.negative_sampler.historical_with_edge_ids(
+            src_nodes, timestamps  # Pass arrays directly, no n_neighbors argument
+        )
+        
+        # Build edge feature list
+        neg_edge_features = []
+        for i in range(num_samples):
+            if edge_ids[i] >= 0 and self.edge_features is not None:
+                # Use actual edge features from the historical edge
+                edge_feat = self.edge_features[edge_ids[i]]
+            elif self.edge_features is not None:
+                # Fallback: zero features for random samples
+                edge_feat = torch.zeros_like(self.edge_features[0])
+            else:
+                edge_feat = None
+            
+            neg_edge_features.append(edge_feat)
+        
+        return neg_dsts, neg_edge_features
     
     def _sample_negatives(
         self, 
@@ -127,6 +241,22 @@ class TemporalDataset(Dataset):
             return self.negative_sampler.inductive(neg_srcs, self.unseen_nodes)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+    
+    def _sample_negatives_with_features(self, src_nodes, timestamps):
+        """Sample negatives with proper edge features."""
+        strategy = self.negative_sampling_strategy
+        
+        if strategy == 'historical':
+            return self._sample_historical_with_features(src_nodes, timestamps)
+        elif strategy == 'random':
+            return self._sample_random_with_features(src_nodes)
+        elif strategy == 'inductive':
+            return self._sample_inductive_with_features(src_nodes, self.unseen_nodes)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+    
+    
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -153,7 +283,6 @@ class TemporalDataset(Dataset):
         
         edge_features = [item['edge_feature'] for item in batch]
         if any(ef is not None for ef in edge_features):
-            # Assumes 1D edge features; gets feature dimension from first valid feature
             first_feat = next(ef for ef in edge_features if ef is not None)
             feat_dim = first_feat.shape[0]
             batch_dict['edge_features'] = torch.stack([

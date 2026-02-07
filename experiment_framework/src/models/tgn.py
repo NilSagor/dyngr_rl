@@ -153,8 +153,7 @@ class TGN(BaseDynamicGNN):
         #     print("Memory updater: NONE!")
 
         
-        # self.last_batch_time = None
-        # self._memory_initialized = False
+        
 
         
 
@@ -174,41 +173,15 @@ class TGN(BaseDynamicGNN):
         num_nodes_backup = state.pop('_num_nodes_backup', None)
         edge_dim_backup = state.pop('_edge_features_dim_backup', None)
 
-        # if num_nodes_backup is not None:
-        #     self.num_nodes = num_nodes_backup
-        # if edge_dim_backup is not None:
-        #     self.edge_features_dim = edge_dim_backup
+   
         
         # Update instance dictionary
         self.__dict__.update(state)
         self._pending_messages = None
         self._memory_initialized = False
         
-        # # CRITICAL: Detect and repair corrupted num_nodes (<1000 indicates reconstruction failure)
-        # if num_nodes_backup is not None and (not hasattr(self, 'num_nodes') or self.num_nodes < 1000):
-        #     print(f"RECONSTRUCTION CORRUPTION DETECTED! "
-        #         f"Restoring num_nodes from {self.num_nodes} → {num_nodes_backup}")
-        #     self.num_nodes = num_nodes_backup
-            
-        #     # Reinitialize memory with CORRECT size
-        #     if hasattr(self, 'memory') and self.memory is not None and self.use_memory:
-        #         device = self.memory.memory.device
-        #         # Create new memory tensor with correct size
-        #         new_memory = torch.zeros(
-        #             num_nodes_backup, 
-        #             self.memory.memory_dimension, 
-        #             device=device
-        #         )
-        #         # Preserve existing values where possible
-        #         min_size = min(self.memory.memory.shape[0], num_nodes_backup)
-        #         new_memory[:min_size] = self.memory.memory[:min_size]
-        #         self.memory.memory = new_memory
-        #         self.memory.last_update = torch.zeros(
-        #             num_nodes_backup, 
-        #             dtype=torch.float32, 
-        #             device=device
-        #         )
-        #         print(f"Memory reinitialized with size {num_nodes_backup}")
+      
+     
         
 
         if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
@@ -520,37 +493,8 @@ class TGN(BaseDynamicGNN):
                 self._compute_and_store_messages(batch)
             self._memory_initialized = True
             self.train_batch_counter += 1
-
         
-        # # Update memory from PREVIOUS batch's interactions
-        # if self.use_memory and self.memory is not None and self._memory_initialized:
-        #     with torch.no_grad():  # Memory update is not part of gradient computation
-        #         self._update_memory_for_batch(batch)
-
-
-        # src_nodes = batch['src_nodes']
-        # dst_nodes = batch['dst_nodes']
-        # timestamps = batch['timestamps']       
-        
-        # # Compute embeddings
-        # source_embedding, destination_embedding = self.compute_temporal_embeddings_pair(
-        #     source_nodes=src_nodes.cpu().numpy(),
-        #     destination_nodes=dst_nodes.cpu().numpy(),            
-        #     edge_times = timestamps.cpu().numpy(),
-        #     n_neighbors=self.n_neighbors
-        # )
-        
-        # # Concatenate embeddings for link prediction
-        # combined = torch.cat([source_embedding, destination_embedding], dim=-1)
-        # scores = self.link_predictor(combined).squeeze(-1)
-
-        # # Mark memory as initialized AFTER first forward completes
-        # if not self._memory_initialized:
-        #     self._memory_initialized = True
-        
-        # # Increment batch counter for debugging
-        # if self.training:
-        #     self.train_batch_counter += 1
+       
         
 
         return scores
@@ -631,6 +575,11 @@ class TGN(BaseDynamicGNN):
         # node_raw_features = self.node_raw_features.to(device) if self.node_raw_features is not None else None
         # edge_raw_features = self.edge_raw_features.to(device) if self.edge_raw_features is not None else None
         
+        # Ensure raw features are on same device
+        if self.node_raw_features is not None:
+            if self.node_raw_features.device != device:
+                self.node_raw_features = self.node_raw_features.to(device)
+
         
         # Get raw features
         if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
@@ -679,20 +628,9 @@ class TGN(BaseDynamicGNN):
                 src_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
                 dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
 
-        return src_emb, dst_emb
-    
+        return src_emb, dst_emb  
         
-    # def _generate_negative_samples(self, src_nodes: np.ndarray, 
-    #                               dst_nodes: np.ndarray) -> np.ndarray:
-    #     """Generate negative samples for link prediction."""
-    #     n_samples = len(src_nodes)
-    #     negative_nodes = np.random.choice(self.num_nodes, size=n_samples, replace=True)
-        
-    #     for i in range(n_samples):
-    #         if negative_nodes[i] == dst_nodes[i]:
-    #             negative_nodes[i] = (negative_nodes[i] + 1) % self.num_nodes
-                
-    #     return negative_nodes  
+  
     
     
     

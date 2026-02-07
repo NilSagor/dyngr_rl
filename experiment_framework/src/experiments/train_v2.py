@@ -182,7 +182,7 @@ class DataPipeline:
         train_ts = self.data['timestamps'][self.data['train_mask']]
         
         # Create edge indices (0-indexed)
-        train_edge_idxs = torch.arange(len(train_edges))
+        # train_edge_idxs = torch.arange(len(train_edges))
         
         self.neighbor_finder = NeighborFinder(
             train_edges=train_edges,
@@ -215,30 +215,40 @@ class DataPipeline:
     
     def build_datasets(self) -> 'DataPipeline':
         """Build TemporalDatasets for each split."""
-        splits = ['train', 'val', 'test']
+        splits = ['train', 'val', 'test']  # FIX: Define splits and masks
         masks = ['train_mask', 'val_mask', 'test_mask']
-        
         is_inductive = self.config['data']['evaluation_type'] == 'inductive'
         
         for split, mask_key in zip(splits, masks):
             mask = self.data[mask_key]
             
+            # Get split-specific edges and timestamps
+            split_edges = self.data['edges'][mask]
+            split_timestamps = self.data['timestamps'][mask]
+            
             # Handle features
-            edge_feats = self.data['edge_features']
-            if edge_feats is not None:
-                edge_feats = edge_feats[mask]
+            full_edge_features = self.data['edge_features']
             
-            unseen_nodes = self.data['unseen_nodes'] if (is_inductive and split != 'train') else None
             
+            # Get unseen nodes for inductive evaluation
+            if is_inductive and split != 'train':
+                unseen_nodes = self.data['unseen_nodes']
+            else:
+                unseen_nodes = None
+            
+            negative_sampling_strategy = self.config['data'].get(
+            'negative_sampling_strategy', 'historical'
+            )
+
             self.datasets[split] = TemporalDataset(
-                edges=self.data['edges'][mask],
-                timestamps=self.data['timestamps'][mask],
-                edge_features=edge_feats,
+                edges=split_edges,
+                timestamps=split_timestamps,
+                edge_features=full_edge_features,
                 num_nodes=self.data['num_nodes'],
                 split=split,
                 negative_sampler=self.samplers[split],
-                negative_sampling_strategy=self.config['data']['negative_sampling_strategy'],
-                unseen_nodes=unseen_nodes,
+                negative_sampling_strategy=negative_sampling_strategy,
+                unseen_nodes=unseen_nodes, 
                 seed=self.config['experiment']['seed']
             )
         

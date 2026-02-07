@@ -111,43 +111,108 @@ class NegativeSampler:
             
         Returns:
             [N] destination node IDs (negative samples)
+        """        
+        if self.neighbor_finder is None:
+            raise ValueError("neighbor_finder required for historical sampling")
+        
+        src_nodes = np.asarray(src_nodes)
+        timestamps = np.asarray(timestamps)
+
+        
+        neg_dsts = np.empty(len(src_nodes), dtype=np.int64)
+    
+        # Batch query all neighbors at once for efficiency
+        all_neighbors_list, _, _ = self.neighbor_finder.find_neighbors_with_edge_ids(
+            src_nodes.tolist(), timestamps.tolist(), n_neighbors=self.neighbor_finder.max_neighbors
+        )
+        
+        for i, (src, neighbors) in enumerate(zip(src_nodes, all_neighbors_list)):
+            src = int(src)
+            
+            # Filter: must be historical, not self, and not positive
+            valid_candidates = [
+                n for n in neighbors
+                if n != src and (src, n) not in self.positive_edges
+            ]
+            
+            if valid_candidates:
+                # Choose random historical neighbor
+                neg_dsts[i] = self.rng.choice(valid_candidates)
+            else:
+                # Fallback to random (per TGN protocol)
+                neg_dsts[i] = self.random(np.array([src]))[0]
+
+            # neighbors, _, _ = self.historical_with_edge_ids(int(src), float(ts))
+            
+            # if neighbors:
+            #     # Choose random historical neighbor
+            #     idx = self.rng.integers(0, len(neighbors))
+            #     neg_dsts[i] = neighbors[idx]
+            # else:
+            #     # Fallback to random (per TGN protocol)
+            #     neg_dsts[i] = self.random(np.array([src]))[0]
+        
+        return neg_dsts
+    
+    
+    
+    def historical_with_edge_ids(self, 
+                              src_nodes: np.ndarray, 
+                              timestamps: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Historical negative sampling with edge IDs for feature retrieval.
+        
+        Args:
+            src_nodes: [N] source node IDs
+            timestamps: [N] cutoff timestamps
+            
+        Returns:
+            Tuple of (neg_dsts, edge_ids) where:
+                - neg_dsts: [N] destination node IDs
+                - edge_ids: [N] original edge indices (-1 if fallback to random)
         """
         if self.neighbor_finder is None:
             raise ValueError("neighbor_finder required for historical sampling")
-            
+        
         src_nodes = np.asarray(src_nodes)
         timestamps = np.asarray(timestamps)
         
         if len(src_nodes) != len(timestamps):
             raise ValueError(f"Length mismatch: {len(src_nodes)} vs {len(timestamps)}")
         
-        neg_dst = np.empty(len(src_nodes), dtype=np.int64)
+        neg_dsts = np.empty(len(src_nodes), dtype=np.int64)
+        edge_ids = np.full(len(src_nodes), -1, dtype=np.int64)
         
-        for i, (src, ts) in enumerate(zip(src_nodes, timestamps)):
+        # Batch query all neighbors with edge IDs
+        all_neighbors_list, _, all_edge_ids_list = self.neighbor_finder.find_neighbors_with_edge_ids(
+            src_nodes.tolist(), timestamps.tolist(), n_neighbors=self.neighbor_finder.max_neighbors
+        )
+        
+        for i, (src, neighbors, edge_ids_list) in enumerate(zip(src_nodes, all_neighbors_list, all_edge_ids_list)):
             src = int(src)
             
-            # Query historical neighbors before timestamp ts
-            # FIXED: Use correct method name and unpack 2 values
-            # Use DEFAULT neighbor count from finder
-            n_neighbors = self.neighbor_finder.max_neighbors
-            neighbors_list, _ = self.neighbor_finder.find_neighbors(
-                [src], [float(ts)], n_neighbors=n_neighbors
-            )
-            neighbors = neighbors_list[0]  # Unwrap batch dimension
-            
             # Filter: must be historical, not self, and not positive
-            candidates = [
-                n for n in neighbors
-                if n != src and (src, n) not in self.positive_edges
-            ]
+            valid_candidates = []
+            valid_edge_ids = []
             
-            if candidates:
-                neg_dst[i] = self.rng.choice(candidates)
+            for nbr, eid in zip(neighbors, edge_ids_list):
+                if nbr != src and (src, nbr) not in self.positive_edges:
+                    valid_candidates.append(nbr)
+                    valid_edge_ids.append(eid)
+            
+            if valid_candidates:
+                # Choose random historical neighbor
+                choice_idx = self.rng.integers(len(valid_candidates))
+                neg_dsts[i] = valid_candidates[choice_idx]
+                edge_ids[i] = valid_edge_ids[choice_idx]
             else:
                 # Fallback to random (per TGN protocol)
-                neg_dst[i] = self.random(np.array([src]))[0]
+                neg_dsts[i] = self.random(np.array([src]))[0]
+                edge_ids[i] = -1  # Marker for random sample
         
-        return neg_dst
+        return neg_dsts, edge_ids
+    
+    
     
     def inductive(self, 
                  src_nodes: np.ndarray, 
@@ -191,3 +256,4 @@ class NegativeSampler:
                 neg_dst[i] = self.rng.choice(unseen_nodes)
         
         return neg_dst
+    

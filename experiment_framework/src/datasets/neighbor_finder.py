@@ -37,35 +37,73 @@ class NeighborFinder:
             
         self.max_neighbors = max_neighbors
         self.undirected = undirected
-        self.adj_list: Dict[int, List[Tuple[int, float]]] = {}
+        # self.adj_list: Dict[int, List[Tuple[int, float]]] = {}
         
+        # Single unified adjacency list with edge IDs: node -> [(neighbor, timestamp, edge_id), ...]
+        self.edge_id_adj_list: Dict[int, List[Tuple[int, float, int]]] = {}
+
+
         # Build from training edges only
         edges_list = train_edges.tolist()
         timestamps_list = train_timestamps.tolist()
         
-        for (src, dst), ts in zip(edges_list, timestamps_list):
-            self._add_edge(src, dst, ts)
+        for edge_idx, ((src, dst), ts) in enumerate(zip(edges_list, timestamps_list)):
+            self._add_edge_with_id(src, dst, ts, edge_idx)
             if undirected:
-                self._add_edge(dst, src, ts)
+                self._add_edge_with_id(dst, src, ts, edge_idx)
         
         # Sort by timestamp (oldest first) for binary search
         self._timestamps_cache: Dict[int, List[float]] = {}
-        for node in self.adj_list:
-            self.adj_list[node].sort(key=lambda x: x[1])
+        for node in self.edge_id_adj_list:
+            self.edge_id_adj_list[node].sort(key=lambda x: x[1])
             # Cache timestamps for O(log n) lookup
-            self._timestamps_cache[node] = [t for _, t in self.adj_list[node]]
+            self._timestamps_cache[node] = [t for _, t, _ in self.edge_id_adj_list[node]]
         
+         # Store original edge indices for feature lookup
+        # self.edge_id_adj_list: Dict[int, List[Tuple[int, float, int]]] = {}
         # Statistics
-        self.num_nodes = len(self.adj_list)
+        self.num_nodes = len(self.edge_id_adj_list)
         self.num_edges = train_edges.shape[0]
         self.max_timestamp = max(timestamps_list) if timestamps_list else 0.0
         self.min_timestamp = min(timestamps_list) if timestamps_list else 0.0
+
+
+        # # Build from training edges with edge IDs
+        # for edge_idx, ((src, dst), ts) in enumerate(zip(edges_list, timestamps_list)):
+        #     self._add_edge_with_id(src, dst, ts, edge_idx)
+        #     if undirected:
+        #         self._add_edge_with_id(dst, src, ts, edge_idx)
+
+
+        # Statistics
+        # self.num_nodes = len(self.adj_list)
+        # self.num_edges = train_edges.shape[0]
+        # self.max_timestamp = max(timestamps_list) if timestamps_list else 0.0
+        # self.min_timestamp = min(timestamps_list) if timestamps_list else 0.0
     
-    def _add_edge(self, src: int, dst: int, ts: float):
-        """Internal: add single directed edge."""
-        if src not in self.adj_list:
-            self.adj_list[src] = []
-        self.adj_list[src].append((dst, ts))
+    def _add_edge_with_id(self, src: int, dst: int, ts: float, edge_id: int):
+        """Add directed edge with original edge ID."""
+        if src not in self.edge_id_adj_list:
+            self.edge_id_adj_list[src] = []
+        self.edge_id_adj_list[src].append((dst, ts, edge_id))
+    
+    
+    # def _add_edge(self, src: int, dst: int, ts: float):
+    #     """Internal: add single directed edge."""
+    #     if src not in self.adj_list:
+    #         self.adj_list[src] = []
+    #     self.adj_list[src].append((dst, ts))
+    
+    # def _add_edge_with_id(self, src: int, dst: int, ts: float, edge_id: int):
+    #     """Add directed edge with original edge ID."""
+    #     if src not in self.edge_id_adj_list:
+    #         self.edge_id_adj_list[src] = []
+    #     self.edge_id_adj_list[src].append((dst, ts, edge_id))
+        
+    #     # Also update regular adj_list for backward compatibility
+    #     if src not in self.adj_list:
+    #         self.adj_list[src] = []
+    #     self.adj_list[src].append((dst, ts))
     
     def find_neighbors(self, 
                       nodes: Union[List[int], torch.Tensor], 
@@ -73,6 +111,7 @@ class NeighborFinder:
                       n_neighbors: Optional[int] = None) -> Tuple[List[List[int]], List[List[float]]]:
         """
         Find temporal neighbors that appeared BEFORE the given timestamp.
+        Backward-compatible interface without edge IDs.
         
         Args:
             nodes: list/tensor of node IDs to query
@@ -82,15 +121,74 @@ class NeighborFinder:
         Returns:
             neighbors: list of neighbor ID lists per node
             edge_times: list of edge timestamp lists per node
-            
-        Raises:
-            ValueError: if nodes and timestamps length mismatch
-            KeyError: if node ID invalid (optional, see strict_mode)
         """
+        nbrs, times, _ = self.find_neighbors_with_edge_ids(nodes, timestamps, n_neighbors)
+        return nbrs, times
+    
+    
+    # def find_neighbors(self, 
+    #                   nodes: Union[List[int], torch.Tensor], 
+    #                   timestamps: Union[List[float], torch.Tensor],
+    #                   n_neighbors: Optional[int] = None) -> Tuple[List[List[int]], List[List[float]]]:
+    #     """
+    #     Find temporal neighbors that appeared BEFORE the given timestamp.
+        
+    #     Args:
+    #         nodes: list/tensor of node IDs to query
+    #         timestamps: list/tensor of cutoff timestamps (must align with nodes)
+    #         n_neighbors: max neighbors per node (None = use default)
+            
+    #     Returns:
+    #         neighbors: list of neighbor ID lists per node
+    #         edge_times: list of edge timestamp lists per node
+            
+    #     Raises:
+    #         ValueError: if nodes and timestamps length mismatch
+    #         KeyError: if node ID invalid (optional, see strict_mode)
+    #     """
+    #     if n_neighbors is None:
+    #         n_neighbors = self.max_neighbors
+            
+    #     # Normalize inputs
+    #     if isinstance(nodes, torch.Tensor):
+    #         nodes = nodes.tolist()
+    #     if isinstance(timestamps, torch.Tensor):
+    #         timestamps = timestamps.tolist()
+            
+    #     if len(nodes) != len(timestamps):
+    #         raise ValueError(f"Length mismatch: {len(nodes)} nodes vs {len(timestamps)} timestamps")
+        
+    #     all_neighbors: List[List[int]] = []
+    #     all_edge_times: List[List[float]] = []
+        
+    #     for node, ts in zip(nodes, timestamps):
+    #         result = self._find_single_node_neighbors(node, ts, n_neighbors)
+    #         all_neighbors.append(result[0])
+    #         all_edge_times.append(result[1])
+        
+    #     return all_neighbors, all_edge_times
+    
+    def find_neighbors_with_edge_ids(self, 
+                                     nodes: Union[List[int], torch.Tensor], 
+                                     timestamps: Union[List[float], torch.Tensor],
+                                     n_neighbors: Optional[int] = None) -> Tuple[List[List[int]], List[List[float]], List[List[int]]]:
+        """
+        Find temporal neighbors with their original edge IDs.
+        
+        Args:
+            nodes: list/tensor of node IDs to query
+            timestamps: list/tensor of cutoff timestamps (must align with nodes)
+            n_neighbors: max neighbors per node (None = use default)
+            
+        Returns:
+            neighbors: list of neighbor ID lists per node
+            edge_times: list of edge timestamp lists per node
+            edge_ids: list of original edge ID lists per node
+        """
+        
         if n_neighbors is None:
             n_neighbors = self.max_neighbors
-            
-        # Normalize inputs
+        
         if isinstance(nodes, torch.Tensor):
             nodes = nodes.tolist()
         if isinstance(timestamps, torch.Tensor):
@@ -101,54 +199,92 @@ class NeighborFinder:
         
         all_neighbors: List[List[int]] = []
         all_edge_times: List[List[float]] = []
+        all_edge_ids: List[List[int]] = []
         
         for node, ts in zip(nodes, timestamps):
-            result = self._find_single_node_neighbors(node, ts, n_neighbors)
-            all_neighbors.append(result[0])
-            all_edge_times.append(result[1])
+            nbrs, times, eids = self._find_single_node_neighbors(node, ts, n_neighbors)
+            all_neighbors.append(nbrs)
+            all_edge_times.append(times)
+            all_edge_ids.append(eids)
         
-        return all_neighbors, all_edge_times
+        return all_neighbors, all_edge_times, all_edge_ids
     
-    def _find_single_node_neighbors(self, 
-                                   node: int, 
-                                   ts: float, 
-                                   n_neighbors: int) -> Tuple[List[int], List[float]]:
-        """Find neighbors for single node with binary search optimization."""
-        # Unknown node or no history
-        if node not in self.adj_list:
-            return [], []
+    # def _find_single_node_neighbors_with_ids(self, node: int, ts: float, n_neighbors: int):
+    #     """Find neighbors with edge IDs for a single node."""
+    #     if node not in self.edge_id_adj_list:
+    #         return [], [], []
         
-        node_neighbors = self.adj_list[node]
+    #     node_neighbors = self.edge_id_adj_list[node]
+        
+    #     # Sort by timestamp (should already be sorted from init)
+    #     # Get timestamps for binary search
+    #     node_times = [t for _, t, _ in node_neighbors]
+        
+    #     # Binary search: find rightmost timestamp < ts
+    #     cutoff_idx = bisect.bisect_left(node_times, ts)
+        
+    #     if cutoff_idx == 0:
+    #         return [], [], []
+        
+    #     # Take most recent n_neighbors from valid range
+    #     valid_neighbors = node_neighbors[:cutoff_idx]
+    #     start_idx = max(0, cutoff_idx - n_neighbors)
+    #     sampled = valid_neighbors[start_idx:cutoff_idx]
+        
+    #     if not sampled:
+    #         return [], [], []
+        
+    #     # Unpack neighbors, timestamps, and edge IDs
+    #     neighbors, times, edge_ids = zip(*sampled)
+    #     return list(neighbors), list(times), list(edge_ids)
+    
+    
+    # def _find_single_node_neighbors(self, 
+    #                                node: int, 
+    #                                ts: float, 
+    #                                n_neighbors: int) -> Tuple[List[int], List[float]]:
+    #     """Find neighbors for single node with binary search optimization.
+    #         Find neighbors without edge IDs (for backward compatibility)."""
+    #     nbrs, times, _ = self._find_single_node_neighbors_with_ids(node, ts, n_neighbors)
+    #     return nbrs, times
+    
+    def _find_single_node_neighbors(self, node: int, ts: float, n_neighbors: int)-> Tuple[List[int], List[float], List[int]]:
+        """Find neighbors with edge IDs for a single node."""
+        if node not in self.edge_id_adj_list:
+            return [], [], []
+        
+        node_neighbors = self.edge_id_adj_list[node]
+        
+        # Sort by timestamp (should already be sorted from init)
+        # Get timestamps for binary search
         node_times = self._timestamps_cache[node]
         
         # Binary search: find rightmost timestamp < ts
-        # bisect_left returns first index where timestamp >= ts
         cutoff_idx = bisect.bisect_left(node_times, ts)
         
         if cutoff_idx == 0:
-            return [], []
+            return [], [], []
         
-        # Take most recent n_neighbors from valid range [0:cutoff_idx]
-        valid_neighbors = node_neighbors[:cutoff_idx]
+        # Take most recent n_neighbors from valid range
+        # valid_neighbors = node_neighbors[:cutoff_idx]
         start_idx = max(0, cutoff_idx - n_neighbors)
-        sampled = valid_neighbors[start_idx:cutoff_idx]
-        
-        # Reverse to get most recent first
-        # sampled.reverse()
+        sampled = node_neighbors[start_idx:cutoff_idx]
         
         if not sampled:
-            return [], []
+            return [], [], []
         
-        neighbors, times = zip(*sampled)
-        return list(neighbors), list(times)
+        # Unpack neighbors, timestamps, and edge IDs
+        neighbors, times, edge_ids = zip(*sampled)
+        return list(neighbors), list(times), list(edge_ids)
     
-    def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
+    
+    def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=10):
         """
         TGN-compatible interface. Returns (neighbors, edge_idxs, edge_times).
         edge_idxs are dummy indices (0,1,2...) for each neighbor position.
         """
-        # Get neighbors and times using your existing method
-        neighbors_list, times_list = self.find_neighbors(
+        # Get neighbors, times, and actual edge IDs
+        neighbors_list, times_list, edge_ids_list = self.find_neighbors_with_edge_ids(
             source_nodes, timestamps, n_neighbors=n_neighbors
         )
         
