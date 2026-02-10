@@ -194,8 +194,7 @@ def setup_trainer(config: dict):
         gradient_clip_val=config['training']['gradient_clip_val'],
         log_every_n_steps=10,
         val_check_interval=0.25,
-        enable_progress_bar=True,
-        # resume_from_checkpoint=None,
+        enable_progress_bar=True,        
     )
     
     return trainer
@@ -444,7 +443,7 @@ def train_model(config: dict):
         # Initialize model
         # model = setup_model(config, num_nodes)
 
-    # ✅ MODEL INITIALIZATION (reconstruction-safe)
+    # MODEL INITIALIZATION (reconstruction-safe)
     model = create_model(
         model_name=config['model']['name'],
         model_config=config['model'],
@@ -510,28 +509,28 @@ def train_model(config: dict):
         #         # Fallback: set attributes directly
         #         model.node_raw_features = node_features.to(device)
         #         model.edge_raw_features = unpadded_edge_features.to(device)
-        elif config['model']['name'] == 'TGN':
-            # Load raw features with proper padding for 1-indexed nodes
-            actual_num_nodes = num_nodes  # This should be 9228 for Wikipedia
+        # elif config['model']['name'] == 'TGN':
+        #     # Load raw features with proper padding for 1-indexed nodes
+        #     actual_num_nodes = num_nodes  # This should be 9228 for Wikipedia
             
-            # Get node features from dataset (should already be padded)
-            if 'node_features' in data:
-                node_features = data['node_features']
-                logger.info(f"Loaded node features shape: {node_features.shape}")
-            else:
-                # Wikipedia has NO node features - use learned embeddings instead
-                logger.warning("No node features available - using learned embeddings")
-                node_features = None
+        #     # Get node features from dataset (should already be padded)
+        #     if 'node_features' in data:
+        #         node_features = data['node_features']
+        #         logger.info(f"Loaded node features shape: {node_features.shape}")
+        #     else:
+        #         # Wikipedia has NO node features - use learned embeddings instead
+        #         logger.warning("No node features available - using learned embeddings")
+        #         node_features = None
 
-            # Edge features (use unpadded version for TGN)
-            edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
+        #     # Edge features (use unpadded version for TGN)
+        #     edge_features = data.get('edge_features', torch.zeros(len(data['edges']), 172))
             
-            model.set_raw_features(node_features, edge_features)
-            model.set_neighbor_finder(neighbor_finder)
-            logger.info(f"Node feature stats - mean: {node_features.mean():.6f}, std: {node_features.std():.6f}")
-            # logger.info(f"First 5 node features:\n{node_features[1:6]}") 
+        #     model.set_raw_features(node_features, edge_features)
+        #     model.set_neighbor_finder(neighbor_finder)
+        #     logger.info(f"Node feature stats - mean: {node_features.mean():.6f}, std: {node_features.std():.6f}")
+        #     # logger.info(f"First 5 node features:\n{node_features[1:6]}") 
     
-        logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
+        # logger.info(f"Set raw features - Node: {node_features.shape}, Edge: {edge_features.shape}")
     
     logger.info(f"Model: {model.__class__.__name__}")
     logger.info(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")

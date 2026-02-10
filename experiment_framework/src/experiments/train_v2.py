@@ -164,11 +164,14 @@ class DataPipeline:
         is_inductive_eval = self.config['data']['evaluation_type'] == 'inductive'
         sampling_strategy = self.config['data']['negative_sampling_strategy']
     
+        # Inductive negative sampling REQUIRES inductive evaluation (needs unseen_nodes)
         if sampling_strategy == 'inductive' and not is_inductive_eval:
             raise ValueError(
-                "Configuration error: 'inductive' negative sampling requires "
-                "'inductive' evaluation_type. Current: evaluation_type='transductive'. "
-                "Either change evaluation_type to 'inductive' or use 'random'/'historical' sampling."
+                f"Invalid configuration: negative_sampling_strategy='inductive' "
+                f"requires evaluation_type='inductive' (needs unseen nodes). "
+                f"Got evaluation_type='transductive'. "
+                f"Either switch to evaluation_type='inductive' or use "
+                f"negative_sampling_strategy='random'/'historical'."
             )
         
         
@@ -230,6 +233,7 @@ class DataPipeline:
         splits = ['train', 'val', 'test']  # FIX: Define splits and masks
         masks = ['train_mask', 'val_mask', 'test_mask']
         is_inductive = self.config['data']['evaluation_type'] == 'inductive'
+        sampling_strategy = self.config['data']['negative_sampling_strategy']
         
         for split, mask_key in zip(splits, masks):
             mask = self.data[mask_key]
@@ -243,7 +247,7 @@ class DataPipeline:
             
             
             # Get unseen nodes for inductive evaluation
-            if is_inductive and split != 'train':
+            if is_inductive or sampling_strategy == 'inductive':
                 unseen_nodes = self.data['unseen_nodes']
             else:
                 unseen_nodes = None
