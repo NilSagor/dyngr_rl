@@ -146,6 +146,7 @@ def load_dataset(
     test_mask = np.zeros(total_edges, dtype=bool)
     
     unseen_nodes_tensor: Optional[torch.Tensor] = None
+    actual_train_end = train_end  # Define for both cases
     
     if inductive:
         # Select unseen nodes BEFORE any edge filtering
@@ -156,83 +157,60 @@ def load_dataset(
         unseen_set: Set[int] = set(unseen_nodes_arr)
         unseen_nodes_tensor = torch.from_numpy(unseen_nodes_arr).long()
         
+        
+
         # Identify edges containing unseen nodes
-        has_both_unseen = np.array([
+        has_unseen = np.array([
             (e[0] in unseen_set) or (e[1] in unseen_set) 
             for e in edges
         ])
         
         # Training edges: must be in train window AND no unseen nodes
         train_candidates = np.arange(total_edges) < train_end
-        train_mask = train_candidates & (~has_both_unseen)
+        train_mask = train_candidates & (~has_unseen)
         
-        # Adjust train_end to actual used boundary for consistent val/test
-        actual_train_end = train_end  # Keep original temporal boundaries
+        # CRITICAL FIX: Edges with unseen nodes in train window go to val
+        # This ensures temporal continuity and all edges are assigned
+        val_candidates = (np.arange(total_edges) >= train_end) & (np.arange(total_edges) < val_end)
+        val_candidates = val_candidates | (train_candidates & has_unseen)
+        
+        val_mask = val_candidates
+        test_mask[np.arange(total_edges) >= val_end] = True
+
         
         logger.info(f"Inductive: {train_mask.sum()}/{train_end} edges in train "
-                   f"(removed {(~train_mask[:train_end]).sum()} with unseen nodes)")
-    else:
+                   f"(removed {(train_candidates & has_unseen).sum()} with unseen nodes -> val), "
+                   f"val={val_mask.sum()}, test={test_mask.sum()}")
+    else:        
         # Standard transductive: temporal split only
         train_mask[:train_end] = True
-        actual_train_end = train_end
+        val_mask[train_end:val_end] = True
+        test_mask[val_end:] = True
     
-    # Val/Test: temporal boundaries (may include unseen nodes in inductive)
-    val_mask[actual_train_end:val_end] = True
-    test_mask[val_end:] = True
+    
+    
+    # ============================================
+    # VALIDATION (unchanged)
+    # ============================================
     
     # Validate splits don't overlap
     assert not (train_mask & val_mask).any(), "Train/Val overlap"
     assert not (train_mask & test_mask).any(), "Train/Test overlap"
     assert not (val_mask & test_mask).any(), "Val/Test overlap"
     assert (train_mask | val_mask | test_mask).all(), "Unassigned edges"
-    
+
     # Validate temporal ordering
     train_max_ts = timestamps[train_mask].max() if train_mask.any() else -np.inf
     val_min_ts = timestamps[val_mask].min() if val_mask.any() else np.inf
     val_max_ts = timestamps[val_mask].max() if val_mask.any() else -np.inf
     test_min_ts = timestamps[test_mask].min() if test_mask.any() else np.inf
     
-    if inductive:
-        # Select unseen nodes BEFORE any edge filtering
-        all_nodes = np.arange(num_nodes)
-        rng.shuffle(all_nodes)
-        num_unseen = max(1, int(num_nodes * unseen_ratio))
-        unseen_nodes_arr = all_nodes[:num_unseen]
-        unseen_set: Set[int] = set(unseen_nodes_arr)
-        unseen_nodes_tensor = torch.from_numpy(unseen_nodes_arr).long()
-        
-        # Identify edges containing unseen nodes
-        has_both_unseen = np.array([
-            (e[0] in unseen_set) or (e[1] in unseen_set) 
-            for e in edges
-        ])
-        
-        # Training edges: must be in train window AND no unseen nodes
-        train_candidates = np.arange(total_edges) < train_end
-        train_mask = train_candidates & (~has_both_unseen)
-        
-        # CRITICAL FIX: Edges with unseen nodes in train window go to val
-        # This ensures all edges are assigned
-        val_candidates = (np.arange(total_edges) >= train_end) & (np.arange(total_edges) < val_end)
-        val_candidates = val_candidates | (train_candidates & has_both_unseen)  # Add removed train edges to val
-        
-        val_mask = val_candidates
-        actual_train_end = train_end  # Keep original for test boundary
-        
-        logger.info(f"Inductive: {train_mask.sum()}/{train_end} edges in train "
-                f"(removed {(~train_mask[:train_end]).sum()} with unseen nodes, "
-                f"added to val)")
-    else:
-        # Standard transductive: temporal split only
-        train_mask[:train_end] = True
-        actual_train_end = train_end
-        val_mask[actual_train_end:val_end] = True
 
-    # Test: always temporal boundary
-    test_mask[val_end:] = True
-    # else:
-    #     assert train_max_ts <= val_min_ts, f"Temporal leak: train ends at {train_max_ts}, val starts at {val_min_ts}"
-    #     assert val_max_ts <= test_min_ts, f"Temporal leak: val ends at {val_max_ts}, test starts at {test_min_ts}"
+    # Temporal validation 
+    if not inductive:
+        # In transductive mode, enforce strict temporal separation
+        assert train_max_ts <= val_min_ts, f"Temporal leak: train ends at {train_max_ts}, val starts at {val_min_ts}"
+        assert val_max_ts <= test_min_ts, f"Temporal leak: val ends at {val_max_ts}, test starts at {test_min_ts}"
     
     # Build statistics
     stats = {
@@ -242,7 +220,7 @@ def load_dataset(
         'num_edges_train': int(train_mask.sum()),
         'num_edges_val': int(val_mask.sum()),
         'num_edges_test': int(test_mask.sum()),
-        'split_ratios': {'train': val_ratio + test_ratio, 'val': val_ratio, 'test': test_ratio},
+        'split_ratios': {'train': 1 - val_ratio - test_ratio, 'val': val_ratio, 'test': test_ratio},
         'inductive': inductive,
         'num_unseen_nodes': len(unseen_nodes_arr) if inductive else 0,
         'unseen_ratio': unseen_ratio if inductive else 0.0,
@@ -269,7 +247,7 @@ def load_dataset(
         'test_mask': torch.from_numpy(test_mask),
         'unseen_nodes': unseen_nodes_tensor,
         'statistics': stats,
-        'train_end_idx': actual_train_end,  # Useful for neighbor finder
+        'train_end_idx': actual_train_end,  # Now defined for both cases
     }
 
 

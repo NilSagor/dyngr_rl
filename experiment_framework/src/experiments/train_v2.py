@@ -161,6 +161,18 @@ class DataPipeline:
         """Load raw dataset."""
         logger.info(f"Loading dataset: {self.config['data']['dataset']}")
         
+        is_inductive_eval = self.config['data']['evaluation_type'] == 'inductive'
+        sampling_strategy = self.config['data']['negative_sampling_strategy']
+    
+        if sampling_strategy == 'inductive' and not is_inductive_eval:
+            raise ValueError(
+                "Configuration error: 'inductive' negative sampling requires "
+                "'inductive' evaluation_type. Current: evaluation_type='transductive'. "
+                "Either change evaluation_type to 'inductive' or use 'random'/'historical' sampling."
+            )
+        
+        
+        
         self.data = load_dataset(
             dataset_name=self.config['data']['dataset'],
             val_ratio=self.config['data']['val_ratio'],
