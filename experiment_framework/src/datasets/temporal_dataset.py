@@ -69,18 +69,28 @@ class TemporalDataset(Dataset):
         neg_srcs = self.edges[:, 0].numpy()
         neg_timestamps = self.timestamps.numpy()     
     
-        # Get negative destinations with appropriate edge features
-        if self.negative_sampling_strategy == 'historical':
-            neg_dsts, neg_edge_features = self._sample_historical_with_features(
-                neg_srcs, neg_timestamps
-            )
-        else:
-            # Random or inductive sampling - use zero features
-            neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
-            neg_edge_features = [
-                torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
-                for _ in range(num_positives)
-            ]
+        # FIX #1: Sample destinations ONLY (no edge feature retrieval)
+        neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
+
+        # Synthetic negatives have no real edge features - using real features causes leakage
+        neg_edge_features = [
+            torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
+            for _ in range(num_positives)
+        ]
+        
+        
+        # # Get negative destinations with appropriate edge features
+        # if self.negative_sampling_strategy == 'historical':
+        #     neg_dsts, neg_edge_features = self._sample_historical_with_features(
+        #         neg_srcs, neg_timestamps
+        #     )
+        # else:
+        #     # Random or inductive sampling - use zero features
+        #     neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
+        #     neg_edge_features = [
+        #         torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
+        #         for _ in range(num_positives)
+        #     ]
 
         for i in range(num_positives):
             self.samples.append({
@@ -92,7 +102,7 @@ class TemporalDataset(Dataset):
                 'is_positive': False,
             })
         
-        # CRITICAL FIX: INTERLEAVE positives/negatives for val/test to guarantee per-batch balance
+        # CRITICAL FIX #3: INTERLEAVE positives/negatives for eval splits (prevents single-class batches)
         if self.split != 'train':
             interleaved = []
             for i in range(num_positives):
@@ -100,15 +110,15 @@ class TemporalDataset(Dataset):
                 interleaved.append(self.samples[i + num_positives])  # Negative
             self.samples = interleaved
         else:
-            # Shuffle training only
+            # Shuffle training only (temporal order not critical for training)
             self.rng.shuffle(self.samples)
         
-        # Validation
+        # Validation: check label balance
         pos_ratio = sum(s['label'] for s in self.samples) / len(self.samples)
         assert abs(pos_ratio - 0.5) <= BALANCE_TOLERANCE, \
             f"Label imbalance in {self.split}: {pos_ratio:.3f}"
         logger.info(f"{self.split} split: {len(self.samples)} samples (pos_ratio={pos_ratio:.3f})")
-    
+
     def _get_historical_negatives_with_features(self, src_nodes, timestamps, positive_edge_features):
         """Get historical negatives with real edge features."""
         num_samples = len(src_nodes)

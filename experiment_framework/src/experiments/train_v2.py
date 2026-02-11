@@ -217,11 +217,21 @@ class DataPipeline:
             edges = self.data['edges'][self.data[mask_key]]
             timestamps = self.data['timestamps'][self.data[mask_key]]
             
+            # TGN PAPER STANDARD: ALWAYS use RANDOM sampling for TRAINING
+            # Historical/inductive sampling is ONLY for evaluation ablation studies
+            if split == 'train':
+                sampling_strategy = 'random'  # NEVER historical/inductive in training!
+            else:
+                # Validation/test: use configured strategy for ablation studies
+                sampling_strategy = self.config['data']['negative_sampling_strategy']
+            
+            
             self.samplers[split] = NegativeSampler(
                 edges=edges,
                 timestamps=timestamps,
                 num_nodes=self.data['num_nodes'],
                 neighbor_finder=self.neighbor_finder,
+                # sampling_strategy=sampling_strategy,
                 seed=self.config['experiment']['seed']
             )
         
@@ -450,11 +460,11 @@ class ExperimentLogger:
         self.csv_path = self.log_dir.parent / 'all_results.csv'
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
     
-    def log(self, config: Dict, test_results: List[Dict], training_time: float):
+    def log(self, config: Dict, test_results: List[Dict], training_time: float, model: torch.nn.Module):
         """Log results to CSV."""
-        model = test_results[0].get('model', None)
-        num_params = sum(p.numel() for p in model.parameters()) if model else 0
-        
+        # model = test_results[0].get('model', None)
+        # num_params = sum(p.numel() for p in model.parameters()) if model else 0
+        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         row = {
             'model': config['model']['name'],
             'dataset': config['data']['dataset'],
@@ -548,7 +558,7 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     # Log results
     training_time = (datetime.now() - start_time).total_seconds()
     exp_logger = ExperimentLogger(config['logging']['log_dir'])
-    exp_logger.log(config, test_results, training_time)
+    exp_logger.log(config, test_results, training_time, model)
     
     # Save checkpoint
     final_path = Path(config['logging']['checkpoint_dir']) / 'final_model.ckpt'

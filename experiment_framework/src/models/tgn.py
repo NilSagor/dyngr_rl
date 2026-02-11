@@ -768,15 +768,15 @@ class TGN(BaseDynamicGNN):
                 mem_update = torch.norm(self.memory.memory - self.memory.memory.clone().detach())
                 print(f"Memory update norm = {mem_update:.4f}")  
     
-    def _reset_memory(self, phase: str):
-        """Reset memory state."""
-        if not self.use_memory or self.memory is None:
-            return
+    # def _reset_memory(self, phase: str):
+    #     """Reset memory state."""
+    #     if not self.use_memory or self.memory is None:
+    #         return
         
-        self.memory.__init_memory__()
-        self._pending_messages = None
-        self._memory_initialized = False
-        logger.info(f"Memory reset for {phase}")
+    #     self.memory.__init_memory__()
+    #     self._pending_messages = None
+    #     self._memory_initialized = False
+    #     logger.info(f"Memory reset for {phase}")
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
