@@ -432,9 +432,11 @@ class TGN(BaseDynamicGNN):
         
         
         # PHASE 0: Update memory from previous batch's messages
-        if self.training and self.use_memory and self._pending_messages is not None:
-            with torch.no_grad():
-                self._apply_pending_memory_update()
+        # if self.training and self.use_memory and self._pending_messages is not None:
+        #     with torch.no_grad():
+        #         self._apply_pending_memory_update()
+        if self.training and self.use_memory:
+            self._aggregate_and_update_memory()
 
         # # PHASE 1: Compute messages for CURRENT batch
         # if self.training and self.use_memory:
@@ -491,6 +493,7 @@ class TGN(BaseDynamicGNN):
         if self.training and self.use_memory and self.memory is not None:
             with torch.no_grad():
                 self._compute_and_store_messages(batch)
+            
             self._memory_initialized = True
             self.train_batch_counter += 1
         
@@ -542,12 +545,75 @@ class TGN(BaseDynamicGNN):
         src_messages = self.message_fn(src_msg_input)
         dst_messages = self.message_fn(dst_msg_input)
         
+        # ----- Store in Memory.messages -----
+        # Convert to dictionary: node_id -> list of (message, timestamp)
+        node_id_to_messages = {}
+        for node, msg, ts in zip(src_nodes.cpu().numpy(), src_messages, timestamps.cpu().numpy()):
+            if node not in node_id_to_messages:
+                node_id_to_messages[node] = []
+            node_id_to_messages[node].append((msg, ts))
+
+        for node, msg, ts in zip(dst_nodes.cpu().numpy(), dst_messages, timestamps.cpu().numpy()):
+            if node not in node_id_to_messages:
+                node_id_to_messages[node] = []
+            node_id_to_messages[node].append((msg, ts))
+
+        self.memory.store_raw_messages(list(node_id_to_messages.keys()), node_id_to_messages)
+        
+        
         # Store for next batch
         self._pending_messages = {
             'nodes': torch.cat([src_nodes, dst_nodes]),
             'messages': torch.cat([src_messages, dst_messages]),
             'timestamps': torch.cat([timestamps, timestamps])
         }   
+    
+    def _aggregate_and_update_memory(self):
+        """Aggregate all stored messages per node and update memory, then clear them."""
+        if not self.use_memory or self.memory is None:
+            return
+
+        nodes_with_messages = list(self.memory.messages.keys())
+        if not nodes_with_messages:
+            return
+
+        node_ids = []
+        messages_list = []
+        timestamps_list = []
+
+        for node in nodes_with_messages:
+            node_msgs = self.memory.messages[node]   # list of (message, timestamp)
+            if not node_msgs:
+                continue
+            msgs = torch.stack([msg for msg, _ in node_msgs])
+            ts = torch.tensor([ts for _, ts in node_msgs], dtype=torch.float32, device=self.device)
+            node_ids.append(node)
+            messages_list.append(msgs)
+            timestamps_list.append(ts)
+
+        if not node_ids:
+            return
+
+        unique_nodes, unique_messages, unique_timestamps = self.message_aggregator.aggregate(
+            node_ids=node_ids,
+            messages=messages_list,
+            timestamps=timestamps_list
+        )
+
+        if len(unique_nodes) > 0:
+            unique_nodes_t = torch.tensor(unique_nodes, device=self.device)
+            unique_messages = unique_messages.to(self.device)
+            unique_timestamps = unique_timestamps.to(self.device)
+
+            self.memory_updater.update_memory(
+                unique_node_ids=unique_nodes_t,
+                unique_messages=unique_messages,
+                timestamps=unique_timestamps
+            )
+
+        # Clear processed messages
+        self.memory.clear_messages(nodes_with_messages)
+    
     
     def _apply_pending_memory_update(self):
         """Apply stored messages to memory."""
@@ -754,16 +820,17 @@ class TGN(BaseDynamicGNN):
                 logger.info(f"Batch {batch_idx}: memory mean={mem_mean:.4f}, std={mem_std:.4f}")
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Check if gradients are flowing."""
+        """Detach memory to prevent gradient leakage across batches."""
+        if self.use_memory and self.memory is not None:
+            self.memory.detach_memory()   # ← critical missing line
+
+        # Optional: your existing logging code
         if batch_idx % 100 == 0:
             total_grad_norm = 0
             for name, param in self.named_parameters():
                 if param.grad is not None:
                     total_grad_norm += param.grad.norm().item()
-            
             print(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
-            
-            # Check memory updates
             if self.use_memory and self.memory is not None:
                 mem_update = torch.norm(self.memory.memory - self.memory.memory.clone().detach())
                 print(f"Memory update norm = {mem_update:.4f}")  

@@ -79,7 +79,8 @@ class Memory(nn.Module):
 
   def clear_messages(self, nodes):
     for node in nodes:
-      self.messages[node] = []
+        if node in self.messages:
+            del self.messages[node]
 
   def to(self, device):
     """Move memory to specified device."""
