@@ -18,17 +18,6 @@ from .tgn_module.message_function import get_message_function
 from .tgn_module.embedding_module import get_embedding_module
 
 
-# def scatter_mean(src, index, dim=0, dim_size=None):
-#     if dim_size is None:
-#         dim_size = index.max().item() + 1
-#     count = torch.zeros(dim_size, dtype=src.dtype, device=src.device)
-#     count.scatter_add_(dim, index, torch.ones_like(index, dtype=src.dtype))
-#     out = torch.zeros(dim_size, src.size(1), dtype=src.dtype, device=src.device)
-#     out.scatter_add_(dim, index.unsqueeze(1).expand_as(src), src)
-#     return out / count.unsqueeze(1).clamp(min=1)
-
-
-
 class TGN(BaseDynamicGNN):
     """Temporal Graph Networks for Deep Learning on Dynamic Graphs.
    
@@ -108,13 +97,10 @@ class TGN(BaseDynamicGNN):
         self.node_raw_features = None  # Will point to buffer
         self.edge_raw_features = None
         
-        # Memory management for TGN (lagged update)
-        self._pending_messages = None
+        # Memory management for TGN         
         self._memory_initialized = False
 
-        # Add message store as in original TGN
-        self.message_store = defaultdict(list)
-        
+               
         # Add layer norm to attention
         self.attention_norm = nn.LayerNorm(hidden_dim)
         
@@ -129,9 +115,11 @@ class TGN(BaseDynamicGNN):
             self.node_embedding = nn.Embedding(self.num_nodes, self.hidden_dim)
 
        
+        # self.link_predictor = MergeLayer()
+
         self.link_predictor = nn.Sequential(
             nn.Linear(hidden_dim*2, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # Add normalization
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1)
@@ -146,16 +134,7 @@ class TGN(BaseDynamicGNN):
 
         # Add training state tracking
         self.train_batch_counter = 0
-        logger.info(f"TGN initialized with use_memory={self.use_memory}")
-        # if self.memory_updater is not None:
-        #     print("Memory updater: OK")
-        # else:
-        #     print("Memory updater: NONE!")
-
-        
-        
-
-        
+        logger.info(f"TGN initialized with use_memory={self.use_memory}")       
 
     # Add these methods to your TGN class (after __init__)
     def __getstate__(self):
@@ -177,35 +156,18 @@ class TGN(BaseDynamicGNN):
         
         # Update instance dictionary
         self.__dict__.update(state)
-        self._pending_messages = None
-        self._memory_initialized = False
         
-      
+        self._memory_initialized = False 
      
         
 
         if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
             self.num_nodes = num_nodes_backup
             if self.use_memory and hasattr(self, 'memory'):
-                self._init_modules()
-
-
-        # Restore edge dimension if corrupted
-        # if edge_dim_backup is not None and hasattr(self, 'edge_features_dim'):
-        #     if self.edge_features_dim != edge_dim_backup:
-        #         print(f"Restoring edge_features_dim from {self.edge_features_dim} → {edge_dim_backup}")
-        #         self.edge_features_dim = edge_dim_backup
+                self._init_modules()       
 
         if edge_dim_backup is not None:
             self.edge_features_dim = edge_dim_backup
-
-        # self._memory_initialized = False
-        # self._init_modules()
-        # if self.node_raw_features is not None and self.edge_raw_features is not None:
-        #     self.set_raw_features(self.node_raw_features, self.edge_raw_features)
-        
-        
-
 
 
     def _init_weights(self):
@@ -217,12 +179,10 @@ class TGN(BaseDynamicGNN):
                     nn.init.zeros_(m.bias)
     
     def set_neighbor_finder(self, neighbor_finder):
-        """Initialize embedding module AFTER model reconstruction (critical fix)."""
+        """Initialize embedding module AFTER model reconstruction."""
         self.neighbor_finder = neighbor_finder
         
-        # Only initialize embedding module if features are already set
-        # if self.embedding_module is None and neighbor_finder is not None and self.node_raw_features is not None:
-        #     self._init_embedding_module()
+        # Only initialize embedding module if features are already set        
         # Validate interface
         required = ['find_neighbors', 'get_temporal_neighbor']
         for method in required:
@@ -237,8 +197,7 @@ class TGN(BaseDynamicGNN):
                         f"edge_raw_features={self.edge_raw_features is not None}, "
                         f"neighbor_finder={neighbor_finder is not None}")
         
-        # if self.node_raw_features is not None and self.edge_raw_features is not None:
-        #     self._init_embedding_module()
+       
 
     def _init_embedding_module(self):
         """Initialize embedding module with CORRECT feature dimensions."""
@@ -247,7 +206,7 @@ class TGN(BaseDynamicGNN):
         logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
         
         # Handle Wikipedia (no node features)
-        # CRITICAL FIX: Handle case where node features are None (Wikipedia)
+        # Handle case where node features are None (Wikipedia)
         if self.node_raw_features is None:
             logger.warning("Node features are None! Using node embedding layer for embedding module.")
             # Use the node embedding layer's weight as node features
@@ -401,8 +360,7 @@ class TGN(BaseDynamicGNN):
           f"time={self.time_encoding_dim}, edge={edge_feat_dim})")
         
         
-        # if raw_message_dim <= 0:
-        #     raw_message_dim = self.message_dim
+        
 
 
         self.message_fn = get_message_function(
@@ -420,8 +378,9 @@ class TGN(BaseDynamicGNN):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward pass of TGN."""       
         device = self.device
-        # if self.training and self.use_memory and self.memory is not None:
-        #     # self._update_memory_for_batch(batch)
+        if self.training and self.use_memory:
+            self._aggregate_and_update_memory()      
+        
         
         # DEBUG: Check if embedding module exists
         if self.embedding_module is None:
@@ -435,8 +394,8 @@ class TGN(BaseDynamicGNN):
         # if self.training and self.use_memory and self._pending_messages is not None:
         #     with torch.no_grad():
         #         self._apply_pending_memory_update()
-        if self.training and self.use_memory:
-            self._aggregate_and_update_memory()
+        # if self.training and self.use_memory:
+        #     self._aggregate_and_update_memory()
 
         # # PHASE 1: Compute messages for CURRENT batch
         # if self.training and self.use_memory:
@@ -451,13 +410,7 @@ class TGN(BaseDynamicGNN):
         
         
         
-        # if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-        #     if self.node_raw_features.device != device:
-        #         self.node_raw_features = self.node_raw_features.to(device)
-        # if hasattr(self, 'edge_raw_features') and self.edge_raw_features is not None:
-        #     if self.edge_raw_features.device != device:
-        #         self.edge_raw_features = self.edge_raw_features.to(device)
-        
+      
         
         
         # Guard: ensure message_fn is initialized
@@ -491,15 +444,10 @@ class TGN(BaseDynamicGNN):
         
         # PHASE 4: Store messages for NEXT batch (don't apply yet)
         if self.training and self.use_memory and self.memory is not None:
-            with torch.no_grad():
-                self._compute_and_store_messages(batch)
-            
+            # with torch.no_grad():
+            self._compute_and_store_messages(batch)
             self._memory_initialized = True
             self.train_batch_counter += 1
-        
-       
-        
-
         return scores
 
     def _compute_and_store_messages(self, batch):
@@ -546,33 +494,30 @@ class TGN(BaseDynamicGNN):
         dst_messages = self.message_fn(dst_msg_input)
         
         # ----- Store in Memory.messages -----
-        # Convert to dictionary: node_id -> list of (message, timestamp)
         node_id_to_messages = {}
-        for node, msg, ts in zip(src_nodes.cpu().numpy(), src_messages, timestamps.cpu().numpy()):
-            if node not in node_id_to_messages:
-                node_id_to_messages[node] = []
-            node_id_to_messages[node].append((msg, ts))
+        for node, msg, ts in zip(src_nodes, src_messages, timestamps):
+            node_id_to_messages.setdefault(
+                node.item(), []).append(
+                    (msg, ts.item()))
+        for node, msg, ts in zip(dst_nodes, dst_messages, timestamps):
+            node_id_to_messages.setdefault(
+                node.item(), []).append(
+                    (msg, ts.item()))
 
-        for node, msg, ts in zip(dst_nodes.cpu().numpy(), dst_messages, timestamps.cpu().numpy()):
-            if node not in node_id_to_messages:
-                node_id_to_messages[node] = []
-            node_id_to_messages[node].append((msg, ts))
-
-        self.memory.store_raw_messages(list(node_id_to_messages.keys()), node_id_to_messages)
-        
-        
-        # Store for next batch
-        self._pending_messages = {
-            'nodes': torch.cat([src_nodes, dst_nodes]),
-            'messages': torch.cat([src_messages, dst_messages]),
-            'timestamps': torch.cat([timestamps, timestamps])
-        }   
+        self.memory.store_raw_messages(
+            list(node_id_to_messages.keys()), 
+            node_id_to_messages
+        )         
     
     def _aggregate_and_update_memory(self):
         """Aggregate all stored messages per node and update memory, then clear them."""
+        device = self.device
         if not self.use_memory or self.memory is None:
             return
 
+        if self.training:
+            self._memory_before_update = self.memory.memory.clone().detach()
+        
         nodes_with_messages = list(self.memory.messages.keys())
         if not nodes_with_messages:
             return
@@ -582,17 +527,14 @@ class TGN(BaseDynamicGNN):
         timestamps_list = []
 
         for node in nodes_with_messages:
-            node_msgs = self.memory.messages[node]   # list of (message, timestamp)
+            node_msgs = self.memory.messages[node]
             if not node_msgs:
                 continue
-            msgs = torch.stack([msg for msg, _ in node_msgs])
-            ts = torch.tensor([ts for _, ts in node_msgs], dtype=torch.float32, device=self.device)
+            msgs = torch.stack([msg for msg, _ in node_msgs]).to(device)
+            ts = torch.tensor([ts for _, ts in node_msgs], dtype=torch.float32, device=device)
             node_ids.append(node)
             messages_list.append(msgs)
             timestamps_list.append(ts)
-
-        if not node_ids:
-            return
 
         unique_nodes, unique_messages, unique_timestamps = self.message_aggregator.aggregate(
             node_ids=node_ids,
@@ -601,9 +543,9 @@ class TGN(BaseDynamicGNN):
         )
 
         if len(unique_nodes) > 0:
-            unique_nodes_t = torch.tensor(unique_nodes, device=self.device)
-            unique_messages = unique_messages.to(self.device)
-            unique_timestamps = unique_timestamps.to(self.device)
+            unique_nodes_t = torch.tensor(unique_nodes, device=device)
+            unique_messages = unique_messages.to(device)
+            unique_timestamps = unique_timestamps.to(device)
 
             self.memory_updater.update_memory(
                 unique_node_ids=unique_nodes_t,
@@ -611,21 +553,12 @@ class TGN(BaseDynamicGNN):
                 timestamps=unique_timestamps
             )
 
+        
+
         # Clear processed messages
         self.memory.clear_messages(nodes_with_messages)
     
     
-    def _apply_pending_memory_update(self):
-        """Apply stored messages to memory."""
-        if self._pending_messages is None or self.memory_updater is None:
-            return
-        
-        self.memory_updater.update_memory(
-            self._pending_messages['nodes'],
-            self._pending_messages['messages'],
-            self._pending_messages['timestamps']
-        )
-        self._pending_messages = None
     
     def compute_temporal_embeddings_pair(self, source_nodes: np.ndarray,
                                    destination_nodes: np.ndarray,
@@ -695,63 +628,9 @@ class TGN(BaseDynamicGNN):
                 dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
 
         return src_emb, dst_emb  
-        
-  
+         
     
     
-    
-    def _update_memory_for_batch(self, batch: Dict[str, torch.Tensor]):
-        """Update memory immediately after forward pass."""
-        device = self.device
-        
-        if not self.use_memory or self.memory is None:
-            return
-            
-        with torch.no_grad():
-            src_nodes = batch['src_nodes'].to(device)
-            dst_nodes = batch['dst_nodes'].to(device)
-            timestamps = batch['timestamps'].to(device)
-
-            # Get features
-            if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-                src_features = self.node_raw_features[src_nodes]
-                dst_features = self.node_raw_features[dst_nodes]
-            else:
-                src_features = self.node_embedding(src_nodes)
-                dst_features = self.node_embedding(dst_nodes)
-
-            # Get edge features from batch
-            if 'edge_features' in batch and batch['edge_features'] is not None:
-                edge_feats = batch['edge_features']
-            else:
-                # FIXED: Use configured dimension
-                edge_feats = torch.zeros(
-                    len(src_nodes), 
-                    self.edge_features_dim,  # NOT 172
-                    device=self.device
-                )
-
-            # Get current memory states
-            src_memory = self.memory.get_memory(src_nodes)
-            dst_memory = self.memory.get_memory(dst_nodes)
-            time_enc = self.time_encoder(timestamps)
-            
-            # Create message inputs
-            src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc, edge_feats], dim=-1)
-            dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc, edge_feats], dim=-1)
-            
-            # Generate messages
-            src_messages = self.message_fn(src_msg_input)
-            dst_messages = self.message_fn(dst_msg_input)
-            
-            # Update memory
-            all_messages = torch.cat([src_messages, dst_messages], dim=0)
-            all_nodes = torch.cat([src_nodes, dst_nodes], dim=0)
-            all_timestamps = torch.cat([timestamps, timestamps], dim=0)
-            
-            # if self.memory_updater is not None:
-            self.memory_updater.update_memory(all_nodes, all_messages, all_timestamps)
-     
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
              
         # Forward pass
@@ -811,6 +690,24 @@ class TGN(BaseDynamicGNN):
             'loss': loss
         }
     
+    def validation_step(self, batch, batch_idx):
+        """Compute and log validation metrics."""
+        logits = self.forward(batch)
+        labels = batch['labels'].float()
+        
+        # Compute loss (already logged by base)
+        loss = self.loss_fn(logits, labels)
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        
+        # Compute AP and log it
+        probs = torch.sigmoid(logits)
+        from sklearn.metrics import average_precision_score
+        ap = average_precision_score(labels.cpu().numpy(), probs.detach().cpu().numpy())
+        self.log('val_ap', ap, prog_bar=True, sync_dist=True)
+        
+        return loss
+    
+    
     def on_train_batch_start(self, batch, batch_idx):
         """Verify memory is updating."""
         if self.use_memory and self.memory is not None:
@@ -831,8 +728,8 @@ class TGN(BaseDynamicGNN):
                 if param.grad is not None:
                     total_grad_norm += param.grad.norm().item()
             print(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
-            if self.use_memory and self.memory is not None:
-                mem_update = torch.norm(self.memory.memory - self.memory.memory.clone().detach())
+            if hasattr(self, '_memory_before_update'):
+                mem_update = torch.norm(self.memory.memory - self._memory_before_update)
                 print(f"Memory update norm = {mem_update:.4f}")  
     
     # def _reset_memory(self, phase: str):

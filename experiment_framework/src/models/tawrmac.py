@@ -5,12 +5,12 @@ from gc import enable
 import numpy as np
 import torch
 import torch.nn.functional as F
-from model.time_encoding import TimeEncode
-from model.memory import Memory, GRUMemoryUpdater, LastMessageAggregator, IdentityMessageFunction, GraphAttentionEmbedding
-from model.walk import WalkEncoder, PositionEncoder
-from model.cooccurrence import NeighborCooccurrenceEncoder
-from utils.utils import AffinityMergeLayer
-from utils.utils import RestartMLP
+from tawrmac_module.time_encoding import TimeEncode
+from tawrmac_module import Memory, GRUMemoryUpdater, LastMessageAggregator, IdentityMessageFunction, GraphAttentionEmbedding
+from tawrmac_module.walk import WalkEncoder, PositionEncoder
+from tawrmac_module.cooccurrence import NeighborCooccurrenceEncoder
+from tawrmac_module.merg_layer import AffinityMergeLayer
+from tawrmac_module.mlp_module import RestartMLP
 
 
 class TAWRMAC(torch.nn.Module):

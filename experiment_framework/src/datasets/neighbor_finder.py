@@ -296,11 +296,12 @@ class NeighborFinder:
         edge_idxs = np.zeros((batch_size, n_neighbors), dtype=np.int64)
         edge_times = np.zeros((batch_size, n_neighbors), dtype=np.float32)
         
-        for i, (nbrs, tms) in enumerate(zip(neighbors_list, times_list)):
+        for i, (nbrs, tms, eids) in enumerate(zip(neighbors_list, times_list, edge_ids_list)):
             if len(nbrs) > 0:
                 actual_n = min(len(nbrs), n_neighbors)
                 neighbors[i, :actual_n] = nbrs[:actual_n]
-                edge_idxs[i, :actual_n] = np.arange(actual_n)  # Dummy indices
+                # edge_idxs[i, :actual_n] = np.arange(actual_n)  # Dummy indices
+                edge_idxs[i, :actual_n] = eids[:actual_n]  # Actual edge IDs
                 edge_times[i, :actual_n] = tms[:actual_n]
         
         return neighbors, edge_idxs, edge_times

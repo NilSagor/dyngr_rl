@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 class MessageFunction(nn.Module):
@@ -12,9 +13,10 @@ class MLPMessageFunction(MessageFunction):
             nn.ReLU(),
             nn.Linear(raw_message_dimension//2, message_dimension),
         )
+        self.scale = nn.Parameter(torch.ones(1))
 
     def forward(self, raw_messages):
-        messages = self.mlp(raw_messages)
+        messages = self.mlp(raw_messages)*self.scale
         return messages
     
 

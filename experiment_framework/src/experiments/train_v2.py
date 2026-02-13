@@ -23,6 +23,7 @@ import torch
 import numpy as np
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+# from lightning.pytorch.callbacks import ReduceLROnPlateau
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from torch.utils.data import DataLoader
 from loguru import logger
@@ -405,7 +406,7 @@ class TrainerSetup:
         callbacks = [
             ModelCheckpoint(
                 dirpath=config['logging']['checkpoint_dir'],
-                filename='{epoch}-{val_loss:.2f}',
+                filename='{epoch}-{val_ap:.2f}',
                 monitor=config['logging']['monitor'],
                 mode=config['logging']['mode'],
                 save_top_k=config['logging']['save_top_k'],
@@ -418,6 +419,7 @@ class TrainerSetup:
                 verbose=True,
             ),
             LearningRateMonitor(logging_interval='epoch'),
+            # ReduceLROnPlateau(monitor='val_ap', mode='max', patience=10, factor=0.5)
         ]
         
         loggers = [
@@ -539,6 +541,8 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     
     # Setup trainer
     trainer = TrainerSetup.create(config)
+    print(f"Trainer max_epochs: {trainer.max_epochs}")
+    print(f"EarlyStopping patience: {[c for c in trainer.callbacks if isinstance(c, EarlyStopping)]}")
     
     # Train
     logger.info("Starting training...")
@@ -547,6 +551,29 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         train_dataloaders=pipeline.loaders['train'],
         val_dataloaders=pipeline.loaders['val'],
     )
+
+    # Load the best checkpoint for testing
+    if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
+        best_path = trainer.checkpoint_callback.best_model_path
+        logger.info(f"Loading best checkpoint from {best_path}")
+        
+        # 1. Re‑create a fresh model with the same configuration and data
+        #    (ModelFactory.create already gives a new instance)
+        model = ModelFactory.create(config, features)
+        model.set_raw_features(features['node_features'], features['edge_features'])
+        model.set_neighbor_finder(pipeline.neighbor_finder)
+        
+        # 2. Load the checkpoint with strict=False – ignore unexpected keys
+        checkpoint = torch.load(best_path, map_location=model.device)
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        
+        # 3. Ensure model is on correct device and in eval mode
+        model = model.to(model.device)
+        model.eval()
+        
+        logger.info("Best checkpoint loaded successfully (strict=False).")
+    else:
+        logger.warning("No checkpoint callback or best model path found. Using current model.")
     
     # Test
     logger.info("Running evaluation...")

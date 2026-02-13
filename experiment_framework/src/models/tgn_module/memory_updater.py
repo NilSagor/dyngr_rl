@@ -19,25 +19,28 @@ class SequenceMemoryUpdater(MemoryUpdater):
         return
 
     # Get current last update times
-    last_update = self.memory.get_last_update(unique_node_ids)
+    # last_update = self.memory.get_last_update(unique_node_ids).detach()
     
     # Skip updates that would go backwards in time
-    valid_mask = last_update <= timestamps
-    if not valid_mask.all():
-        # Log warning for debugging
-        # print(f"Warning: Skipping {(~valid_mask).sum().item()} memory updates in the past")
-        unique_node_ids = unique_node_ids[valid_mask]
-        unique_messages = unique_messages[valid_mask]
-        timestamps = timestamps[valid_mask]
+    # valid_mask = last_update <= timestamps
+    # if not valid_mask.all():
+    #     # Log warning for debugging
+    #     # print(f"Warning: Skipping {(~valid_mask).sum().item()} memory updates in the past")
+    #     unique_node_ids = unique_node_ids[valid_mask]
+    #     unique_messages = unique_messages[valid_mask]
+    #     timestamps = timestamps[valid_mask]
         
-        if len(unique_node_ids) == 0:
-            return
+    #     if len(unique_node_ids) == 0:
+    #         return
 
     # Update memory for valid entries
+    # with torch.no_grad():
     memory = self.memory.get_memory(unique_node_ids)
+    # GRU call is differentiable – gradients flow through messages!
     updated_memory = self.memory_updater(unique_messages, memory)
-    self.memory.set_memory(unique_node_ids, updated_memory)
-    self.memory.last_update[unique_node_ids] = timestamps
+    # in‑place assignment on a non‑differentiable tensor 
+    self.memory.memory.data[unique_node_ids] = updated_memory
+    self.memory.last_update.data[unique_node_ids] = timestamps
 
 def get_updated_memory(self, unique_node_ids, unique_messages, timestamps):
     if len(unique_node_ids) <= 0:

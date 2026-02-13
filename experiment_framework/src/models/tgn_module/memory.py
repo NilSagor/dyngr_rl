@@ -30,11 +30,14 @@ class Memory(nn.Module):
     current_device = self.memory.device if hasattr(self, 'memory') else self.device
     
     # Create tensors on correct device
-    memory_tensor = torch.zeros((self.n_nodes, self.memory_dimension), device=current_device)
+    # memory_tensor = torch.zeros((self.n_nodes, self.memory_dimension), device=current_device)
+    memory_tensor = torch.randn(self.n_nodes, self.memory_dimension, device=current_device) * 0.01
     last_update_tensor = torch.zeros(self.n_nodes, device=current_device)
     
     # Register as parameters
-    self.memory = nn.Parameter(memory_tensor, requires_grad=False)
+    self.memory = nn.Parameter(memory_tensor, requires_grad=True)
+    # self.memory = nn.Parameter(torch.randn(self.n_nodes, self.memory_dimension) * 0.01,
+    #                        requires_grad=False)
     self.last_update = nn.Parameter(last_update_tensor, requires_grad=False)
     
     self.messages = defaultdict(list)
@@ -44,12 +47,17 @@ class Memory(nn.Module):
       self.messages[node].extend(node_id_to_messages[node])
 
   def get_memory(self, node_idxs):
+    # Ensure memory is on the same device as the indexing tensor
+    if self.memory.device != node_idxs.device:
+        self.memory = self.memory.to(node_idxs.device)
     return self.memory[node_idxs, :]
 
   def set_memory(self, node_idxs, values):
     self.memory[node_idxs, :] = values
 
   def get_last_update(self, node_idxs):
+    if self.last_update.device != node_idxs.device:
+        self.last_update = self.last_update.to(node_idxs.device)
     return self.last_update[node_idxs]
 
   def backup_memory(self):

@@ -26,13 +26,20 @@ class Memory(nn.Module):
         Initializes the memory to all zeros. It should be called at the start of each epoch.
         """
         # Treat memory as parameter so that it is saved and loaded together with the model
-        n_nodes = self.n_nodes
+        # n_nodes = self.n_nodes
 
-        self.memory = nn.Parameter(torch.zeros((n_nodes, self.memory_dimension)).to(self.device),
-                                   requires_grad=False)
-        self.last_update = nn.Parameter(torch.zeros(n_nodes).to(self.device),
-                                        requires_grad=False)
+        # self.memory = nn.Parameter(torch.zeros((n_nodes, self.memory_dimension)).to(self.device),
+        #                            requires_grad=False)
+        # self.last_update = nn.Parameter(torch.zeros(n_nodes).to(self.device),
+        #                                 requires_grad=False)
 
+        # self.messages = defaultdict(list)
+        current_device = self.memory.device if hasattr(self, 'memory') else self.device
+        # Use small random values instead of zeros
+        memory_tensor = torch.randn(self.n_nodes, self.memory_dimension, device=current_device) * 0.01
+        last_update_tensor = torch.zeros(self.n_nodes, device=current_device)
+        self.memory = nn.Parameter(memory_tensor, requires_grad=False)
+        self.last_update = nn.Parameter(last_update_tensor, requires_grad=False)
         self.messages = defaultdict(list)
 
     def store_raw_messages(self, nodes, node_id_to_messages):

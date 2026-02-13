@@ -79,18 +79,18 @@ class TemporalDataset(Dataset):
         ]
         
         
-        # # Get negative destinations with appropriate edge features
-        # if self.negative_sampling_strategy == 'historical':
-        #     neg_dsts, neg_edge_features = self._sample_historical_with_features(
-        #         neg_srcs, neg_timestamps
-        #     )
-        # else:
-        #     # Random or inductive sampling - use zero features
-        #     neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
-        #     neg_edge_features = [
-        #         torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
-        #         for _ in range(num_positives)
-        #     ]
+        # Get negative destinations with appropriate edge features
+        if self.negative_sampling_strategy == 'historical':
+            neg_dsts, neg_edge_features = self._sample_historical_with_features(
+                neg_srcs, neg_timestamps
+            )
+        else:
+            # Random or inductive sampling - use zero features
+            neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
+            neg_edge_features = [
+                torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
+                for _ in range(num_positives)
+            ]
 
         for i in range(num_positives):
             self.samples.append({
