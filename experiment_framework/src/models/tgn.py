@@ -357,9 +357,7 @@ class TGN(BaseDynamicGNN):
         # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
         logger.info(f"Message function input dim: {raw_message_dim} "
           f"(node={node_feat_dim}, mem={self.memory_dim}, "
-          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")
-        
-        
+          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")   
         
 
 
@@ -378,8 +376,7 @@ class TGN(BaseDynamicGNN):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward pass of TGN."""       
         device = self.device
-        if self.training and self.use_memory:
-            self._aggregate_and_update_memory()      
+           
         
         
         # DEBUG: Check if embedding module exists
@@ -433,6 +430,10 @@ class TGN(BaseDynamicGNN):
             edge_times=timestamps.cpu().numpy(),
             n_neighbors=self.n_neighbors
         )
+
+        if self.training and self.use_memory:
+            self._compute_and_store_messages(batch)
+            self._aggregate_and_update_memory()   
         
         # DEBUG: Check embeddings
         if torch.all(source_emb == 0) or torch.all(dest_emb == 0):
@@ -445,7 +446,7 @@ class TGN(BaseDynamicGNN):
         # PHASE 4: Store messages for NEXT batch (don't apply yet)
         if self.training and self.use_memory and self.memory is not None:
             # with torch.no_grad():
-            self._compute_and_store_messages(batch)
+            
             self._memory_initialized = True
             self.train_batch_counter += 1
         return scores
@@ -603,15 +604,15 @@ class TGN(BaseDynamicGNN):
             
             # Use full attention-based embeddings with neighbor sampling
             source_emb = self.embedding_module.compute_embedding(
-                memory= full_memory,
-                # memory= source_memory,
+                # memory= full_memory,
+                memory= self.memory,
                 source_nodes=source_nodes,
                 timestamps=edge_times,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
             destination_emb = self.embedding_module.compute_embedding(
-                memory= full_memory,
+                memory= self.memory,
                 # memory= destination_memory,
                 source_nodes=destination_nodes,
                 timestamps=edge_times,
@@ -730,23 +731,19 @@ class TGN(BaseDynamicGNN):
             print(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
             if hasattr(self, '_memory_before_update'):
                 mem_update = torch.norm(self.memory.memory - self._memory_before_update)
-                print(f"Memory update norm = {mem_update:.4f}")  
+                print(f"Memory update norm = {mem_update:.4f}") 
     
-    # def _reset_memory(self, phase: str):
-    #     """Reset memory state."""
-    #     if not self.use_memory or self.memory is None:
-    #         return
-        
-    #     self.memory.__init_memory__()
-    #     self._pending_messages = None
-    #     self._memory_initialized = False
-    #     logger.info(f"Memory reset for {phase}")
+    
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self.train_batch_counter = 0
         logger.info(f"✓ Training epoch start - Memory state preserved (size={self.memory.memory.shape[0]})")
 
+    # def on_validation_epoch_start(self):
+    #     if self.use_memory:
+    #         self.memory.__init_memory__()
+    
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
         # self._reset_memory("validation")
