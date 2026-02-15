@@ -88,14 +88,14 @@ class TGN(BaseDynamicGNN):
         self.neighbor_finder = None
         self.embedding_module = None
         
-
+        self.register_buffer('_num_nodes', torch.tensor(num_nodes, dtype=torch.long))
         # # Store raw features as buffers        
         # Register buffers (will be filled later)
-        self.register_buffer('_node_raw_features', None)
-        self.register_buffer('_edge_raw_features', None)      
+        # self.register_buffer('_node_raw_features', None)
+        # self.register_buffer('_edge_raw_features', None)      
         
-        self.node_raw_features = None  # Will point to buffer
-        self.edge_raw_features = None
+        # self.node_raw_features = None  # Will point to buffer
+        # self.edge_raw_features = None
         
         # Memory management for TGN         
         self._memory_initialized = False
@@ -137,37 +137,37 @@ class TGN(BaseDynamicGNN):
         logger.info(f"TGN initialized with use_memory={self.use_memory}")       
 
     # Add these methods to your TGN class (after __init__)
-    def __getstate__(self):
-        """Preserve critical parameters during pickling/reconstruction."""
-        state = self.__dict__.copy()
-        # Backup critical parameters that Lightning often corrupts
-        state['_num_nodes_backup'] = self.num_nodes
-        state['_edge_features_dim_backup'] = self.edge_features_dim
-        state.pop('_memory_initialized', None)
-        return state
+    # def __getstate__(self):
+    #     """Preserve critical parameters during pickling/reconstruction."""
+    #     state = self.__dict__.copy()
+    #     # Backup critical parameters that Lightning often corrupts
+    #     state['_num_nodes_backup'] = self.num_nodes
+    #     state['_edge_features_dim_backup'] = self.edge_features_dim
+    #     state.pop('_memory_initialized', None)
+    #     return state
 
-    def __setstate__(self, state):
-        """Restore state with validation to prevent corruption."""
-        # Extract backups BEFORE updating state
-        num_nodes_backup = state.pop('_num_nodes_backup', None)
-        edge_dim_backup = state.pop('_edge_features_dim_backup', None)
+    # def __setstate__(self, state):
+    #     """Restore state with validation to prevent corruption."""
+    #     # Extract backups BEFORE updating state
+    #     num_nodes_backup = state.pop('_num_nodes_backup', None)
+    #     edge_dim_backup = state.pop('_edge_features_dim_backup', None)
 
    
         
-        # Update instance dictionary
-        self.__dict__.update(state)
+    #     # Update instance dictionary
+    #     self.__dict__.update(state)
         
-        self._memory_initialized = False 
+    #     self._memory_initialized = False 
      
         
 
-        if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
-            self.num_nodes = num_nodes_backup
-            if self.use_memory and hasattr(self, 'memory'):
-                self._init_modules()       
+    #     if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
+    #         self.num_nodes = num_nodes_backup
+    #         if self.use_memory and hasattr(self, 'memory'):
+    #             self._init_modules()       
 
-        if edge_dim_backup is not None:
-            self.edge_features_dim = edge_dim_backup
+    #     if edge_dim_backup is not None:
+    #         self.edge_features_dim = edge_dim_backup
 
 
     def _init_weights(self):
@@ -253,7 +253,7 @@ class TGN(BaseDynamicGNN):
         #     )
         
         # CRITICAL DEBUG
-        print(f"DEBUG: use_memory={self.use_memory}, memory_updater_type={self.memory_updater_type}")
+        logger.debug(f"DEBUG: use_memory={self.use_memory}, memory_updater_type={self.memory_updater_type}")
 
         # Memory module
         if self.use_memory:
@@ -291,43 +291,38 @@ class TGN(BaseDynamicGNN):
         # Message function will be initialized after raw features are set
         self.message_fn = None
 
-    def set_raw_features(self, node_raw_features: torch.Tensor, edge_raw_features: torch.Tensor):
-        # """Set raw features from dataset."""        
-        """Set raw features WITHOUT reinitializing modules (critical fix)."""
+    def set_raw_features(self, node_raw_features: Optional[torch.Tensor], edge_raw_features: torch.Tensor):
+        """Set raw features as buffers for automatic device management."""
         device = self.device
-        
-        # self.node_raw_features = node_raw_features.to(device) if node_raw_features is not None else None
-        # self.edge_raw_features = edge_raw_features.to(device)
-        # Direct assignment works for registered buffers
-        # Store in buffers for proper device handling
+
+        # Helper to remove any existing buffer/attribute with the same name
+        def _safe_remove(name):
+            if name in self._buffers:
+                del self._buffers[name]
+            if hasattr(self, name):
+                delattr(self, name)
+
+        # Handle node features
+        _safe_remove('node_raw_features')
         if node_raw_features is not None:
-            self._node_features_buffer = node_raw_features.to(device)
-            self.node_raw_features = self._node_features_buffer
+            self.register_buffer('node_raw_features', node_raw_features.to(device))
         else:
-            self.node_raw_features = None
-            
+            self.node_raw_features = None   # plain attribute (None)
+
+        # Handle edge features
+        _safe_remove('edge_raw_features')
         if edge_raw_features is not None:
-            self._edge_features_buffer = edge_raw_features.to(device)
-            self.edge_raw_features = self._edge_features_buffer
+            self.register_buffer('edge_raw_features', edge_raw_features.to(device))
         else:
             self.edge_raw_features = None
-        
-        logger.info(f"Set raw features: Node={self.node_raw_features.shape if self.node_raw_features is not None else None}, "
-                   f"Edge={self.edge_raw_features.shape if self.edge_raw_features is not None else None}")
-        
-        # CRITICAL FIX: NEVER call _init_modules() here - causes double initialization with corrupted state
-        # Update embedding module features directly if it exists
-        # if hasattr(self, 'embedding_module') and self.embedding_module is not None:
-        #     self.embedding_module.node_features = self.node_raw_features
-        #     self.embedding_module.edge_features = self.edge_raw_features
-        
-        # Initialize message function (safe - doesn't reinit modules)
-        self._init_message_function()
 
-        # Verify it worked
+        logger.info(f"Set raw features: Node={self.node_raw_features.shape if self.node_raw_features is not None else None}, "
+                    f"Edge={self.edge_raw_features.shape if self.edge_raw_features is not None else None}")
+
+        self._init_message_function()
         if self.message_fn is None:
             raise RuntimeError("Failed to initialize message_fn in set_raw_features")
-
+    
     def _init_message_function(self):
         """Initialize message function with correct dimensions."""        
         # Calculate actual message dimension
@@ -341,7 +336,7 @@ class TGN(BaseDynamicGNN):
         
         # Raw message dimension: [src_features, dst_features, src_memory, dst_memory, time_enc]
         raw_message_dim = (
-            node_feat_dim * 2 + # src + dst node features
+            # node_feat_dim * 2 + # src + dst node features
             self.memory_dim * 2 + # src + dst memory
             self.time_encoding_dim + # time encoding
             edge_feat_dim # edge features
@@ -357,8 +352,7 @@ class TGN(BaseDynamicGNN):
         # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
         logger.info(f"Message function input dim: {raw_message_dim} "
           f"(node={node_feat_dim}, mem={self.memory_dim}, "
-          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")   
-        
+          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")       
 
 
         self.message_fn = get_message_function(
@@ -375,9 +369,7 @@ class TGN(BaseDynamicGNN):
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward pass of TGN."""       
-        device = self.device
-           
-        
+        device = self.device        
         
         # DEBUG: Check if embedding module exists
         if self.embedding_module is None:
@@ -388,23 +380,14 @@ class TGN(BaseDynamicGNN):
         
         
         # PHASE 0: Update memory from previous batch's messages
-        # if self.training and self.use_memory and self._pending_messages is not None:
-        #     with torch.no_grad():
-        #         self._apply_pending_memory_update()
-        # if self.training and self.use_memory:
-        #     self._aggregate_and_update_memory()
+       
 
         # # PHASE 1: Compute messages for CURRENT batch
-        # if self.training and self.use_memory:
-        #     self._compute_and_store_messages(batch)
+       
         
         
         # # PHASE 1: Apply pending memory updates from PREVIOUS batch
-        # if self.use_memory and self.memory is not None:
-        #     if self._memory_initialized and self._pending_messages is not None:
-        #         with torch.no_grad():
-        #             self._apply_pending_memory_update()
-        
+       
         
         
       
@@ -454,7 +437,7 @@ class TGN(BaseDynamicGNN):
     def _compute_and_store_messages(self, batch):
         """Compute messages from this batch for NEXT memory update."""
         if not self.use_memory or self.memory is None:
-            print("WARNING: Trying to store messages but use_memory=False or memory=None")
+            logger.warning("WARNING: Trying to store messages but use_memory=False or memory=None")
             return
         
         device = self.device
@@ -488,8 +471,8 @@ class TGN(BaseDynamicGNN):
         time_enc = self.time_encoder(timestamps)
         
         # Compute messages
-        src_msg_input = torch.cat([src_features, dst_features, src_memory, dst_memory, time_enc, edge_feats], dim=-1)
-        dst_msg_input = torch.cat([dst_features, src_features, dst_memory, src_memory, time_enc, edge_feats], dim=-1)
+        src_msg_input = torch.cat([ src_memory, dst_memory, time_enc, edge_feats], dim=-1)
+        dst_msg_input = torch.cat([ dst_memory, src_memory, time_enc, edge_feats], dim=-1)
         
         src_messages = self.message_fn(src_msg_input)
         dst_messages = self.message_fn(dst_msg_input)
@@ -576,9 +559,9 @@ class TGN(BaseDynamicGNN):
         # edge_raw_features = self.edge_raw_features.to(device) if self.edge_raw_features is not None else None
         
         # Ensure raw features are on same device
-        if self.node_raw_features is not None:
-            if self.node_raw_features.device != device:
-                self.node_raw_features = self.node_raw_features.to(device)
+        # if self.node_raw_features is not None:
+        #     if self.node_raw_features.device != device:
+        #         self.node_raw_features = self.node_raw_features.to(device)
 
         
         # Get raw features
@@ -692,23 +675,28 @@ class TGN(BaseDynamicGNN):
         }
     
     def validation_step(self, batch, batch_idx):
-        """Compute and log validation metrics."""
         logits = self.forward(batch)
         labels = batch['labels'].float()
-        
-        # Compute loss (already logged by base)
         loss = self.loss_fn(logits, labels)
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
-        
-        # Compute AP and log it
+
         probs = torch.sigmoid(logits)
-        from sklearn.metrics import average_precision_score
-        ap = average_precision_score(labels.cpu().numpy(), probs.detach().cpu().numpy())
+        # Use PyTorch AP (from _compute_metrics)
+        sorted_indices = torch.argsort(probs, descending=True)
+        sorted_labels = labels[sorted_indices]
+        cumulative_positives = torch.cumsum(sorted_labels, dim=0)
+        cumulative_predictions = torch.arange(1, len(labels) + 1, device=self.device, dtype=torch.float)
+        precisions = cumulative_positives / cumulative_predictions
+        ap = precisions.mean()
         self.log('val_ap', ap, prog_bar=True, sync_dist=True)
-        
         return loss
     
     
+    def on_fit_start(self):
+        super().on_fit_start()
+        if self.use_memory and self.memory is not None:
+            self.memory.__init_memory__()
+
     def on_train_batch_start(self, batch, batch_idx):
         """Verify memory is updating."""
         if self.use_memory and self.memory is not None:
@@ -728,35 +716,41 @@ class TGN(BaseDynamicGNN):
             for name, param in self.named_parameters():
                 if param.grad is not None:
                     total_grad_norm += param.grad.norm().item()
-            print(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
+            logger.debug(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
             if hasattr(self, '_memory_before_update'):
                 mem_update = torch.norm(self.memory.memory - self._memory_before_update)
-                print(f"Memory update norm = {mem_update:.4f}") 
+                logger.debug(f"Memory update norm = {mem_update:.4f}") 
     
     
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self.train_batch_counter = 0
-        logger.info(f"✓ Training epoch start - Memory state preserved (size={self.memory.memory.shape[0]})")
-
-    # def on_validation_epoch_start(self):
-    #     if self.use_memory:
-    #         self.memory.__init_memory__()
+        logger.info(f" Training epoch start - Memory state preserved (size={self.memory.memory.shape[0]})")
+        
     
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
-        # self._reset_memory("validation")
         if self.use_memory:
-            self.memory.__init_memory__()
-            logger.info(" Memory reset for validation (prevents training leakage)")
-
+            # Clone memory for validation, DON'T reset training memory
+            self._validation_memory = self.memory.memory.clone().detach()
+            self._validation_last_update = self.memory.last_update.clone().detach()
+            logger.info(" Cloned memory for validation (preserves training state)")
+    
+    def on_validation_epoch_end(self):
+        super().on_validation_epoch_end()
+        if self.use_memory:
+            # Restore training memory after validation
+            self.memory.memory.data.copy_(self._validation_memory)
+            self.memory.last_update.data.copy_(self._validation_last_update)
+            logger.info(" Restored training memory after validation")   
+    
+  
     def on_test_epoch_start(self):
-        super().on_test_epoch_start()
-        # self._reset_memory("test")
+        super().on_test_epoch_start()        
         if self.use_memory:
             self.memory.__init_memory__()
-            logger.info(" Memory reset for test (prevents training leakage)")
+        logger.info(" Memory reset for TEST (cold-start evaluation - prevents temporal leakage)")
 
     
 

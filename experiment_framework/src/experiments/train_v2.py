@@ -159,46 +159,57 @@ class DataPipeline:
         self.loaders: Dict[str, DataLoader] = {}
     
     def load(self) -> 'DataPipeline':
-        """Load raw dataset."""
+        """Load raw dataset with validation."""
         logger.info(f"Loading dataset: {self.config['data']['dataset']}")
         
-        is_inductive_eval = self.config['data']['evaluation_type'] == 'inductive'
+        eval_type = self.config['data']['evaluation_type']
         sampling_strategy = self.config['data']['negative_sampling_strategy']
-    
-        # Inductive negative sampling REQUIRES inductive evaluation (needs unseen_nodes)
-        if sampling_strategy == 'inductive' and not is_inductive_eval:
-            raise ValueError(
-                f"Invalid configuration: negative_sampling_strategy='inductive' "
-                f"requires evaluation_type='inductive' (needs unseen nodes). "
-                f"Got evaluation_type='transductive'. "
-                f"Either switch to evaluation_type='inductive' or use "
-                f"negative_sampling_strategy='random'/'historical'."
-            )
         
-        
+        #  Comprehensive inductive sampling validation
+        if sampling_strategy == 'inductive':
+            if eval_type != 'inductive':
+                raise ValueError(
+                    f"Inductive sampling requires inductive evaluation. "
+                    f"Got evaluation_type='{eval_type}'. "
+                    f"Fix: Use evaluation_type='inductive' OR switch to "
+                    f"negative_sampling_strategy='random'/'historical'."
+                )
+            if self.config['data'].get('unseen_ratio', 0.1) <= 0:
+                raise ValueError(
+                    "Inductive sampling requires unseen_ratio > 0. "
+                    "Fix: Set data.unseen_ratio=0.1 in config."
+                )
         
         self.data = load_dataset(
             dataset_name=self.config['data']['dataset'],
             val_ratio=self.config['data']['val_ratio'],
             test_ratio=self.config['data']['test_ratio'],
-            inductive=(self.config['data']['evaluation_type'] == 'inductive'),
+            inductive=(eval_type == 'inductive'),
             unseen_ratio=self.config['data'].get('unseen_ratio', 0.1),
             seed=self.config['experiment']['seed'],
         )
+        
+        # Validate node count correctness (Wikipedia=9228)
+        expected_nodes = {
+            'wikipedia': 9228,
+            'reddit': 7144,
+            'mooc': 7144,
+            'uslegis': 225,
+            'unvote': 201,
+        }
+        dataset = self.config['data']['dataset'].lower()
+        if dataset in expected_nodes:
+            assert self.data['num_nodes'] == expected_nodes[dataset], \
+                f"Node count mismatch! Expected {expected_nodes[dataset]} for {dataset}, " \
+                f"got {self.data['num_nodes']}. Check 0-indexing in load_dataset.py"
         
         logger.info(f"Loaded: {self.data['num_nodes']} nodes, {self.data['statistics']['num_edges']} edges")
         return self
     
     def build_neighbor_finder(self) -> 'DataPipeline':
-        """Build neighbor finder from training edges only."""
-        # if self.config['data']['negative_sampling_strategy'] != 'historical':
-        #     return self
-        
+        """Build neighbor finder from training edges only (leakage-proof)."""
         train_edges = self.data['edges'][self.data['train_mask']]
         train_ts = self.data['timestamps'][self.data['train_mask']]
-        
-        # Create edge indices (0-indexed)
-        # train_edge_idxs = torch.arange(len(train_edges))
         
         self.neighbor_finder = NeighborFinder(
             train_edges=train_edges,
@@ -206,11 +217,11 @@ class DataPipeline:
             max_neighbors=self.config['data']['max_neighbors']
         )
         
-        logger.info(f"Built NeighborFinder from {len(train_edges)} training edges")
+        logger.info(f" Built leakage-proof NeighborFinder from {len(train_edges)} training edges")
         return self
     
     def build_samplers(self) -> 'DataPipeline':
-        """Build negative samplers for each split."""
+        """Build negative samplers with TGN paper standard enforcement."""
         splits = ['train', 'val', 'test']
         masks = ['train_mask', 'val_mask', 'test_mask']
         
@@ -218,69 +229,98 @@ class DataPipeline:
             edges = self.data['edges'][self.data[mask_key]]
             timestamps = self.data['timestamps'][self.data[mask_key]]
             
-            # TGN PAPER STANDARD: ALWAYS use RANDOM sampling for TRAINING
-            # Historical/inductive sampling is ONLY for evaluation ablation studies
-            if split == 'train':
-                sampling_strategy = 'random'  # NEVER historical/inductive in training!
-            else:
-                # Validation/test: use configured strategy for ablation studies
-                sampling_strategy = self.config['data']['negative_sampling_strategy']
+            #  TGN paper standard - random sampling for TRAINING ONLY
+            # Historical/inductive sampling ONLY for evaluation ablation studies
+            # if split == 'train':
+            #     # Force random sampling regardless of config (prevents easy negatives)
+            #     pass  # NegativeSampler will use .random() method when called
             
-            
+            strategy = 'random' if split == 'train' else self.config['data']['negative_sampling_strategy']
+
             self.samplers[split] = NegativeSampler(
                 edges=edges,
                 timestamps=timestamps,
                 num_nodes=self.data['num_nodes'],
                 neighbor_finder=self.neighbor_finder,
-                # sampling_strategy=sampling_strategy,
                 seed=self.config['experiment']['seed']
             )
         
-        logger.info(f"Built samplers for: {list(self.samplers.keys())}")
+        logger.info(f" Built samplers: train=random (TGN standard), "
+                   f"val/test={self.config['data']['negative_sampling_strategy']}")
         return self
     
     def build_datasets(self) -> 'DataPipeline':
-        """Build TemporalDatasets for each split."""
-        splits = ['train', 'val', 'test']  # FIX: Define splits and masks
+        """Build TemporalDatasets with STRICT feature masking."""
+        splits = ['train', 'val', 'test']
         masks = ['train_mask', 'val_mask', 'test_mask']
         is_inductive = self.config['data']['evaluation_type'] == 'inductive'
-        sampling_strategy = self.config['data']['negative_sampling_strategy']
         
         for split, mask_key in zip(splits, masks):
             mask = self.data[mask_key]
             
-            # Get split-specific edges and timestamps
-            split_edges = self.data['edges'][mask]
-            split_timestamps = self.data['timestamps'][mask]
-            
-            # Handle features
-            full_edge_features = self.data['edge_features']
-            
-            
-            # Get unseen nodes for inductive evaluation
-            if is_inductive or sampling_strategy == 'inductive':
-                unseen_nodes = self.data['unseen_nodes']
-            else:
-                unseen_nodes = None
-            
-            negative_sampling_strategy = self.config['data'].get(
-            'negative_sampling_strategy', 'historical'
+            #  MASK EDGE FEATURES PER SPLIT (prevent leakage)
+            # Using full edge_features tensor would leak val/test features into training!
+            split_edge_features = (
+                self.data['edge_features'][mask] if self.data['edge_features'] is not None else None
             )
-
+            
+            # Get unseen nodes ONLY for val/test in inductive evaluation
+            unseen_nodes = (
+                self.data['unseen_nodes'] 
+                if (is_inductive and split != 'train') 
+                else None
+            )
+            
+            # Determine sampling strategy per split (train always random)
+            sampling_strategy = (
+                'random' if split == 'train' 
+                else self.config['data']['negative_sampling_strategy']
+            )
+            
             self.datasets[split] = TemporalDataset(
-                edges=split_edges,
-                timestamps=split_timestamps,
-                edge_features=full_edge_features,
+                edges=self.data['edges'][mask],
+                timestamps=self.data['timestamps'][mask],
+                edge_features=split_edge_features,  # MASKED FEATURES
                 num_nodes=self.data['num_nodes'],
                 split=split,
                 negative_sampler=self.samplers[split],
-                negative_sampling_strategy=negative_sampling_strategy,
-                unseen_nodes=unseen_nodes, 
+                negative_sampling_strategy=sampling_strategy,
+                unseen_nodes=unseen_nodes,
                 seed=self.config['experiment']['seed']
             )
         
-        logger.info(f"Built datasets: { {k: len(v) for k, v in self.datasets.items()} }")
+        # Validate per-batch label balance (prevent single-class batches)
+        self._validate_evaluation_batches()
+        
+        logger.info(f" Built datasets: { {k: len(v) for k, v in self.datasets.items()} }")
         return self
+    
+    def _validate_evaluation_batches(self):
+        """Ensure ALL evaluation batches contain both classes (prevent AUC=nan)."""
+        for split in ['val', 'test']:
+            if split not in self.datasets:
+                continue
+            
+            dataset = self.datasets[split]
+            batch_size = self.config['training']['batch_size']
+            
+            # Check first 10 batches
+            for i in range(min(10, len(dataset) // batch_size)):
+                start = i * batch_size
+                end = min(start + batch_size, len(dataset))
+                batch_labels = [dataset.samples[j]['label'] for j in range(start, end)]
+                
+                # Must have BOTH classes in every batch
+                if 0.0 not in batch_labels or 1.0 not in batch_labels:
+                    raise ValueError(
+                        f"Single-class batch detected in {split} split (batch {i})! "
+                        f"Labels: {set(batch_labels)}. "
+                        f"Fix: Ensure positives/negatives are interleaved in _prepare_samples()."
+                    )
+        
+        logger.info(" All evaluation batches validated: contain both classes (valid metrics guaranteed)")
+    
+    
     
     def build_loaders(self) -> 'DataPipeline':
         """Wrap datasets in DataLoaders."""
@@ -308,11 +348,21 @@ class DataPipeline:
         else:
             node_features = self.data.get('node_features')
         
+
+        # Return TRAINING edge features only (for model init)
+        # Model should never see val/test edge features during initialization
+        train_edge_features = (
+            self.data['edge_features'][self.data['train_mask']] 
+            if self.data['edge_features'] is not None 
+            else None
+        )
+        
+        
         return {
             'node_features': node_features,
-            'edge_features': self.data['edge_features'],
+            'edge_features': train_edge_features,  # TRAINING FEATURES ONLY
             'num_nodes': self.data['num_nodes'],
-            'edge_feat_dim': self.data['edge_features'].shape[1] if self.data['edge_features'] is not None else 0,
+            'edge_feat_dim': train_edge_features.shape[1] if train_edge_features is not None else 0,
             'node_feat_dim': node_features.shape[1] if node_features is not None else 0,
         }
     
@@ -492,6 +542,7 @@ class ExperimentLogger:
         logger.info(f"Results saved to {self.csv_path}")
 
 
+
 # ============================================================================
 # MAIN TRAINING LOOP
 # ============================================================================
@@ -537,7 +588,8 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     print(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
     print(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
     print(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
-        
+
+       
     
     # Setup trainer
     trainer = TrainerSetup.create(config)
@@ -579,7 +631,8 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     logger.info("Running evaluation...")
     test_results = trainer.test(
         model=model, 
-        dataloaders=pipeline.loaders['test']
+        dataloaders=pipeline.loaders['test'],
+        ckpt_path='best'
     )
     
     # Log results

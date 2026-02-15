@@ -34,13 +34,14 @@ class SequenceMemoryUpdater(MemoryUpdater):
     #         return
 
     # Update memory for valid entries
-    # with torch.no_grad():
+    
     memory = self.memory.get_memory(unique_node_ids)
     # GRU call is differentiable – gradients flow through messages!
     updated_memory = self.memory_updater(unique_messages, memory)
+    with torch.no_grad():
     # in‑place assignment on a non‑differentiable tensor 
-    self.memory.memory.data[unique_node_ids] = updated_memory
-    self.memory.last_update.data[unique_node_ids] = timestamps
+      self.memory.memory[unique_node_ids] = updated_memory
+      self.memory.last_update.data[unique_node_ids] = timestamps
 
 def get_updated_memory(self, unique_node_ids, unique_messages, timestamps):
     if len(unique_node_ids) <= 0:
