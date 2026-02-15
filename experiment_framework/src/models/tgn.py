@@ -408,9 +408,9 @@ class TGN(BaseDynamicGNN):
         timestamps = batch['timestamps']
         
         source_emb, dest_emb = self.compute_temporal_embeddings_pair(
-            source_nodes=src_nodes.cpu().numpy(),
-            destination_nodes=dst_nodes.cpu().numpy(),
-            edge_times=timestamps.cpu().numpy(),
+            source_nodes=src_nodes,
+            destination_nodes=dst_nodes,
+            edge_times=timestamps,
             n_neighbors=self.n_neighbors
         )
 
@@ -544,15 +544,16 @@ class TGN(BaseDynamicGNN):
     
     
     
-    def compute_temporal_embeddings_pair(self, source_nodes: np.ndarray,
-                                   destination_nodes: np.ndarray,
-                                   edge_times: np.ndarray,
+    def compute_temporal_embeddings_pair(self, 
+                                         source_nodes: torch.Tensor,
+                                   destination_nodes: torch.Tensor,
+                                   edge_times: torch.Tensor,
                                    n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = self.device
+        # device = self.device
         
-        n_samples = len(source_nodes)
-        src_tensor = torch.from_numpy(source_nodes).long().to(device)
-        dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
+        # n_samples = len(source_nodes)
+        # src_tensor = torch.from_numpy(source_nodes).long().to(device)
+        # dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
         # edge_time_tensor = torch.from_numpy(edge_times).float().to(device)
 
         # node_raw_features = self.node_raw_features.to(device) if self.node_raw_features is not None else None
@@ -565,15 +566,24 @@ class TGN(BaseDynamicGNN):
 
         
         # Get raw features
-        if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-            src_feat = self.node_raw_features[src_tensor]
-            dst_feat = self.node_raw_features[dst_tensor]            
-        else:
-            src_feat = self.node_embedding(src_tensor)
-            dst_feat = self.node_embedding(dst_tensor)
+        # if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+        #     src_feat = self.node_raw_features[src_tensor]
+        #     dst_feat = self.node_raw_features[dst_tensor]            
+        # else:
+        #     src_feat = self.node_embedding(src_tensor)
+        #     dst_feat = self.node_embedding(dst_tensor)
 
         
-        if self.embedding_module is not None:           
+        if self.embedding_module is not None:
+            device = self.device
+
+            src_feat = (self.node_raw_features[source_nodes]
+                    if self.node_raw_features is not None
+                    else self.node_embedding(source_nodes))
+            dst_feat = (self.node_raw_features[destination_nodes]
+                        if self.node_raw_features is not None
+                        else self.node_embedding(destination_nodes))
+            return src_feat, dst_feat           
             
             # Ensure we're passing tensors on the correct device
             # source_nodes_tensor = torch.from_numpy(source_nodes).long().to(device)
@@ -583,35 +593,51 @@ class TGN(BaseDynamicGNN):
             # source_memory = self.memory.get_memory(source_nodes_tensor)
             # destination_memory = self.memory.get_memory(destination_nodes_tensor)
 
-            full_memory = self.memory.memory if self.memory is not None else None   
+        #     full_memory = self.memory.memory if self.memory is not None else None   
             
-            # Use full attention-based embeddings with neighbor sampling
-            source_emb = self.embedding_module.compute_embedding(
-                # memory= full_memory,
-                memory= self.memory,
-                source_nodes=source_nodes,
-                timestamps=edge_times,
-                n_layers=self.num_layers,
-                n_neighbors=n_neighbors
-            )
-            destination_emb = self.embedding_module.compute_embedding(
-                memory= self.memory,
-                # memory= destination_memory,
-                source_nodes=destination_nodes,
-                timestamps=edge_times,
-                n_layers=self.num_layers,
-                n_neighbors=n_neighbors
-            )
-            return source_emb, destination_emb
-        else:
-            # Fallback: use features only
-            src_emb = src_feat
-            dst_emb = dst_feat
-            if src_emb.shape[-1] != self.hidden_dim:
-                src_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
-                dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
+        #     # Use full attention-based embeddings with neighbor sampling
+        #     source_emb = self.embedding_module.compute_embedding(
+        #         # memory= full_memory,
+        #         memory= self.memory,
+        #         source_nodes=source_nodes,
+        #         timestamps=edge_times,
+        #         n_layers=self.num_layers,
+        #         n_neighbors=n_neighbors
+        #     )
+        #     destination_emb = self.embedding_module.compute_embedding(
+        #         memory= self.memory,
+        #         # memory= destination_memory,
+        #         source_nodes=destination_nodes,
+        #         timestamps=edge_times,
+        #         n_layers=self.num_layers,
+        #         n_neighbors=n_neighbors
+        #     )
+        #     return source_emb, destination_emb
+        # else:
+        #     # Fallback: use features only
+        #     src_emb = src_feat
+        #     dst_emb = dst_feat
+        #     if src_emb.shape[-1] != self.hidden_dim:
+        #         src_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
+        #         dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
 
-        return src_emb, dst_emb  
+        # Pass tensors directly to the embedding module
+        source_emb = self.embedding_module.compute_embedding(
+            memory=self.memory,
+            source_nodes=source_nodes,      # tensor
+            timestamps=edge_times,          # tensor
+            n_layers=self.num_layers,
+            n_neighbors=n_neighbors
+        )
+        destination_emb = self.embedding_module.compute_embedding(
+            memory=self.memory,
+            source_nodes=destination_nodes,
+            timestamps=edge_times,
+            n_layers=self.num_layers,
+            n_neighbors=n_neighbors
+        )
+        
+        return source_emb, destination_emb  
          
     
     
