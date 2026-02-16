@@ -5,7 +5,7 @@ set -e
 CONFIG="experiment_framework/configs/tgn_config.yaml"
 SCRIPT="experiment_framework/src/experiments/train.py"
 
-DATASETS=("wikipedia" "reddit" "mooc" "lastfm" "uci")
+DATASETS=("wikipedia" "Contacts" "CanParl" "Flights" "myket" "UNtrade" "USLegis" "reddit" "mooc" "lastfm")
 EVAL_TYPES=("transductive" "inductive")
 SEEDS=(42 43 44)
 

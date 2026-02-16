@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from loguru import logger
 from collections import defaultdict
 
-from .base_model import BaseDynamicGNN
+from .base_model import BaseDynamicGNN, TimeEncoder
 from .tgn_module.temporal_attention import TemporalAttentionLayer, MergeLayer
 from .tgn_module.memory import Memory
 from .tgn_module.memory_updater import get_memory_updater
@@ -104,6 +104,11 @@ class TGN(BaseDynamicGNN):
         # Add layer norm to attention
         self.attention_norm = nn.LayerNorm(hidden_dim)
         
+        # Always initialize node embedding layer (even when node_features>0)
+        # Required for structural datasets and Wikipedia (no raw features)
+        self.node_embedding = nn.Embedding(self.num_nodes, self.hidden_dim)
+        
+        
         # Initialize modules
         self._init_modules()
 
@@ -114,7 +119,12 @@ class TGN(BaseDynamicGNN):
         if self.use_memory and self.node_features == 0:
             self.node_embedding = nn.Embedding(self.num_nodes, self.hidden_dim)
 
-       
+        #  Ensure time encoder matches config dimension
+        self.time_encoding_dim = time_encoding_dim  # Store for message function
+        
+        # Initialize time encoder with EXACT config dimension
+        self.time_encoder = TimeEncoder(time_dim=time_encoding_dim)
+        logger.info(f" Time encoder initialized with dim={time_encoding_dim}")
         # self.link_predictor = MergeLayer()
 
         self.link_predictor = nn.Sequential(
@@ -136,509 +146,7 @@ class TGN(BaseDynamicGNN):
         self.train_batch_counter = 0
         logger.info(f"TGN initialized with use_memory={self.use_memory}")       
 
-    # Add these methods to your TGN class (after __init__)
-    # def __getstate__(self):
-    #     """Preserve critical parameters during pickling/reconstruction."""
-    #     state = self.__dict__.copy()
-    #     # Backup critical parameters that Lightning often corrupts
-    #     state['_num_nodes_backup'] = self.num_nodes
-    #     state['_edge_features_dim_backup'] = self.edge_features_dim
-    #     state.pop('_memory_initialized', None)
-    #     return state
-
-    # def __setstate__(self, state):
-    #     """Restore state with validation to prevent corruption."""
-    #     # Extract backups BEFORE updating state
-    #     num_nodes_backup = state.pop('_num_nodes_backup', None)
-    #     edge_dim_backup = state.pop('_edge_features_dim_backup', None)
-
-   
-        
-    #     # Update instance dictionary
-    #     self.__dict__.update(state)
-        
-    #     self._memory_initialized = False 
-     
-        
-
-    #     if num_nodes_backup is not None and getattr(self, 'num_nodes', 0) < 2:
-    #         self.num_nodes = num_nodes_backup
-    #         if self.use_memory and hasattr(self, 'memory'):
-    #             self._init_modules()       
-
-    #     if edge_dim_backup is not None:
-    #         self.edge_features_dim = edge_dim_backup
-
-
-    def _init_weights(self):
-        """Initialize weights for better convergence."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
-    def set_neighbor_finder(self, neighbor_finder):
-        """Initialize embedding module AFTER model reconstruction."""
-        self.neighbor_finder = neighbor_finder
-        
-        # Only initialize embedding module if features are already set        
-        # Validate interface
-        required = ['find_neighbors', 'get_temporal_neighbor']
-        for method in required:
-            if not hasattr(neighbor_finder, method):
-                raise ValueError(f"NeighborFinder missing: {method}")
-        
-        # FIXED: Initialize even without node features
-        if self.edge_raw_features is not None and neighbor_finder is not None:
-            self._init_embedding_module()
-        else:
-            logger.warning(f"Cannot initialize embedding module: "
-                        f"edge_raw_features={self.edge_raw_features is not None}, "
-                        f"neighbor_finder={neighbor_finder is not None}")
-        
-       
-
-    def _init_embedding_module(self):
-        """Initialize embedding module with CORRECT feature dimensions."""
-        device = self.device
-        
-        logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
-        
-        # Handle Wikipedia (no node features)
-        # Handle case where node features are None (Wikipedia)
-        if self.node_raw_features is None:
-            logger.warning("Node features are None! Using node embedding layer for embedding module.")
-            # Use the node embedding layer's weight as node features
-            node_features = self.node_embedding.weight  # Shape: [num_nodes, hidden_dim]
-        else:
-            node_features = self.node_raw_features
-        logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
-
-        self.embedding_module = get_embedding_module(
-            module_type=self.embedding_module_type,
-            node_features=node_features,
-            edge_features=self.edge_raw_features,
-            memory=self.memory,
-            neighbor_finder=self.neighbor_finder,
-            time_encoder=self.time_encoder,
-            n_layers=self.num_layers,
-            n_node_features=self.hidden_dim,
-            n_edge_features=self.edge_features_dim,  # CORRECT dimension (4 for MOOC, 172 for Wikipedia)
-            n_time_features=self.time_encoding_dim,
-            embedding_dimension=self.hidden_dim,
-            device=device,
-            n_heads=self.n_heads,
-            dropout=self.dropout,
-            n_neighbors=self.n_neighbors,
-            use_memory=self.use_memory
-        )
-        logger.info(f"Embedding module initialized: {self.embedding_module is not None}")
-
-    def _init_modules(self):
-        """Initialize TGN modules"""
-        device = self.device
-        
-        # CRITICAL DEBUG: Log actual num_nodes during initialization
-        # print(f"DEBUG: _init_modules() called with num_nodes={self.num_nodes}, "
-        #   f"device={device}, has_neighbor_finder={self.neighbor_finder is not None}")
-        
-        
-        # if self.num_nodes < 1000:
-        #     raise RuntimeError(
-        #         f"TGN._init_modules() called with num_nodes={self.num_nodes}! "
-        #         f"This indicates BaseDynamicGNN still calls save_hyperparameters(). "
-        #         f"FIX: Remove self.save_hyperparameters() from BaseDynamicGNN.__init__(). "
-        #         f"Current hparams: {getattr(self, 'hparams', 'MISSING')}"
-        #     )
-        
-        # CRITICAL DEBUG
-        logger.debug(f"DEBUG: use_memory={self.use_memory}, memory_updater_type={self.memory_updater_type}")
-
-        # Memory module
-        if self.use_memory:
-            self.memory = Memory(
-                n_nodes=self.num_nodes,
-                memory_dimension=self.memory_dim,
-                input_dimension=self.message_dim + self.time_encoding_dim,
-                message_dimension=self.message_dim,
-                device=device
-            )
-        else:
-            self.memory = None
-
-                
-        # Message aggregator
-        self.message_aggregator = get_message_aggregator(
-            aggregator_type=self.aggregator_type,
-            device=device
-        )
-        
-        # Memory updater
-        if self.use_memory:
-            self.memory_updater = get_memory_updater(
-                module_type=self.memory_updater_type,
-                memory=self.memory,
-                message_dim=self.message_dim,
-                memory_dim=self.memory_dim,
-                device=device
-            )
-        else:
-            self.memory = None
-            self.memory_updater = None        
-
-        self.embedding_module = None
-        # Message function will be initialized after raw features are set
-        self.message_fn = None
-
-    def set_raw_features(self, node_raw_features: Optional[torch.Tensor], edge_raw_features: torch.Tensor):
-        """Set raw features as buffers for automatic device management."""
-        device = self.device
-
-        # Helper to remove any existing buffer/attribute with the same name
-        def _safe_remove(name):
-            if name in self._buffers:
-                del self._buffers[name]
-            if hasattr(self, name):
-                delattr(self, name)
-
-        # Handle node features
-        _safe_remove('node_raw_features')
-        if node_raw_features is not None:
-            self.register_buffer('node_raw_features', node_raw_features.to(device))
-        else:
-            self.node_raw_features = None   # plain attribute (None)
-
-        # Handle edge features
-        _safe_remove('edge_raw_features')
-        if edge_raw_features is not None:
-            self.register_buffer('edge_raw_features', edge_raw_features.to(device))
-        else:
-            self.edge_raw_features = None
-
-        logger.info(f"Set raw features: Node={self.node_raw_features.shape if self.node_raw_features is not None else None}, "
-                    f"Edge={self.edge_raw_features.shape if self.edge_raw_features is not None else None}")
-
-        self._init_message_function()
-        if self.message_fn is None:
-            raise RuntimeError("Failed to initialize message_fn in set_raw_features")
-    
-    def _init_message_function(self):
-        """Initialize message function with correct dimensions."""        
-        # Calculate actual message dimension
-        if self.node_raw_features is not None and len(self.node_raw_features.shape) > 1:
-            node_feat_dim = self.node_raw_features.shape[1]
-        else:
-            node_feat_dim = self.hidden_dim # changed from self.node_features
-
-        # Edge feature dimension (now dynamic!)
-        edge_feat_dim = self.edge_features_dim    
-        
-        # Raw message dimension: [src_features, dst_features, src_memory, dst_memory, time_enc]
-        raw_message_dim = (
-            # node_feat_dim * 2 + # src + dst node features
-            self.memory_dim * 2 + # src + dst memory
-            self.time_encoding_dim + # time encoding
-            edge_feat_dim # edge features
-        )
-        
-        # Ensure raw_message_dim is positive
-        if raw_message_dim <= 0:
-            raw_message_dim = self.message_dim
-
-        # logger.info(f"Message function: input_dim={raw_message_dim}")
-        
-        
-        # If it prints something like Message function input dim: 360, then node_feat_dim=0 → features not loaded.
-        logger.info(f"Message function input dim: {raw_message_dim} "
-          f"(node={node_feat_dim}, mem={self.memory_dim}, "
-          f"time={self.time_encoding_dim}, edge={edge_feat_dim})")       
-
-
-        self.message_fn = get_message_function(
-            module_type=self.message_function_type,
-            raw_message_dimension=raw_message_dim,
-            message_dimension=self.message_dim
-        )
-
-        if self.message_fn is None:
-            raise RuntimeError("get_message_function returned None")
-
-        self.message_fn = self.message_fn.to(self.device)
-        # print(f" Message function initialized: {self.message_fn}")        
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Forward pass of TGN."""       
-        device = self.device        
-        
-        # DEBUG: Check if embedding module exists
-        if self.embedding_module is None:
-            logger.error("CRITICAL: Embedding module is None! Using fallback features only.")
-            logger.error(f"node_raw_features: {self.node_raw_features is not None}")
-            logger.error(f"edge_raw_features: {self.edge_raw_features is not None}")
-            logger.error(f"neighbor_finder: {self.neighbor_finder is not None}")
-        
-        
-        # PHASE 0: Update memory from previous batch's messages
-       
-
-        # # PHASE 1: Compute messages for CURRENT batch
-       
-        
-        
-        # # PHASE 1: Apply pending memory updates from PREVIOUS batch
-       
-        
-        
       
-        
-        
-        # Guard: ensure message_fn is initialized
-        # if self.message_fn is None:
-        #     raise RuntimeError(
-        #         "message_fn is not initialized! "
-        #         "Ensure set_raw_features() is called before forward(). "
-        #         f"node_raw_features: {self.node_raw_features is not None}, "
-        #         f"edge_raw_features: {self.edge_raw_features is not None}"
-        #     )
-        
-        # PHASE 2: Compute embeddings with current memory
-        src_nodes = batch['src_nodes']
-        dst_nodes = batch['dst_nodes']
-        timestamps = batch['timestamps']
-        
-        source_emb, dest_emb = self.compute_temporal_embeddings_pair(
-            source_nodes=src_nodes,
-            destination_nodes=dst_nodes,
-            edge_times=timestamps,
-            n_neighbors=self.n_neighbors
-        )
-
-        if self.training and self.use_memory:
-            self._compute_and_store_messages(batch)
-            self._aggregate_and_update_memory()   
-        
-        # DEBUG: Check embeddings
-        if torch.all(source_emb == 0) or torch.all(dest_emb == 0):
-            logger.warning("All-zero embeddings detected!")
-        
-        # PHASE 3: Predict
-        combined = torch.cat([source_emb, dest_emb], dim=-1)
-        scores = self.link_predictor(combined).squeeze(-1)
-        
-        # PHASE 4: Store messages for NEXT batch (don't apply yet)
-        if self.training and self.use_memory and self.memory is not None:
-            # with torch.no_grad():
-            
-            self._memory_initialized = True
-            self.train_batch_counter += 1
-        return scores
-
-    def _compute_and_store_messages(self, batch):
-        """Compute messages from this batch for NEXT memory update."""
-        if not self.use_memory or self.memory is None:
-            logger.warning("WARNING: Trying to store messages but use_memory=False or memory=None")
-            return
-        
-        device = self.device
-        
-        src_nodes = batch['src_nodes'].to(device)
-        dst_nodes = batch['dst_nodes'].to(device)
-        timestamps = batch['timestamps'].to(device)
-        
-        # print(f"DEBUG: Storing messages for {len(src_nodes)} source nodes")
-        # print(f"DEBUG: Message function exists: {self.message_fn is not None}")
-        # print(f"DEBUG: Memory exists: {self.memory is not None}")
-        
-        
-        # Get features
-        if self.node_raw_features is not None:
-            src_features = self.node_raw_features[src_nodes]
-            dst_features = self.node_raw_features[dst_nodes]
-        else:
-            src_features = self.node_embedding(src_nodes)
-            dst_features = self.node_embedding(dst_nodes)
-        
-        # Use SAME edge features for both directions (TGN standard)
-        if 'edge_features' in batch and batch['edge_features'] is not None:
-            edge_feats = batch['edge_features']
-        else:
-            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=device)
-        
-        # Get memory states
-        src_memory = self.memory.get_memory(src_nodes)
-        dst_memory = self.memory.get_memory(dst_nodes)
-        time_enc = self.time_encoder(timestamps)
-        
-        # Compute messages
-        src_msg_input = torch.cat([ src_memory, dst_memory, time_enc, edge_feats], dim=-1)
-        dst_msg_input = torch.cat([ dst_memory, src_memory, time_enc, edge_feats], dim=-1)
-        
-        src_messages = self.message_fn(src_msg_input)
-        dst_messages = self.message_fn(dst_msg_input)
-        
-        # ----- Store in Memory.messages -----
-        node_id_to_messages = {}
-        for node, msg, ts in zip(src_nodes, src_messages, timestamps):
-            node_id_to_messages.setdefault(
-                node.item(), []).append(
-                    (msg, ts.item()))
-        for node, msg, ts in zip(dst_nodes, dst_messages, timestamps):
-            node_id_to_messages.setdefault(
-                node.item(), []).append(
-                    (msg, ts.item()))
-
-        self.memory.store_raw_messages(
-            list(node_id_to_messages.keys()), 
-            node_id_to_messages
-        )         
-    
-    def _aggregate_and_update_memory(self):
-        """Aggregate all stored messages per node and update memory, then clear them."""
-        device = self.device
-        if not self.use_memory or self.memory is None:
-            return
-
-        if self.training:
-            self._memory_before_update = self.memory.memory.clone().detach()
-        
-        nodes_with_messages = list(self.memory.messages.keys())
-        if not nodes_with_messages:
-            return
-
-        node_ids = []
-        messages_list = []
-        timestamps_list = []
-
-        for node in nodes_with_messages:
-            node_msgs = self.memory.messages[node]
-            if not node_msgs:
-                continue
-            msgs = torch.stack([msg for msg, _ in node_msgs]).to(device)
-            ts = torch.tensor([ts for _, ts in node_msgs], dtype=torch.float32, device=device)
-            node_ids.append(node)
-            messages_list.append(msgs)
-            timestamps_list.append(ts)
-
-        unique_nodes, unique_messages, unique_timestamps = self.message_aggregator.aggregate(
-            node_ids=node_ids,
-            messages=messages_list,
-            timestamps=timestamps_list
-        )
-
-        if len(unique_nodes) > 0:
-            unique_nodes_t = torch.tensor(unique_nodes, device=device)
-            unique_messages = unique_messages.to(device)
-            unique_timestamps = unique_timestamps.to(device)
-
-            self.memory_updater.update_memory(
-                unique_node_ids=unique_nodes_t,
-                unique_messages=unique_messages,
-                timestamps=unique_timestamps
-            )
-
-        
-
-        # Clear processed messages
-        self.memory.clear_messages(nodes_with_messages)
-    
-    
-    
-    def compute_temporal_embeddings_pair(self, 
-                                         source_nodes: torch.Tensor,
-                                   destination_nodes: torch.Tensor,
-                                   edge_times: torch.Tensor,
-                                   n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
-        # device = self.device
-        
-        # n_samples = len(source_nodes)
-        # src_tensor = torch.from_numpy(source_nodes).long().to(device)
-        # dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
-        # edge_time_tensor = torch.from_numpy(edge_times).float().to(device)
-
-        # node_raw_features = self.node_raw_features.to(device) if self.node_raw_features is not None else None
-        # edge_raw_features = self.edge_raw_features.to(device) if self.edge_raw_features is not None else None
-        
-        # Ensure raw features are on same device
-        # if self.node_raw_features is not None:
-        #     if self.node_raw_features.device != device:
-        #         self.node_raw_features = self.node_raw_features.to(device)
-
-        
-        # Get raw features
-        # if self.node_features > 0 and hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
-        #     src_feat = self.node_raw_features[src_tensor]
-        #     dst_feat = self.node_raw_features[dst_tensor]            
-        # else:
-        #     src_feat = self.node_embedding(src_tensor)
-        #     dst_feat = self.node_embedding(dst_tensor)
-
-        
-        if self.embedding_module is not None:
-            device = self.device
-
-            src_feat = (self.node_raw_features[source_nodes]
-                    if self.node_raw_features is not None
-                    else self.node_embedding(source_nodes))
-            dst_feat = (self.node_raw_features[destination_nodes]
-                        if self.node_raw_features is not None
-                        else self.node_embedding(destination_nodes))
-            return src_feat, dst_feat           
-            
-            # Ensure we're passing tensors on the correct device
-            # source_nodes_tensor = torch.from_numpy(source_nodes).long().to(device)
-            # destination_nodes_tensor = torch.from_numpy(destination_nodes).long().to(device)
-            
-            # Get memory for source and destination nodes
-            # source_memory = self.memory.get_memory(source_nodes_tensor)
-            # destination_memory = self.memory.get_memory(destination_nodes_tensor)
-
-        #     full_memory = self.memory.memory if self.memory is not None else None   
-            
-        #     # Use full attention-based embeddings with neighbor sampling
-        #     source_emb = self.embedding_module.compute_embedding(
-        #         # memory= full_memory,
-        #         memory= self.memory,
-        #         source_nodes=source_nodes,
-        #         timestamps=edge_times,
-        #         n_layers=self.num_layers,
-        #         n_neighbors=n_neighbors
-        #     )
-        #     destination_emb = self.embedding_module.compute_embedding(
-        #         memory= self.memory,
-        #         # memory= destination_memory,
-        #         source_nodes=destination_nodes,
-        #         timestamps=edge_times,
-        #         n_layers=self.num_layers,
-        #         n_neighbors=n_neighbors
-        #     )
-        #     return source_emb, destination_emb
-        # else:
-        #     # Fallback: use features only
-        #     src_emb = src_feat
-        #     dst_emb = dst_feat
-        #     if src_emb.shape[-1] != self.hidden_dim:
-        #         src_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
-        #         dst_emb = torch.zeros(n_samples, self.hidden_dim, device=self.device)
-
-        # Pass tensors directly to the embedding module
-        source_emb = self.embedding_module.compute_embedding(
-            memory=self.memory,
-            source_nodes=source_nodes,      # tensor
-            timestamps=edge_times,          # tensor
-            n_layers=self.num_layers,
-            n_neighbors=n_neighbors
-        )
-        destination_emb = self.embedding_module.compute_embedding(
-            memory=self.memory,
-            source_nodes=destination_nodes,
-            timestamps=edge_times,
-            n_layers=self.num_layers,
-            n_neighbors=n_neighbors
-        )
-        
-        return source_emb, destination_emb  
-         
     
     
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -700,6 +208,362 @@ class TGN(BaseDynamicGNN):
             'loss': loss
         }
     
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def set_neighbor_finder(self, neighbor_finder):
+        self.neighbor_finder = neighbor_finder
+        required = ['find_neighbors', 'get_temporal_neighbor']
+        for method in required:
+            if not hasattr(neighbor_finder, method):
+                raise ValueError(f"NeighborFinder missing: {method}")
+
+        if self.edge_raw_features is not None and neighbor_finder is not None:
+            self._init_embedding_module()
+        else:
+            logger.warning(f"Cannot initialize embedding module: "
+                           f"edge_raw_features={self.edge_raw_features is not None}, "
+                           f"neighbor_finder={neighbor_finder is not None}")
+    
+    def _init_embedding_module(self):
+        device = self.device
+
+        if self.node_raw_features is not None:
+            node_feat_dim = self.node_raw_features.shape[1]
+            node_features = self.node_raw_features
+            logger.info(f" Using raw node features (dim={node_feat_dim})")
+        else:
+            node_feat_dim = self.hidden_dim
+            node_features = self.node_embedding.weight
+            logger.info(f" Using learned node embeddings (dim={node_feat_dim})")
+
+        logger.info(f"Initializing embedding module with edge_features_dim={self.edge_features_dim}")
+
+        self.embedding_module = get_embedding_module(
+            module_type=self.embedding_module_type,
+            node_features=node_features,
+            edge_features=self.edge_raw_features,
+            memory=self.memory,
+            neighbor_finder=self.neighbor_finder,
+            time_encoder=self.time_encoder,
+            n_layers=self.num_layers,
+            n_node_features=node_feat_dim,
+            n_edge_features=self.edge_features_dim,
+            n_time_features=self.time_encoding_dim,
+            embedding_dimension=self.hidden_dim,
+            device=device,
+            n_heads=self.n_heads,
+            dropout=self.dropout,
+            n_neighbors=self.n_neighbors,
+            use_memory=self.use_memory
+        )
+        logger.info(f"Embedding module initialized: node_dim={node_feat_dim}, edge_dim={self.edge_features_dim}")
+    
+    def _init_modules(self):
+        device = self.device
+        logger.debug(f"use_memory={self.use_memory}, memory_updater_type={self.memory_updater_type}")
+
+        if self.use_memory:
+            self.memory = Memory(
+                n_nodes=self.num_nodes,
+                memory_dimension=self.memory_dim,
+                input_dimension=self.message_dim + self.time_encoding_dim,
+                message_dimension=self.message_dim,
+                device=device
+            )
+        else:
+            self.memory = None
+
+        self.message_aggregator = get_message_aggregator(
+            aggregator_type=self.aggregator_type,
+            device=device
+        )
+
+        if self.use_memory:
+            self.memory_updater = get_memory_updater(
+                module_type=self.memory_updater_type,
+                memory=self.memory,
+                message_dim=self.message_dim,
+                memory_dim=self.memory_dim,
+                device=device
+            )
+        else:
+            self.memory = None
+            self.memory_updater = None
+
+        self.embedding_module = None
+        self.message_fn = None
+    
+    
+    def set_raw_features(self, node_raw_features: Optional[torch.Tensor], edge_raw_features: torch.Tensor):
+        device = self.device
+
+        if node_raw_features is not None:
+            self.node_raw_features = node_raw_features.to(device)
+        else:
+            self.node_raw_features = None
+
+        if edge_raw_features is not None:
+            self.edge_raw_features = edge_raw_features.to(device)
+        else:
+            self.edge_raw_features = None
+
+        logger.info(f" Set raw features on {device}: "
+                    f"Node={self.node_raw_features.shape if self.node_raw_features is not None else None}, "
+                    f"Edge={self.edge_raw_features.shape if self.edge_raw_features is not None else None}")
+
+        self._init_message_function()
+        if self.message_fn is None:
+            raise RuntimeError("Failed to initialize message_fn in set_raw_features")
+    
+    
+    def _init_message_function(self):
+        if self.node_raw_features is not None and len(self.node_raw_features.shape) > 1:
+            node_feat_dim = self.node_raw_features.shape[1]
+        else:
+            node_feat_dim = self.hidden_dim
+
+        # Use ACTUAL edge feature dimension from data
+        if self.edge_raw_features is not None:
+            edge_feat_dim = self.edge_raw_features.shape[1]
+        else:
+            edge_feat_dim = self.edge_features_dim
+
+        # Message dimension: [src_mem, dst_mem, time_enc, edge_feat] (NO node features per TGN paper)
+        raw_message_dim = (
+            self.memory_dim * 2 + 
+            self.time_encoding_dim + 
+            edge_feat_dim
+        )
+        
+        logger.info(f" Message function input dim: {raw_message_dim} "
+                f"(mem={self.memory_dim}*2, time={self.time_encoding_dim}, edge={edge_feat_dim})")
+
+        if raw_message_dim <= 0:
+            raw_message_dim = self.message_dim
+
+        logger.info(f"Message function input dim: {raw_message_dim} "
+                    f"(node={node_feat_dim}, mem={self.memory_dim}, "
+                    f"time={self.time_encoding_dim}, edge={edge_feat_dim})")
+
+        self.message_fn = get_message_function(
+            module_type=self.message_function_type,
+            raw_message_dimension=raw_message_dim,
+            message_dimension=self.message_dim
+        ).to(self.device)
+
+        if self.message_fn is None:
+            raise RuntimeError("get_message_function returned None")
+
+        self.message_fn = self.message_fn.to(self.device)
+    
+    
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        device = self.device
+
+        if self.embedding_module is None:
+            logger.error("CRITICAL: Embedding module is None! Using fallback features only.")
+            logger.error(f"node_raw_features: {self.node_raw_features is not None}")
+            logger.error(f"edge_raw_features: {self.edge_raw_features is not None}")
+            logger.error(f"neighbor_finder: {self.neighbor_finder is not None}")
+
+        src_nodes = batch['src_nodes']
+        dst_nodes = batch['dst_nodes']
+        timestamps = batch['timestamps']
+
+        source_emb, dest_emb = self.compute_temporal_embeddings_pair(
+            source_nodes=src_nodes,
+            destination_nodes=dst_nodes,
+            edge_times=timestamps,
+            n_neighbors=self.n_neighbors
+        )
+
+        if self.training and self.use_memory:
+            self._compute_and_store_messages(batch)
+            self._aggregate_and_update_memory()
+
+        if torch.all(source_emb == 0) or torch.all(dest_emb == 0):
+            logger.warning("All-zero embeddings detected!")
+
+        combined = torch.cat([source_emb, dest_emb], dim=-1)
+        scores = self.link_predictor(combined).squeeze(-1)
+
+        if self.training and self.use_memory and self.memory is not None:
+            self._memory_initialized = True
+            self.train_batch_counter += 1
+
+        return scores
+    
+    def _compute_and_store_messages(self, batch):
+        """Compute messages from this batch for NEXT memory update."""
+        if not self.use_memory or self.memory is None:
+            logger.warning("Trying to store messages but use_memory=False or memory=None")
+            return
+
+        device = self.device
+        src_nodes = batch['src_nodes'].to(device)
+        dst_nodes = batch['dst_nodes'].to(device)
+        timestamps = batch['timestamps'].to(device)
+
+        # if self.node_raw_features is not None:
+        #     src_features = self.node_raw_features[src_nodes]
+        #     dst_features = self.node_raw_features[dst_nodes]
+        # else:
+        #     src_features = self.node_embedding(src_nodes)
+        #     dst_features = self.node_embedding(dst_nodes)
+
+        # Get edge features with CORRECT dimension
+        if 'edge_features' in batch and batch['edge_features'] is not None:
+            edge_feats = batch['edge_features'].to(device)
+        else:
+            # Use dimension from initialization (prevents 100-dim leakage for UCI)
+            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=device)
+            logger.debug(f"Created {self.edge_features_dim}-dim dummy edge features for batch")
+        
+        
+        
+        # Get memory states (NO node features in messages - TGN spec)
+        src_memory = self.memory.get_memory(src_nodes)
+        dst_memory = self.memory.get_memory(dst_nodes)
+        time_enc = self.time_encoder(timestamps)
+
+        #  Runtime validation BEFORE message computation
+        expected_dim = self.memory_dim * 2 + self.time_encoding_dim + self.edge_features_dim
+        actual_dim = src_memory.size(1) + dst_memory.size(1) + time_enc.size(1) + edge_feats.size(1)
+        
+        if actual_dim != expected_dim:
+            # Diagnose root cause
+            time_dim_mismatch = time_enc.size(1) != self.time_encoding_dim
+            edge_dim_mismatch = edge_feats.size(1) != self.edge_features_dim
+            
+            error_msg = (
+                f"CRITICAL: Message dimension mismatch! Expected {expected_dim}, got {actual_dim}.\n"
+                f"  Memory: {src_memory.size(1)} + {dst_memory.size(1)} = {src_memory.size(1) + dst_memory.size(1)}\n"
+                f"  Time: {time_enc.size(1)} (config: {self.time_encoding_dim}) {'← MISMATCH!' if time_dim_mismatch else ''}\n"
+                f"  Edge: {edge_feats.size(1)} (config: {self.edge_features_dim}) {'← MISMATCH!' if edge_dim_mismatch else ''}\n"
+            )
+            
+            # Most likely cause: checkpoint trained with different config
+            if hasattr(self, 'hparams') and 'time_encoding_dim' in self.hparams:
+                error_msg += (
+                    f"\n  CHECKPOINT CONFIG: time_dim={self.hparams.time_encoding_dim}, "
+                    f"edge_dim={self.hparams.get('edge_features_dim', 'N/A')}\n"
+                    f"  CURRENT CONFIG: time_dim={self.time_encoding_dim}, edge_dim={self.edge_features_dim}\n"
+                    f"\n  SOLUTION: Train from scratch OR use checkpoint with matching configuration."
+                )
+            
+            raise RuntimeError(error_msg)
+        
+        
+        
+        src_msg_input = torch.cat([src_memory, dst_memory, time_enc, edge_feats], dim=-1)
+        dst_msg_input = torch.cat([dst_memory, src_memory, time_enc, edge_feats], dim=-1)
+
+        src_messages = self.message_fn(src_msg_input)
+        dst_messages = self.message_fn(dst_msg_input)
+
+        
+
+        # Store messages
+        node_id_to_messages = {}
+        for node, msg, ts in zip(src_nodes, src_messages, timestamps):
+            node_id_to_messages.setdefault(node.item(), []).append((msg, ts.item()))
+        for node, msg, ts in zip(dst_nodes, dst_messages, timestamps):
+            node_id_to_messages.setdefault(node.item(), []).append((msg, ts.item()))
+
+        self.memory.store_raw_messages(list(node_id_to_messages.keys()), node_id_to_messages)
+    
+    
+    
+    def _aggregate_and_update_memory(self):
+        device = self.device
+        if not self.use_memory or self.memory is None:
+            return
+
+        if self.training:
+            self._memory_before_update = self.memory.memory.clone().detach()
+
+        nodes_with_messages = list(self.memory.messages.keys())
+        if not nodes_with_messages:
+            return
+
+        node_ids = []
+        messages_list = []
+        timestamps_list = []
+
+        for node in nodes_with_messages:
+            node_msgs = self.memory.messages[node]
+            if not node_msgs:
+                continue
+            msgs = torch.stack([msg for msg, _ in node_msgs]).to(device)
+            ts = torch.tensor([ts for _, ts in node_msgs], dtype=torch.float32, device=device)
+            node_ids.append(node)
+            messages_list.append(msgs)
+            timestamps_list.append(ts)
+
+        unique_nodes, unique_messages, unique_timestamps = self.message_aggregator.aggregate(
+            node_ids=node_ids,
+            messages=messages_list,
+            timestamps=timestamps_list
+        )
+
+        if len(unique_nodes) > 0:
+            unique_nodes_t = torch.tensor(unique_nodes, device=device)
+            unique_messages = unique_messages.to(device)
+            unique_timestamps = unique_timestamps.to(device)
+
+            self.memory_updater.update_memory(
+                unique_node_ids=unique_nodes_t,
+                unique_messages=unique_messages,
+                timestamps=unique_timestamps
+            )
+
+        self.memory.clear_messages(nodes_with_messages)
+    
+    def compute_temporal_embeddings_pair(self,
+                                         source_nodes: np.ndarray,
+                                         destination_nodes: np.ndarray,
+                                         edge_times: np.ndarray,
+                                         n_neighbors: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = self.device
+
+        if isinstance(source_nodes, np.ndarray):
+            src_tensor = torch.from_numpy(source_nodes).long().to(device)
+            dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
+        else:
+            src_tensor = source_nodes.to(device)
+            dst_tensor = destination_nodes.to(device)
+
+        if self.embedding_module is not None:
+            source_emb = self.embedding_module.compute_embedding(
+                memory=self.memory.memory,
+                source_nodes=source_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+            destination_emb = self.embedding_module.compute_embedding(
+                memory=self.memory.memory,
+                source_nodes=destination_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+            return source_emb, destination_emb
+
+        if self.node_raw_features is not None:
+            src_feat = self.node_raw_features[src_tensor]
+            dst_feat = self.node_raw_features[dst_tensor]
+        else:
+            src_feat = self.node_embedding(src_tensor)
+            dst_feat = self.node_embedding(dst_tensor)
+
+        return src_feat, dst_feat
+    
     def validation_step(self, batch, batch_idx):
         logits = self.forward(batch)
         labels = batch['labels'].float()
@@ -707,7 +571,6 @@ class TGN(BaseDynamicGNN):
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
 
         probs = torch.sigmoid(logits)
-        # Use PyTorch AP (from _compute_metrics)
         sorted_indices = torch.argsort(probs, descending=True)
         sorted_labels = labels[sorted_indices]
         cumulative_positives = torch.cumsum(sorted_labels, dim=0)
@@ -723,8 +586,15 @@ class TGN(BaseDynamicGNN):
         if self.use_memory and self.memory is not None:
             self.memory.__init_memory__()
 
+        device = self.device
+        if self.node_raw_features is not None and self.node_raw_features.device != device:
+            self.node_raw_features = self.node_raw_features.to(device)
+            logger.info(f" Moved node_raw_features to {device} in on_fit_start()")
+        if self.edge_raw_features is not None and self.edge_raw_features.device != device:
+            self.edge_raw_features = self.edge_raw_features.to(device)
+            logger.info(f" Moved edge_raw_features to {device} in on_fit_start()")
+
     def on_train_batch_start(self, batch, batch_idx):
-        """Verify memory is updating."""
         if self.use_memory and self.memory is not None:
             mem_mean = self.memory.memory.mean().item()
             mem_std = self.memory.memory.std().item()
@@ -732,11 +602,9 @@ class TGN(BaseDynamicGNN):
                 logger.info(f"Batch {batch_idx}: memory mean={mem_mean:.4f}, std={mem_std:.4f}")
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Detach memory to prevent gradient leakage across batches."""
         if self.use_memory and self.memory is not None:
-            self.memory.detach_memory()   # ← critical missing line
+            self.memory.detach_memory()
 
-        # Optional: your existing logging code
         if batch_idx % 100 == 0:
             total_grad_norm = 0
             for name, param in self.named_parameters():
@@ -745,39 +613,56 @@ class TGN(BaseDynamicGNN):
             logger.debug(f"Batch {batch_idx}: Total gradient norm = {total_grad_norm:.4f}")
             if hasattr(self, '_memory_before_update'):
                 mem_update = torch.norm(self.memory.memory - self._memory_before_update)
-                logger.debug(f"Memory update norm = {mem_update:.4f}") 
-    
+                logger.debug(f"Memory update norm = {mem_update:.4f}")
     
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
         self.train_batch_counter = 0
         logger.info(f" Training epoch start - Memory state preserved (size={self.memory.memory.shape[0]})")
-        
-    
+
     def on_validation_epoch_start(self):
         super().on_validation_epoch_start()
         if self.use_memory:
-            # Clone memory for validation, DON'T reset training memory
             self._validation_memory = self.memory.memory.clone().detach()
             self._validation_last_update = self.memory.last_update.clone().detach()
             logger.info(" Cloned memory for validation (preserves training state)")
-    
+
     def on_validation_epoch_end(self):
         super().on_validation_epoch_end()
         if self.use_memory:
-            # Restore training memory after validation
             self.memory.memory.data.copy_(self._validation_memory)
             self.memory.last_update.data.copy_(self._validation_last_update)
             logger.info(" Restored training memory after validation")   
     
   
     def on_test_epoch_start(self):
-        super().on_test_epoch_start()        
+        super().on_test_epoch_start()
         if self.use_memory:
             self.memory.__init_memory__()
         logger.info(" Memory reset for TEST (cold-start evaluation - prevents temporal leakage)")
-
     
+    def to(self, *args, **kwargs):
+        self = super().to(*args, **kwargs)
+
+        device = None
+        if args:
+            device = args[0] if isinstance(args[0], (torch.device, str)) else None
+        elif 'device' in kwargs:
+            device = kwargs['device']
+
+        if device is not None:
+            if self.node_raw_features is not None:
+                self.node_raw_features = self.node_raw_features.to(device)
+                logger.debug(f" Moved node_raw_features to {device}")
+                if self.embedding_module is not None and hasattr(self.embedding_module, 'node_features'):
+                    self.embedding_module.node_features = self.node_raw_features
+            if self.edge_raw_features is not None:
+                self.edge_raw_features = self.edge_raw_features.to(device)
+                logger.debug(f" Moved edge_raw_features to {device}")
+                if self.embedding_module is not None and hasattr(self.embedding_module, 'edge_features'):
+                    self.embedding_module.edge_features = self.edge_raw_features
+
+        return self
 
 

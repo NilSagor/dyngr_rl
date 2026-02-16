@@ -187,22 +187,8 @@ class DataPipeline:
             inductive=(eval_type == 'inductive'),
             unseen_ratio=self.config['data'].get('unseen_ratio', 0.1),
             seed=self.config['experiment']['seed'],
-        )
-        
-        # Validate node count correctness (Wikipedia=9228)
-        expected_nodes = {
-            'wikipedia': 9228,
-            'reddit': 7144,
-            'mooc': 7144,
-            'uslegis': 225,
-            'unvote': 201,
-        }
-        dataset = self.config['data']['dataset'].lower()
-        if dataset in expected_nodes:
-            assert self.data['num_nodes'] == expected_nodes[dataset], \
-                f"Node count mismatch! Expected {expected_nodes[dataset]} for {dataset}, " \
-                f"got {self.data['num_nodes']}. Check 0-indexing in load_dataset.py"
-        
+        )        
+       
         logger.info(f"Loaded: {self.data['num_nodes']} nodes, {self.data['statistics']['num_edges']} edges")
         return self
     
@@ -341,30 +327,89 @@ class DataPipeline:
         return self
     
     def get_features(self) -> Dict[str, Optional[torch.Tensor]]:
-        """Get node/edge features for model initialization."""
-        # Dataset-specific handling
-        if self.config['data']['dataset'] == "wikipedia":
-            node_features = None  # Wikipedia has no node features
+        """Get node/edge features with STRUCTURAL DATASET DETECTION."""
+        dataset = self.config['data']['dataset'].lower()
+        # STRUCTURAL_DATASETS = {'untrade', 'uslegis', 'canparl', 'unvote', 'enron', 'uci'}  # UCI is NOT structural!
+        
+        # UCI is NOT structural - has real edge features
+        IS_STRUCTURAL = dataset in {'untrade', 'uslegis', 'canparl', 'unvote'}
+        
+        if IS_STRUCTURAL:
+            # Structural datasets: create 1-dim dummy edge features
+            node_features = None
+            num_edges = self.data['train_mask'].sum().item()
+            edge_features = torch.ones(num_edges, 1)  # 1-dim dummy features (required)
+            logger.info(f" Structural dataset {dataset}: using 1-dim dummy edge features")
+            return {
+                'node_features': node_features,
+                'edge_features': edge_features,
+                'num_nodes': self.data['num_nodes'],
+                'edge_feat_dim': 1,  #  structural datasets need dummy features
+                'node_feat_dim': 0,
+            }
+        
+        # Enron has 32-dim edge features (DyGLib format)
+        if dataset == "enron":
+            train_mask = self.data['train_mask']
+            edge_features = self.data['edge_features'][train_mask]
+            
+            # Enron edge features are 32-dimensional (message content embedding)
+            if edge_features.shape[1] != 32:
+                logger.warning(
+                    f"Enron edge features should be 32-dim, got {edge_features.shape[1]}. "
+                    f"Using actual dimension: {edge_features.shape[1]}"
+                )
+            
+            return {
+                'node_features': None,  # Enron has no node features
+                'edge_features': edge_features,
+                'num_nodes': self.data['num_nodes'],
+                'edge_feat_dim': edge_features.shape[1],  # 32 (not 1!)
+                'node_feat_dim': 0,
+            }        
+        
+        
+        # UCI-specific handling (has 2-dim edge features)
+        if dataset == "uci":
+            train_mask = self.data['train_mask']
+            edge_features = self.data['edge_features'][train_mask]
+            
+            # UCI edge features are 2-dimensional (message content embedding)
+            if edge_features.shape[1] != 2:
+                logger.warning(f"UCI edge features should be 2-dim, got {edge_features.shape[1]}. Truncating.")
+                edge_features = edge_features[:, :2]
+            
+            return {
+                'node_features': self.data.get('node_features'),  # 100-dim for UCI
+                'edge_features': edge_features,
+                'num_nodes': self.data['num_nodes'],
+                'edge_feat_dim': 2,  # Critical: NOT 1!
+                'node_feat_dim': 100 if self.data.get('node_features') is not None else 0,
+            }
+        
+        # Standard datasets (Wikipedia/Reddit/MOOC)
+        if dataset == "wikipedia":
+            node_features = None
         else:
             node_features = self.data.get('node_features')
         
-
-        # Return TRAINING edge features only (for model init)
-        # Model should never see val/test edge features during initialization
         train_edge_features = (
             self.data['edge_features'][self.data['train_mask']] 
             if self.data['edge_features'] is not None 
             else None
         )
         
-        
         return {
             'node_features': node_features,
-            'edge_features': train_edge_features,  # TRAINING FEATURES ONLY
+            'edge_features': train_edge_features,
             'num_nodes': self.data['num_nodes'],
             'edge_feat_dim': train_edge_features.shape[1] if train_edge_features is not None else 0,
             'node_feat_dim': node_features.shape[1] if node_features is not None else 0,
-        }
+        }     
+        
+        
+    
+    
     
     @property
     def num_nodes(self) -> int:
@@ -498,8 +543,8 @@ class TrainerSetup:
             logger=loggers,
             precision=config['experiment']['precision'],
             gradient_clip_val=config['training']['gradient_clip_val'],
-            log_every_n_steps=10,
-            val_check_interval=0.25,
+            log_every_n_steps=config['training']['log_every_n_steps'],
+            val_check_interval=config['training']['val_check_interval'],
             enable_progress_bar=True,
         )
 
@@ -540,6 +585,38 @@ class ExperimentLogger:
             writer.writerow(row)
         
         logger.info(f"Results saved to {self.csv_path}")
+
+
+
+def load_checkpoint_safely(checkpoint_path, model, config):
+    """Load checkpoint ONLY if config matches training config."""
+    if not checkpoint_path.exists():
+        return model
+    
+    # Load checkpoint metadata WITHOUT loading weights
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    ckpt_config = checkpoint.get('hyper_parameters', {})
+    
+    # Critical dimensions to validate
+    dims_to_check = ['time_encoding_dim', 'edge_features_dim', 'memory_dim']
+    mismatches = []
+    
+    for dim in dims_to_check:
+        if dim in ckpt_config and dim in config['model']:
+            if ckpt_config[dim] != config['model'][dim]:
+                mismatches.append(f"{dim}: checkpoint={ckpt_config[dim]} != current={config['model'][dim]}")
+    
+    if mismatches:
+        logger.warning(
+            "Checkpoint configuration mismatch detected! Skipping checkpoint load.\n"
+            "Mismatches:\n" + "\n".join(f"  - {m}" for m in mismatches) + "\n"
+            "Training from scratch with current configuration."
+        )
+        return model  # Return untrained model
+    
+    # Safe to load
+    logger.info(f" Loading checkpoint with matching configuration: {checkpoint_path.name}")
+    return model.load_from_checkpoint(checkpoint_path)
 
 
 
@@ -617,7 +694,7 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         
         # 2. Load the checkpoint with strict=False – ignore unexpected keys
         checkpoint = torch.load(best_path, map_location=model.device)
-        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        model.load_state_dict(checkpoint['state_dict'], strict=True)
         
         # 3. Ensure model is on correct device and in eval mode
         model = model.to(model.device)

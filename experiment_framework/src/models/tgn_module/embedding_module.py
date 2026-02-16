@@ -4,6 +4,8 @@ import numpy as np
 import math
 from .temporal_attention import TemporalAttentionLayer
 
+from loguru import logger
+
 class EmbeddingModule(nn.Module):
     def __init__(self, node_features, edge_features, memory, neighbor_finder, time_encoder, n_layers,
                  n_node_features, n_edge_features, n_time_features, embedding_dimension, device, dropout):
@@ -188,6 +190,7 @@ class GraphAttentionEmbedding(GraphEmbedding):
                                                     n_layers, n_node_features, n_edge_features, n_time_features,
                                                     embedding_dimension, device, n_heads, dropout, use_memory)
         
+                
         # Project input features to embedding dimension
         input_dim = n_node_features + (memory.memory_dimension if use_memory else 0)
         self.feature_proj = nn.Linear(input_dim, embedding_dimension)
@@ -204,87 +207,124 @@ class GraphAttentionEmbedding(GraphEmbedding):
                 dropout=dropout
             ) for _ in range(n_layers)
         ])
+        # Ensure node_features is always a tensor
+        assert self.node_features is not None, \
+            "node_features cannot be None! For datasets without raw features, " \
+            "TGN._init_embedding_module must pass node_embedding.weight."
+        assert isinstance(self.node_features, torch.Tensor), \
+            f"node_features must be tensor, got {type(self.node_features)}"
+        
+        #  Check dimension compatibility
+        expected_input_dim = self.n_node_features + (self.memory.memory_dimension if self.use_memory else 0)
+        assert self.feature_proj.in_features == expected_input_dim, \
+            f"Feature proj dimension mismatch: expected {expected_input_dim}, got {self.feature_proj.in_features}"
+        
+        logger.info(f" GraphAttentionEmbedding initialized: "
+                f"node_feat_dim={self.n_node_features}, "
+                f"edge_feat_dim={self.n_edge_features}, "
+                f"use_memory={self.use_memory}")
 
     def compute_embedding(self, 
-                          memory, 
-                          source_nodes: torch.Tensor, 
-                          timestamps: torch.Tensor, 
-                          n_layers: int, 
-                          n_neighbors: int=20, 
-                          time_diffs=None
-                          ):
+                      memory, 
+                      source_nodes, 
+                      timestamps, 
+                      n_layers, 
+                      n_neighbors=20, 
+                      time_diffs=None):
         """Compute embeddings using temporal attention over neighbors."""
-        # device = next(self.parameters()).device
-        device = source_nodes.device
-        
-        # Convert to numpy for neighbor query (neighbor finder expects numpy)
-        source_nodes_np = source_nodes.cpu().numpy()
-        timestamps_np = timestamps.cpu().numpy()
-        
-        # Get initial node features (tensors)
-        source_features = self.node_features[source_nodes].to(device)
+        device = next(self.parameters()).device
 
-        # source_nodes_torch = torch.from_numpy(source_nodes).long().to(device)
-        # timestamps_torch = torch.from_numpy(timestamps).float().to(device)
-        
-        
-        # # Ensure all features are on correct device
-        # if self.node_features.device != device:
-        #     self.node_features = self.node_features.to(device)
-        # if self.edge_features.device != device:
-        #     self.edge_features = self.edge_features.to(device)
-        
-        # DEBUG: Check node indices against memory size
-        # max_node_index = source_nodes_torch.max().item()
-        
-        # # Check if memory is a Memory object or a tensor
-        # if hasattr(memory, 'memory'):  # It's a Memory object
-        #     memory_size = memory.memory.size(0)
-        #     # Get the full memory tensor from the Memory object
-        #     full_memory = memory.memory
-        # else:  # It's a tensor
-        #     memory_size = memory.size(0)
-        #     full_memory = memory
-        # # memory_size = memory.size(0)
+        # --- Convert inputs to both numpy (for neighbor finder) and tensor (for indexing) ---
+        if isinstance(source_nodes, np.ndarray):
+            source_nodes_np = source_nodes
+            source_nodes_tensor = torch.from_numpy(source_nodes).long().to(device)
+        else:  # assume torch.Tensor
+            source_nodes_np = source_nodes.cpu().numpy()
+            source_nodes_tensor = source_nodes.long().to(device)
 
+        if isinstance(timestamps, np.ndarray):
+            timestamps_np = timestamps
+            timestamps_tensor = torch.from_numpy(timestamps).float().to(device)
+        else:
+            timestamps_np = timestamps.cpu().numpy()
+            timestamps_tensor = timestamps.float().to(device)
+
+        # --- Validate node IDs (critical to prevent CUDA asserts) ---
+        if source_nodes_tensor.max() >= memory.size(0):
+            raise RuntimeError(
+                f"Node ID {source_nodes_tensor.max().item()} >= memory size {memory.size(0)}. "
+                f"Expected num_nodes = max_node_id + 1."
+            )
+
+        # --- Get source node features (always a tensor, from self.node_features) ---
+        source_features = self.node_features[source_nodes_tensor].to(device)
+
+        # --- Concatenate memory ONCE (no duplicate) ---
         if self.use_memory:
-            # memory can be a Memory object; extract the memory tensor
-            if hasattr(memory, 'memory'):
-                mem_tensor = memory.memory
-            else:
-                mem_tensor = memory
-            source_memory = mem_tensor[source_nodes].to(device)
+            source_memory = memory[source_nodes_tensor].to(device)   # full memory tensor
             source_features = torch.cat([source_features, source_memory], dim=-1)
 
-        # Project to embedding dimension
+        # --- Project to embedding dimension ---
         current_embeddings = self.feature_proj(source_features)
 
-        # Multi‑layer attention
+        # --- Multi‑layer attention ---
         for layer_idx in range(n_layers):
-            # Query neighbors (returns numpy arrays)
-            neighbors, edge_idxs, edge_times = self.neighbor_finder.get_temporal_neighbor(
-                source_nodes_np, timestamps_np, n_neighbors=n_neighbors
+            # Query neighbors (neighbor finder expects numpy lists)
+            neighbors_list, edge_times_list = self.neighbor_finder.find_neighbors(
+                source_nodes_np.tolist(), timestamps_np.tolist(), n_neighbors=n_neighbors
             )
-            # Convert to tensors
-            neighbors_t = torch.from_numpy(neighbors).long().to(device)
-            edge_idxs_t = torch.from_numpy(edge_idxs).long().to(device)
-            edge_times_t = torch.from_numpy(edge_times).float().to(device)
 
-            # Neighbor features
-            neighbor_features = self.node_features[neighbors_t].to(device)
+            # Pad to fixed size (use -1 for padding nodes)
+            max_neighbors = max(len(nbrs) for nbrs in neighbors_list)
+            neighbors_padded = []
+            edge_times_padded = []
+            mask = []  # True where padding exists
+
+            for i in range(len(neighbors_list)):
+                nbrs = neighbors_list[i]
+                times = edge_times_list[i]
+                pad_len = max_neighbors - len(nbrs)
+                neighbors_padded.append(nbrs + [-1] * pad_len)      # -1 = padding
+                edge_times_padded.append(times + [0.0] * pad_len)
+                mask.append([False] * len(nbrs) + [True] * pad_len) # True = padding
+
+            neighbors_t = torch.tensor(neighbors_padded, dtype=torch.long, device=device)
+            edge_times_t = torch.tensor(edge_times_padded, dtype=torch.float32, device=device)
+            padding_mask = torch.tensor(mask, dtype=torch.bool, device=device)
+
+            # Get neighbor features (handle padding with -1)
+            valid_mask = neighbors_t != -1
+            neighbor_features = torch.zeros(
+                neighbors_t.shape[0], neighbors_t.shape[1], self.node_features.shape[1],
+                device=device
+            )
+            if valid_mask.any():
+                valid_nodes = neighbors_t[valid_mask]
+                valid_features = self.node_features[valid_nodes].to(device)
+                neighbor_features[valid_mask] = valid_features
+
+            # Add neighbor memory if used
             if self.use_memory:
-                neighbor_memory = mem_tensor[neighbors_t].to(device)
+                neighbor_memory = torch.zeros(
+                    neighbors_t.shape[0], neighbors_t.shape[1], memory.shape[1],
+                    device=device
+                )
+                if valid_mask.any():
+                    neighbor_memory[valid_mask] = memory[valid_nodes].to(device)
                 neighbor_features = torch.cat([neighbor_features, neighbor_memory], dim=-1)
 
+            # Project neighbor features
             neighbor_embeddings = self.feature_proj(neighbor_features)
 
-            # Edge features and time encodings
-            edge_features_batch = self.edge_features[edge_idxs_t]
-            source_time_enc = self.time_encoder(timestamps)
-            neighbor_time_enc = self.time_encoder(edge_times_t)
+            # Edge features are zero (TGN spec – no leakage)
+            edge_features_batch = torch.zeros(
+                neighbors_t.shape[0], neighbors_t.shape[1], self.n_edge_features,
+                device=device
+            )
 
-            # Padding mask (0 is padding)
-            padding_mask = (neighbors_t == 0)
+            # Time encodings
+            source_time_enc = self.time_encoder(timestamps_tensor)
+            neighbor_time_enc = self.time_encoder(edge_times_t)
 
             # Apply attention
             current_embeddings, _ = self.attention_models[layer_idx](
@@ -296,74 +336,7 @@ class GraphAttentionEmbedding(GraphEmbedding):
                 neighbors_padding_mask=padding_mask
             )
             current_embeddings = self.dropout(current_embeddings)
-        
-        # if max_node_index >= memory_size:
-        #     raise ValueError(
-        #         f"Node index {max_node_index} is out of bounds for memory of size {memory_size}. "
-        #         f"Expected max node index < {memory_size}. "
-        #         f"This means TGN was initialized with wrong num_nodes parameter."
-        #     )
-        
-        
-        # # CRITICAL: Ensure memory is on the same device as the model
-        # full_memory = full_memory.to(device)
-        
-        # # Get initial features - ensure everything is on the same device
-        # source_features = self.node_features[source_nodes_torch].to(device)
-        
-        # if self.use_memory:
-        #     # Get memory for source nodes
-        #     source_memory = full_memory[source_nodes_torch].to(device)
-        #     source_features = torch.cat([source_features, source_memory], dim=-1)
-        
-        # # Project to embedding dimension
-        # current_embeddings = self.feature_proj(source_features)
-        
-        # # Multi-layer attention
-        # for layer_idx in range(n_layers):
-        #     # Get neighbors
-        #     neighbors, edge_idxs, edge_times = self.neighbor_finder.get_temporal_neighbor(
-        #         source_nodes, timestamps, n_neighbors=n_neighbors)
-            
-        #     # Convert to tensors and move to device
-        #     neighbors_torch = torch.from_numpy(neighbors).long().to(device)
-        #     edge_idxs_torch = torch.from_numpy(edge_idxs).long().to(device)
-        #     edge_times_torch = torch.from_numpy(edge_times).float().to(device)
 
-
-        #     # Get neighbor features
-        #     neighbor_features = self.node_features[neighbors_torch].to(device)
-            
-        #     if self.use_memory:
-        #         # Get neighbor memory
-        #         neighbor_memory = full_memory[neighbors_torch].to(device)
-        #         neighbor_features = torch.cat([neighbor_features, neighbor_memory], dim=-1)
-            
-        #     # Project neighbor features
-        #     neighbor_embeddings = self.feature_proj(neighbor_features)
-            
-        #     # Edge features
-        #     edge_features_batch = self.edge_features[edge_idxs_torch]
-            
-        #     # Time encoding
-        #     source_time_enc = self.time_encoder(timestamps_torch)
-        #     neighbor_time_enc = self.time_encoder(edge_times_torch)
-            
-        #     # Padding mask
-        #     padding_mask = (neighbors_torch == 0)
-            
-        #     # Apply attention
-        #     current_embeddings, _ = self.attention_models[layer_idx](
-        #         src_node_features=current_embeddings,
-        #         src_time_features=source_time_enc.unsqueeze(1),
-        #         neighbors_features=neighbor_embeddings,
-        #         neighbors_time_features=neighbor_time_enc,
-        #         edge_features=edge_features_batch,
-        #         neighbors_padding_mask=padding_mask
-        #     )
-            
-        #     current_embeddings = self.dropout(current_embeddings)
-        
         return current_embeddings
 
 

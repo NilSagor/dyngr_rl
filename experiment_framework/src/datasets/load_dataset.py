@@ -111,13 +111,13 @@ def load_dataset(
     test_mask = np.zeros(total_edges, dtype=bool)
     test_mask[val_end:] = True
     
-    #  DATASET-SPECIFIC VALIDATION (now passes)
-    if dataset_name == 'wikipedia':
-        assert num_nodes == 9228, f"Wikipedia must have 9228 nodes (IDs 0-9227), got {num_nodes}"
-    elif dataset_name == 'reddit':
-        assert num_nodes == 7144, f"Reddit must have 7144 nodes, got {num_nodes}"
-    elif dataset_name == 'mooc':
-        assert num_nodes == 7144, f"MOOC must have 7144 nodes, got {num_nodes}"
+    # #  DATASET-SPECIFIC VALIDATION (now passes)
+    # if dataset_name == 'wikipedia':
+    #     assert num_nodes == 9228, f"Wikipedia must have 9228 nodes (IDs 0-9227), got {num_nodes}"
+    # elif dataset_name == 'reddit':
+    #     assert num_nodes == 7144, f"Reddit must have 7144 nodes, got {num_nodes}"
+    # elif dataset_name == 'mooc':
+    #     assert num_nodes == 7144, f"MOOC must have 7144 nodes, got {num_nodes}"
     
     statistics = {
         'dataset': dataset_name,

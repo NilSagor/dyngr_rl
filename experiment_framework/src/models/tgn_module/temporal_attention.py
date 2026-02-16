@@ -77,33 +77,6 @@ class MergeLayer(nn.Module):
         return self.fc2(h)
 
 
-
-
-
-
-
-# class MergeLayer(nn.Module):
-#     def __init__(self, dim1, dim2, dim3, dim4):
-#         super().__init__()
-#         self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
-#         self.fc2 = torch.nn.Linear(dim3, dim4)
-#         self.act = torch.nn.ReLU()
-
-#         torch.nn.init.xavier_normal_(self.fc1.weight)
-#         torch.nn.init.xavier_normal_(self.fc2.weight)
-
-#     def forward(self, x1, x2, x3=None, x4=None):
-#         # Handle both 2-arg and 4-arg usage
-#         if x3 is None:
-#             x = torch.cat([x1, x2], dim=-1)
-#         else:
-#             x = torch.cat([x1, x2, x3, x4], dim=-1)
-#         h = self.act(self.fc1(x))
-#         return self.fc2(h)
-
-
-
-
 class TemporalAttentionLayer(nn.Module):
   """
   Temporal attention layer. Return the temporal embedding of a node given the node itself,
@@ -146,7 +119,17 @@ class TemporalAttentionLayer(nn.Module):
     attn_output: float Tensor of shape [1, batch_size, n_node_features]
     attn_output_weights: [batch_size, 1, n_neighbors]
     """
+    batch_size, n_neighbors, _ = neighbors_features.shape
 
+    #  EARLY EXIT FOR ZERO NEIGHBORS (cold-start safe)
+    if n_neighbors == 0:
+        # Return zero attention output (TGN paper spec: "all zero attention output for no neighbors")
+        attn_output = torch.zeros(batch_size, self.feat_dim, device=src_node_features.device)
+        attn_output_weights = torch.zeros(batch_size, 0, device=src_node_features.device)
+        # Skip attention computation entirely
+        attn_output = self.merger(attn_output, src_node_features)
+        return attn_output, attn_output_weights
+    
     src_node_features_unrolled = torch.unsqueeze(src_node_features, dim=1)
 
     query = torch.cat([src_node_features_unrolled, src_time_features], dim=2)
@@ -158,14 +141,19 @@ class TemporalAttentionLayer(nn.Module):
     key = key.permute([1, 0, 2])  # [n_neighbors, batch_size, num_of_features]
 
     # Compute mask of which source nodes have no valid neighbors
-    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
+    # invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
     # If a source node has no valid neighbor, set it's first neighbor to be valid. This will
     # force the attention to just 'attend' on this neighbor (which has the same features as all
     # the others since they are fake neighbors) and will produce an equivalent result to the
     # original tgat paper which was forcing fake neighbors to all have same attention of 1e-10
-    neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
+    # neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
 
     # print(query.shape, key.shape)
+
+    # Handle zero neighbors edge case
+    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
+    if invalid_neighborhood_mask.any() and neighbors_padding_mask.size(1) > 0:  
+        neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
 
     attn_output, attn_output_weights = self.multi_head_target(query=query, key=key, value=key,
                                                               key_padding_mask=neighbors_padding_mask)
