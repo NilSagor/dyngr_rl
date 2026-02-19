@@ -33,6 +33,7 @@ from src.models.dygformer import DyGFormer
 from src.models.tgn import TGN
 
 from src.models.enhanced_tgn.variants.tgn_v2 import TGNv2
+from src.models.enhanced_tgn.variants.tgn_v3 import TGNv3
 from src.models.enhanced_tgn.base_enhance_tgn import BaseEnhancedTGN
 
 from src.utils.general_utils import set_seed, get_device
@@ -46,6 +47,7 @@ MODEL_REGISTRY = {
     "DyGFormer": DyGFormer,
     "TGN": TGN,
     "TGNv2": TGNv2,
+    "TGNv3": TGNv3,
 }
 
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
