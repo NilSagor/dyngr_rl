@@ -56,6 +56,25 @@ def load_dataset(
     node_features = np.load(node_feat_path).astype(np.float32)
     edge_features = np.load(edge_feat_path).astype(np.float32)
     
+    # Correct UCI feature mislabeling (DyGLib bug)
+    if dataset_name.lower() == "uci":
+        # DyGLib's ml_uci.npy contains 100-dim NODE features mislabeled as edge features
+        # True edge features should be 2-dim message content embeddings
+        if edge_features.shape[1] == 100 and (node_features is None or node_features.shape[1] != 100):
+            logger.warning(
+                "UCI feature mislabeling detected: edge_features contains 100-dim node features. "
+                "Swapping node/edge features per DyGLib specification."
+            )
+            # Swap: what DyGLib calls "edge_features" is actually node features
+            node_features, edge_features = edge_features, node_features
+        
+        # Ensure edge features are 2-dim (TGN specification for UCI)
+        if edge_features.shape[1] != 2:
+            logger.info(f"UCI edge features truncated from {edge_features.shape[1]} to 2 dims")
+            edge_features = edge_features[:, :2]  # Keep only first 2 dims as message content
+    
+        
+    
     #  CAPTURE MAX ID BEFORE CONVERSION
     raw_src = df['u'].values.astype(np.int64)  # 1-indexed
     raw_dst = df['i'].values.astype(np.int64)  # 1-indexed

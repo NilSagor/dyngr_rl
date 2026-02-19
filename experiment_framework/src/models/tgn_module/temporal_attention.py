@@ -33,7 +33,7 @@ class MergeLayer(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, output_dim)
         self.act = nn.ReLU()
         
-        # CRITICAL FIX 2: Proper weight initialization (with bias handling)
+        # Proper weight initialization (with bias handling)
         nn.init.xavier_normal_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)  # Explicit bias initialization
         nn.init.xavier_normal_(self.fc2.weight)
@@ -59,7 +59,7 @@ class MergeLayer(nn.Module):
         Raises:
             ValueError: If input dimensions don't match expected sizes
         """
-        # CRITICAL FIX 3: Runtime dimension validation
+        # Runtime dimension validation
         if x1.size(-1) != self.input_dim1:
             raise ValueError(
                 f"x1 dimension mismatch: expected {self.input_dim1}, got {x1.size(-1)}. "

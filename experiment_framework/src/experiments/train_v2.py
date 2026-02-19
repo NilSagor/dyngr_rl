@@ -31,6 +31,10 @@ from loguru import logger
 # Local imports
 from src.models.dygformer import DyGFormer
 from src.models.tgn import TGN
+
+from src.models.enhanced_tgn.variants.tgn_v2 import TGNv2
+from src.models.enhanced_tgn.base_enhance_tgn import BaseEnhancedTGN
+
 from src.utils.general_utils import set_seed, get_device
 from src.datasets.load_dataset import load_dataset, DATA_ROOT
 from src.datasets.negative_sampling import NegativeSampler
@@ -41,6 +45,7 @@ from src.datasets.temporal_dataset import TemporalDataset
 MODEL_REGISTRY = {
     "DyGFormer": DyGFormer,
     "TGN": TGN,
+    "TGNv2": TGNv2,
 }
 
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
@@ -428,6 +433,8 @@ class ModelFactory:
         """Create model with proper parameter handling."""
         model_config = config['model'].copy()
         model_name = model_config.pop('name')
+
+        # variant = config["model"].pop('variant', None)
         
         if model_name not in MODEL_REGISTRY:
             raise ValueError(f"Unknown model: {model_name}")
