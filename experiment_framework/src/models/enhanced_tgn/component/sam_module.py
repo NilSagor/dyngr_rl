@@ -105,19 +105,27 @@ class SAMCell(nn.Module):
         :type prototypes: torch.Tensor 
         :return: similarity scores [batch_size, num_prototypes]
         :rtype: Tensor
+         query: [B, memory_dim]
+        prototypes: [B, num_prototypes, memory_dim]
+        returns: [B, num_prototypes]
         """
         if self.similarity_metric == "cosine":
             # cosine similarity
-            query_norm = F.normalize(query, dim=-1)
-            proto_norm = F.normalize(prototypes, dim=-1)
-            similarity = torch.matmul(query_norm, proto_norm.t()) # [B, num_prototypes]
+            query_norm = F.normalize(query, dim=-1)                # [B, D]
+            proto_norm = F.normalize(prototypes, dim=-1)           # [B, K, D]
+            
+            # Batched matmul: (B,1,D) @ (B,D,K) -> (B,1,K) -> squeeze -> (B,K)
+            similarity = torch.bmm(query_norm.unsqueeze(1),
+                               proto_norm.transpose(1, 2)).squeeze(1) # [B, num_prototypes]
         elif self.similarity_metric == 'dot':
             # Dot product
-            similarity = torch.matmul(query, prototypes.t()) # [B, num_prototypes]
+            similarity = torch.bmm(query.unsqueeze(1),
+                               prototypes.transpose(1, 2)).squeeze(1) # [B, num_prototypes]
         elif self.similarity_metric == "scaled_dot":
             # Scaled dot product
             d_k = query.size(-1)
-            similarity = torch.matmul(query, prototypes.t())/math.sqrt(d_k)
+            similarity = torch.bmm(query.unsqueeze(1),
+                               prototypes.transpose(1, 2)).squeeze(1) / math.sqrt(d_k)
         else:
             raise ValueError(f"Unknown similarity metric: {self.similarity_metric}")
         
@@ -166,11 +174,11 @@ class SAMCell(nn.Module):
 
         attention_weights = F.softmax(similarity, dim=-1) #[B, num_prototypes]
         
-        # step 3: Form candidate memory \tilde(s)_u(t)
-        candidate_memory = torch.matmul(
-            attention_weights.unsqueeze(1), # [B, 1, num_prototypes]
-            prototypes.unsqueeze(0) #[1, num_prototypes, memory_dim]
-        ).squeeze(1) # [B, memory_dim]
+        # Step 3: Form candidate memory \tilde(s)_u(t)
+        candidate_memory = torch.bmm(
+            attention_weights.unsqueeze(1),  # [B, 1, K]
+            prototypes                        # [B, K, D]
+        ).squeeze(1)                          # [B, D]
         
         
         # step 4: compute update date \beta_u(t)
@@ -218,7 +226,7 @@ class StabilityAugmentedMemory(nn.Module):
             prototype_init: str="xavier",
             similarity_metric: str = "cosine",
             dropout: float = 0.1,
-            device: str = "cuda"
+            # device: str = "cuda"
 
     ):
         super(StabilityAugmentedMemory, self).__init__()
@@ -228,7 +236,7 @@ class StabilityAugmentedMemory(nn.Module):
         self.edge_feat_dim = edge_feat_dim
         self.time_dim = time_dim
         self.num_prototypes = num_prototypes
-        self.device = device
+        # self.device = device
 
         # Time encoder (fixed, non-learnable)
         self.time_encoder = TimeEncoder(time_dim)
@@ -282,8 +290,8 @@ class StabilityAugmentedMemory(nn.Module):
             torch.zeros(num_nodes)
         )
         
-        # move to device
-        self.to(device)
+        # # move to device
+        # self.to(device)
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -394,8 +402,8 @@ class StabilityAugmentedMemory(nn.Module):
         )
 
         # Update stored memories (in-place)
-        self.raw_memory[source_nodes] = src_updated
-        self.raw_memory[target_nodes] = tgt_updated
+        self.raw_memory[source_nodes] = src_updated.detach()
+        self.raw_memory[target_nodes] = tgt_updated.detach()
         self.last_update[source_nodes] = current_time
         self.last_update[target_nodes] = current_time
         
@@ -437,7 +445,8 @@ class StabilityAugmentedMemory(nn.Module):
         
         # Edge features (zeros if not provided)
         if edge_features is None:
-            edge_features = torch.zeros(batch_size, self.edge_feat_dim, device=self.device)
+            device = next(self.edge_proj.parameters()).device
+            edge_features = torch.zeros(batch_size, self.edge_feat_dim, device=device)
         edge_features_proj = self.edge_proj(edge_features)
         
         # node features (optional)
