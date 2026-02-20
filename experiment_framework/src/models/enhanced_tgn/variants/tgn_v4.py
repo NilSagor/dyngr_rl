@@ -8,16 +8,20 @@ from loguru import logger
 from ..base_enhance_tgn import BaseEnhancedTGN
 from ..component.time_encoder import TimeEncoder
 from ..component.sam_module import StabilityAugmentedMemory
+from ..component.multi_swalk import MultiScaleWalkSampler
+from ..component.walk_encoder import WalkEncoder
 
 
 
-
-
-class TGNv3(BaseEnhancedTGN):
+class TGNv4(BaseEnhancedTGN):
     """
-    TGN with Stability-Augmented Memory (SAM)
-    Replaces GRU memory updater with prototype-based stable memory updates.
-    Maintains full compatibility with TGN pipeline and evaluation protocols.
+    TGN + Stability-Augmented Memory (SAM) + Multi-Scale Walk Sampler
+    
+    Architecture:
+    1. SAM maintains stable node memory via prototypes
+    2. Multi-scale walk sampler generates short/long/TAWR walks
+    3. Walk encoder aggregates walks into node embeddings
+    4. Link prediction on combined representations
     """
     
     def __init__(
@@ -39,9 +43,19 @@ class TGNv3(BaseEnhancedTGN):
         embedding_module_type: str = "graph_attention",
         message_function_type: str = "mlp",
         aggregator_type: str = "last",
-        memory_updater_type: str = "sam",  # Critical: use SAM instead of GRU
+        memory_updater_type: str = "sam",
+        # SAM params
         num_prototypes: int = 5,
         similarity_metric: str = "cosine",
+        # Multi-scale walk params
+        walk_length_short: int = 3,
+        walk_length_long: int = 10,
+        walk_length_tawr: int = 8,
+        num_walks_short: int = 10,
+        num_walks_long: int = 5,
+        num_walks_tawr: int = 5,
+        walk_temperature: float = 0.1,
+        use_walk_encoder: bool = True,  # Toggle to ablate walks        
         **kwargs
     ):
         # Initialize base TGN WITHOUT memory updater (SAM replaces it)
@@ -62,11 +76,12 @@ class TGNv3(BaseEnhancedTGN):
             use_memory=use_memory,
             embedding_module_type=embedding_module_type,
             message_function_type=message_function_type,
-            aggregator_type=aggregator_type,
+            aggregator_type=aggregator_type,            
             memory_updater_type="none",  # Disable GRU updater - SAM handles updates
             **kwargs
         )
         torch.autograd.set_detect_anomaly(True)
+        
         # Initialize SAM with ALL required parameters
         self.sam_module = StabilityAugmentedMemory(
             num_nodes=num_nodes,
@@ -87,6 +102,125 @@ class TGNv3(BaseEnhancedTGN):
         }
         
         logger.info(f" SAM initialized: {num_prototypes} prototypes, {similarity_metric} similarity")
+
+        # Initialize Multi-Scale Walk Sampler
+        self.walk_sampler = MultiScaleWalkSampler(
+            num_nodes=num_nodes,
+            walk_length_short=walk_length_short,
+            walk_length_long=walk_length_long,
+            walk_length_tawr=walk_length_tawr,
+            num_walks_short=num_walks_short,
+            num_walks_long=num_walks_long,
+            num_walks_tawr=num_walks_tawr,
+            temperature=walk_temperature,
+            memory_dim=memory_dim,
+            time_dim=time_encoding_dim
+        )
+
+        # Initialize Walk Encoder
+        self.use_walk_encoder = use_walk_encoder
+        if use_walk_encoder:
+            self.walk_encoder = WalkEncoder(
+                walk_length_short=walk_length_short,
+                walk_length_long=walk_length_long,
+                walk_length_tawr=walk_length_tawr,
+                memory_dim=memory_dim,
+                output_dim=hidden_dim,  # Match TGN hidden dim
+                num_heads=n_heads,
+                dropout=dropout
+            )
+
+        
+        
+        # Fusion layer: combine walk embeddings with original TGN embeddings
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        logger.info(f"TGNv4 initialized: SAM({num_prototypes} prototypes) + "
+                   f"WalkSampler({num_walks_short}/{num_walks_long}/{num_walks_tawr} walks)")
+    
+    
+    def compute_temporal_embeddings_with_walks(
+        self,
+        source_nodes: torch.Tensor,
+        destination_nodes: torch.Tensor,
+        edge_times: torch.Tensor,
+        n_neighbors: int = 20
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute embeddings using both SAM memory and multi-scale walks.
+        """
+        device = self.device
+        
+        # Convert inputs to tensors
+        if isinstance(source_nodes, np.ndarray):
+            src_tensor = torch.from_numpy(source_nodes).long().to(device)
+            dst_tensor = torch.from_numpy(destination_nodes).long().to(device)
+            ts_tensor = torch.from_numpy(edge_times).float().to(device)
+        else:
+            src_tensor = source_nodes.to(device)
+            dst_tensor = destination_nodes.to(device)
+            ts_tensor = edge_times.to(device)
+        
+        # Update walk sampler's neighbor cache if needed
+        # This should be called periodically, not every batch (expensive)
+        # For now, assume cache is updated in on_train_epoch_start or similar
+        
+        # Generate multi-scale walks
+        walk_data = self.walk_sampler(
+            source_nodes=src_tensor,
+            target_nodes=dst_tensor,
+            current_times=ts_tensor,
+            memory_states=self.sam_module.raw_memory,
+            edge_index=None,  # Cache should be pre-populated
+            edge_time=None
+        )
+        
+        # Encode walks into embeddings
+        if self.use_walk_encoder:
+            walk_src_emb, walk_dst_emb = self.walk_encoder(
+                walk_data['source'],
+                walk_data['target'],
+                self.sam_module.raw_memory
+            )  # [batch, hidden_dim]
+        
+        # Get base TGN embeddings (from SAM memory via graph attention)
+        if self.embedding_module is not None:
+            base_src_emb = self.embedding_module.compute_embedding(
+                memory=self.sam_module.raw_memory,
+                source_nodes=source_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+            base_dst_emb = self.embedding_module.compute_embedding(
+                memory=self.sam_module.raw_memory,
+                source_nodes=destination_nodes,
+                timestamps=edge_times,
+                n_layers=self.num_layers,
+                n_neighbors=n_neighbors
+            )
+        else:
+            # Fallback
+            base_src_emb = self.sam_module.raw_memory[src_tensor]
+            base_dst_emb = self.sam_module.raw_memory[dst_tensor]
+        
+        # Fuse walk embeddings with base embeddings
+        if self.use_walk_encoder:
+            combined_src = torch.cat([base_src_emb, walk_src_emb], dim=-1)
+            combined_dst = torch.cat([base_dst_emb, walk_dst_emb], dim=-1)
+            final_src_emb = self.fusion_layer(combined_src)
+            final_dst_emb = self.fusion_layer(combined_dst)
+        else:
+            final_src_emb = base_src_emb
+            final_dst_emb = base_dst_emb
+        
+        return final_src_emb, final_dst_emb
+    
     
     def _compute_and_store_messages(self, batch):
         """SAM replaces message aggregation - store raw interactions for SAM update."""
