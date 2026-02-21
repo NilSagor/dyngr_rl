@@ -362,6 +362,17 @@ class TGNv4(BaseEnhancedTGN):
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         device = self.device
 
+        # if edge_index is not None and edge_time is not None:
+        #     self.update_neighbors(edge_index, edge_time)
+        
+        # # Check if cache is populated
+        # if not self.neighbor_cache:
+        #     logger.warning("Neighbor cache empty! Returning empty walks.")
+        #     # Return zero tensors with correct shape
+        #     batch_size = len(source_nodes)
+        #     return self._empty_walks(batch_size)
+        
+        
         if self.embedding_module is None:
             logger.error("CRITICAL: Embedding module is None! Using fallback features only.")
 
