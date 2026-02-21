@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 
 
-from .hct_module import PositionalEncoding, TransformerEncoderLayer
+from .transformer_encoder import PositionalEncoding, TransformerEncoderLayer
 
 
 class IntraWalkEncoder(nn.Module):
@@ -407,95 +407,171 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         
         return fused
     
+    # def forward(
+    #     self,
+    #     walks_dict: Dict[str, Dict[str, torch.Tensor]],
+    #     node_memory_states: torch.Tensor,  # [num_nodes, d_model] - SAM memory
+    #     walk_node_indices: Dict[str, torch.Tensor],  # walks_dict[type]['nodes'] (non-anonymized)
+    #     return_all: bool = False
+    # ) -> Union[torch.Tensor, Dict]:
+    #     """
+    #     Main forward pass for HCT.
+        
+    #     Args:
+    #         walks_dict: Dictionary from walk sampler with structure:
+    #             {
+    #                 'short': {'nodes_anon': [B, num_short, L], 'masks': [B, num_short, L]},
+    #                 'long': {'nodes_anon': [B, num_long, L], 'masks': [B, num_long, L]},
+    #                 'tawr': {'nodes_anon': [B, num_tawr, L], 'masks': [B, num_tawr, L],
+    #                          'restart_flags': [B, num_tawr, L]}
+    #             }
+    #         node_embeddings: [batch_size, d_model] base node embeddings (optional)
+    #         return_all: If True, return all intermediate outputs
+            
+    #     Returns:
+    #         fused_embedding: [batch_size, d_model] final node embedding
+    #         or dictionary with all outputs if return_all=True
+    #     """
+    #     batch_size = walks_dict['short']['nodes_anon'].size(0)
+    #     device = walks_dict['short']['nodes_anon'].device
+        
+    #     # Create node feature embeddings for each walk step
+    #     # In a full implementation, this would use the node_embeddings lookup
+    #     # Here we simulate by using the provided node_embeddings or random ones
+    #     if node_embeddings is None:
+    #         node_embeddings = torch.randn(batch_size, self.d_model, device=device)
+        
+    #     # Process each walk type
+    #     outputs = {}
+        
+    #     for walk_type, type_name in [(0, 'short'), (1, 'long'), (2, 'tawr')]:
+    #         data = walks_dict[type_name]
+    #         nodes_anon = data['nodes_anon']  # [B, num_walks, L]
+    #         masks = data['masks']             # [B, num_walks, L]
+            
+    #         num_walks = nodes_anon.size(1)
+    #         walk_len = nodes_anon.size(2)
+            
+    #         # Create walk embeddings by looking up node_embeddings
+    #         # In practice, you'd have a learned embedding for anonymized node IDs
+    #         # Here we use a simple lookup for demonstration
+    #         # walk_embeddings = torch.zeros(batch_size, num_walks, walk_len, self.d_model, device=device)
+            
+    #         # Simulate: use node_embeddings for each step, ignoring actual anonymized IDs
+    #         # In real implementation, you'd have an embedding table for anonymized IDs
+    #         # for b in range(batch_size):
+    #         #     for w in range(num_walks):
+    #         #         for step in range(walk_len):
+    #         #             if masks[b, w, step] > 0:
+    #         #                 # Use base node embedding (simplified)
+    #         #                 walk_embeddings[b, w, step] = node_embeddings[b]
+            
+    #         walk_embeddings = torch.zeros(batch_size, num_walks, walk_len, self.d_model, device=device)
+    #         for b in range(batch_size):
+    #             for w in range(num_walks):
+    #                 for step in range(walk_len):
+    #                     if masks[b, w, step] > 0:
+    #                         walk_embeddings[b, w, step] = node_embeddings[b]
+            
+            
+            
+    #         # Add restart flag information for TAWR walks (if available)
+    #         if 'restart_flags' in data and type_name == 'tawr':
+    #             restart_flags = data['restart_flags']  # [B, num_walks, L]
+    #             # Could incorporate restart flags as additional features
+    #             # For example, add a learned embedding for restart positions
+    #             restart_embed = torch.zeros_like(walk_embeddings)
+    #             restart_embed[restart_flags.bool()] = 0.1  # Simple additive signal
+    #             walk_embeddings = walk_embeddings + restart_embed
+            
+    #         # Process this walk type
+    #         output = self.process_walk_type(
+    #             walk_embeddings,
+    #             nodes_anon,
+    #             masks,
+    #             walk_type=walk_type
+    #         )
+    #         outputs[type_name] = output
+        
+    #     # Fuse all walk types
+    #     fused = self.fuse_walk_types(
+    #         outputs['short'],
+    #         outputs['long'],
+    #         outputs['tawr']
+    #     )
+        
+    #     if return_all:
+    #         return {
+    #             'fused': fused,
+    #             'short': outputs['short'],
+    #             'long': outputs['long'],
+    #             'tawr': outputs['tawr']
+    #         }
+        
+    #     return fused
+
     def forward(
         self,
         walks_dict: Dict[str, Dict[str, torch.Tensor]],
-        node_embeddings: torch.Tensor,
+        node_memory: torch.Tensor,  # [num_nodes, memory_dim] from SAM
+        memory_proj: Optional[nn.Module] = None,  # Project memory_dim -> d_model
         return_all: bool = False
     ) -> Union[torch.Tensor, Dict]:
         """
-        Main forward pass for HCT.
+        Main forward pass for HCT with proper SAM memory integration.
         
         Args:
-            walks_dict: Dictionary from walk sampler with structure:
-                {
-                    'short': {'nodes_anon': [B, num_short, L], 'masks': [B, num_short, L]},
-                    'long': {'nodes_anon': [B, num_long, L], 'masks': [B, num_long, L]},
-                    'tawr': {'nodes_anon': [B, num_tawr, L], 'masks': [B, num_tawr, L],
-                             'restart_flags': [B, num_tawr, L]}
-                }
-            node_embeddings: [batch_size, d_model] base node embeddings (optional)
-            return_all: If True, return all intermediate outputs
-            
-        Returns:
-            fused_embedding: [batch_size, d_model] final node embedding
-            or dictionary with all outputs if return_all=True
+            walks_dict: From walk sampler with 'nodes' (actual IDs) and 'nodes_anon'
+            node_memory: [num_nodes, memory_dim] SAM raw memory
+            memory_proj: Optional projection layer
+            return_all: Return intermediate outputs
         """
-        batch_size = walks_dict['short']['nodes_anon'].size(0)
-        device = walks_dict['short']['nodes_anon'].device
+        batch_size = walks_dict['short']['nodes'].size(0)
+        device = walks_dict['short']['nodes'].device
         
-        # Create node feature embeddings for each walk step
-        # In a full implementation, this would use the node_embeddings lookup
-        # Here we simulate by using the provided node_embeddings or random ones
-        if node_embeddings is None:
-            node_embeddings = torch.randn(batch_size, self.d_model, device=device)
-        
-        # Process each walk type
         outputs = {}
         
         for walk_type, type_name in [(0, 'short'), (1, 'long'), (2, 'tawr')]:
             data = walks_dict[type_name]
-            nodes_anon = data['nodes_anon']  # [B, num_walks, L]
-            masks = data['masks']             # [B, num_walks, L]
             
-            num_walks = nodes_anon.size(1)
-            walk_len = nodes_anon.size(2)
+            # CRITICAL: Get actual node indices for memory lookup
+            nodes = data['nodes']  # [B, num_walks, L] - actual node IDs
+            nodes_anon = data['nodes_anon']  # [B, num_walks, L] - for co-occurrence
+            masks = data['masks']
             
-            # Create walk embeddings by looking up node_embeddings
-            # In practice, you'd have a learned embedding for anonymized node IDs
-            # Here we use a simple lookup for demonstration
-            walk_embeddings = torch.zeros(batch_size, num_walks, walk_len, self.d_model, device=device)
+            num_walks = nodes.size(1)
+            walk_len = nodes.size(2)
             
-            # Simulate: use node_embeddings for each step, ignoring actual anonymized IDs
-            # In real implementation, you'd have an embedding table for anonymized IDs
-            for b in range(batch_size):
-                for w in range(num_walks):
-                    for step in range(walk_len):
-                        if masks[b, w, step] > 0:
-                            # Use base node embedding (simplified)
-                            walk_embeddings[b, w, step] = node_embeddings[b]
+            # Lookup from SAM memory using actual node IDs
+            flat_nodes = nodes.reshape(-1)  # [B * num_walks * L]
+            walk_node_feats = node_memory[flat_nodes]  # [B*num_walks*L, memory_dim]
             
-            # Add restart flag information for TAWR walks (if available)
-            if 'restart_flags' in data and type_name == 'tawr':
-                restart_flags = data['restart_flags']  # [B, num_walks, L]
-                # Could incorporate restart flags as additional features
-                # For example, add a learned embedding for restart positions
-                restart_embed = torch.zeros_like(walk_embeddings)
-                restart_embed[restart_flags.bool()] = 0.1  # Simple additive signal
+            # Project to d_model if needed
+            if memory_proj is not None:
+                walk_node_feats = memory_proj(walk_node_feats)
+            
+            # Reshape: [B, num_walks, L, d_model]
+            walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, self.d_model)
+            
+            # Add restart flags for TAWR
+            if type_name == 'tawr' and 'restart_flags' in data:
+                restart_flags = data['restart_flags'].unsqueeze(-1).float()
+                # Learnable restart embedding or simple marker
+                restart_embed = restart_flags * 0.1
                 walk_embeddings = walk_embeddings + restart_embed
             
-            # Process this walk type
+            # Process through HCT pipeline
             output = self.process_walk_type(
                 walk_embeddings,
-                nodes_anon,
+                nodes_anon,  # Use anonymized for co-occurrence
                 masks,
                 walk_type=walk_type
             )
             outputs[type_name] = output
         
-        # Fuse all walk types
-        fused = self.fuse_walk_types(
-            outputs['short'],
-            outputs['long'],
-            outputs['tawr']
-        )
+        # Fuse and return
+        fused = self.fuse_walk_types(outputs['short'], outputs['long'], outputs['tawr'])
         
         if return_all:
-            return {
-                'fused': fused,
-                'short': outputs['short'],
-                'long': outputs['long'],
-                'tawr': outputs['tawr']
-            }
-        
+            return {'fused': fused, **outputs}
         return fused

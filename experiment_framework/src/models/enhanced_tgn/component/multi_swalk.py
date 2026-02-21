@@ -5,6 +5,7 @@ from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
 from collections import defaultdict
 import random
+from loguru import logger
 
 from .time_encoder import TimeEncoder
 
@@ -164,8 +165,9 @@ class MultiScaleWalkSampler(nn.Module):
             # Default to 0.1 if no memory (e.g., during initialization)
             return 0.1
         
+        device = memory_state.device
         # Get time encoding
-        time_tensor = torch.tensor([current_time], device=self.device).float()
+        time_tensor = torch.tensor([current_time], device=device).float()
         time_enc = self.time_encoder(time_tensor)  # [1, time_dim]
         
         # Combine memory and time encoding
@@ -200,6 +202,8 @@ class MultiScaleWalkSampler(nn.Module):
                 - 'masks': [batch_size, num_walks_short, walk_length_short] (1 if valid)
         """
         batch_size = len(source_nodes)
+        
+        device = source_nodes.device
         
         # Convert to numpy for iterative sampling
         source_np = source_nodes.cpu().numpy()
@@ -244,9 +248,9 @@ class MultiScaleWalkSampler(nn.Module):
         
         # Convert to tensors
         return {
-            'nodes': torch.tensor(walk_nodes, device=self.device),
-            'times': torch.tensor(walk_times, device=self.device),
-            'masks': torch.tensor(walk_masks, device=self.device)
+            'nodes': torch.tensor(walk_nodes, device = device),
+            'times': torch.tensor(walk_times, device = device),
+            'masks': torch.tensor(walk_masks, device = device)
         }   
     
     
@@ -260,6 +264,9 @@ class MultiScaleWalkSampler(nn.Module):
         Sample long walks (same as short walks but with longer length).
         """
         batch_size = len(source_nodes)
+        
+        device = source_nodes.device
+        
         source_np = source_nodes.cpu().numpy()
         times_np = current_times.cpu().numpy()
         
@@ -295,9 +302,9 @@ class MultiScaleWalkSampler(nn.Module):
                     curr_time = next_time
         
         return {
-            'nodes': torch.tensor(walk_nodes, device=self.device),
-            'times': torch.tensor(walk_times, device=self.device),
-            'masks': torch.tensor(walk_masks, device=self.device)
+            'nodes': torch.tensor(walk_nodes, device = device),
+            'times': torch.tensor(walk_times, device = device),
+            'masks': torch.tensor(walk_masks, device = device)
         }
     
     
@@ -326,6 +333,9 @@ class MultiScaleWalkSampler(nn.Module):
                 - 'masks': [batch_size, num_walks_tawr, walk_length_tawr]
         """
         batch_size = len(source_nodes)
+        
+        device = source_nodes.device
+        
         source_np = source_nodes.cpu().numpy()
         times_np = current_times.cpu().numpy()
         
@@ -383,10 +393,10 @@ class MultiScaleWalkSampler(nn.Module):
                         curr_time = next_time
         
         return {
-            'nodes': torch.tensor(walk_nodes, device=self.device),
-            'times': torch.tensor(walk_times, device=self.device),
-            'restart_flags': torch.tensor(walk_restart, device=self.device),
-            'masks': torch.tensor(walk_masks, device=self.device)
+            'nodes': torch.tensor(walk_nodes, device = device),
+            'times': torch.tensor(walk_times, device = device),
+            'restart_flags': torch.tensor(walk_restart, device = device),
+            'masks': torch.tensor(walk_masks, device = device)
         }
     
     
@@ -511,3 +521,6 @@ class MultiScaleWalkSampler(nn.Module):
                 'tawr': {k: v[batch_size:] for k, v in tawr_walks.items()}
             }
         }
+
+        # logger.debug("Walk sampler result keys:", result.keys())  # or use logger
+        return result
