@@ -113,61 +113,91 @@ class CooccurrenceMatrix(nn.Module):
         
         self.register_buffer('kernel', kernel)
     
-    def forward(
-        self,
-        anonymized_nodes: torch.Tensor,  # [batch_size, num_walks, walk_length] with anonymized IDs
-        walk_masks: torch.Tensor          # [batch_size, num_walks, walk_length] (1 for valid)
-    ) -> torch.Tensor:
-        """
-        Compute co-occurrence matrix for each batch item.
+    # def forward(
+    #     self,
+    #     anonymized_nodes: torch.Tensor,  # [batch_size, num_walks, walk_length] with anonymized IDs
+    #     walk_masks: torch.Tensor          # [batch_size, num_walks, walk_length] (1 for valid)
+    # ) -> torch.Tensor:
+    #     """
+    #     Compute co-occurrence matrix for each batch item.
         
-        Returns:
-            cooccurrence: [batch_size, num_walks, num_walks]
-        """
-        batch_size, num_walks, walk_len = anonymized_nodes.shape
+    #     Returns:
+    #         cooccurrence: [batch_size, num_walks, num_walks]
+    #     """
+    #     batch_size, num_walks, walk_len = anonymized_nodes.shape
         
-        # Truncate kernel to actual walk length
-        kernel = self.kernel[:walk_len, :walk_len]  # [walk_len, walk_len]
+    #     # Truncate kernel to actual walk length
+    #     kernel = self.kernel[:walk_len, :walk_len]  # [walk_len, walk_len]
         
-        # Create co-occurrence tensor
-        cooccurrence = torch.zeros(batch_size, num_walks, num_walks, device=anonymized_nodes.device)
+    #     # Create co-occurrence tensor
+    #     cooccurrence = torch.zeros(batch_size, num_walks, num_walks, device=anonymized_nodes.device)
         
-        for b in range(batch_size):
-            for r in range(num_walks):
-                for s in range(num_walks):
-                    if r == s:
-                        # Self-cooccurrence is high by default
-                        cooccurrence[b, r, s] = 1.0
-                        continue
+    #     for b in range(batch_size):
+    #         for r in range(num_walks):
+    #             for s in range(num_walks):
+    #                 if r == s:
+    #                     # Self-cooccurrence is high by default
+    #                     cooccurrence[b, r, s] = 1.0
+    #                     continue
                     
-                    # Get nodes and masks for these walks
-                    nodes_r = anonymized_nodes[b, r]  # [walk_len]
-                    nodes_s = anonymized_nodes[b, s]  # [walk_len]
-                    mask_r = walk_masks[b, r]  # [walk_len]
-                    mask_s = walk_masks[b, s]  # [walk_len]
+    #                 # Get nodes and masks for these walks
+    #                 nodes_r = anonymized_nodes[b, r]  # [walk_len]
+    #                 nodes_s = anonymized_nodes[b, s]  # [walk_len]
+    #                 mask_r = walk_masks[b, r]  # [walk_len]
+    #                 mask_s = walk_masks[b, s]  # [walk_len]
                     
-                    # Create valid position pairs
-                    score = 0.0
-                    total_pairs = 0
+    #                 # Create valid position pairs
+    #                 score = 0.0
+    #                 total_pairs = 0
                     
-                    for i in range(walk_len):
-                        if mask_r[i] == 0:
-                            continue
-                        for j in range(walk_len):
-                            if mask_s[j] == 0:
-                                continue
+    #                 for i in range(walk_len):
+    #                     if mask_r[i] == 0:
+    #                         continue
+    #                     for j in range(walk_len):
+    #                         if mask_s[j] == 0:
+    #                             continue
                             
-                            if nodes_r[i] == nodes_s[j] and nodes_r[i] != 0:  # 0 is padding
-                                # Same anonymized node appears at positions i and j
-                                score += kernel[i, j]
-                                total_pairs += 1
+    #                         if nodes_r[i] == nodes_s[j] and nodes_r[i] != 0:  # 0 is padding
+    #                             # Same anonymized node appears at positions i and j
+    #                             score += kernel[i, j]
+    #                             total_pairs += 1
                     
-                    if total_pairs > 0:
-                        cooccurrence[b, r, s] = score / total_pairs
-                    else:
-                        cooccurrence[b, r, s] = 0.0
+    #                 if total_pairs > 0:
+    #                     cooccurrence[b, r, s] = score / total_pairs
+    #                 else:
+    #                     cooccurrence[b, r, s] = 0.0
         
-        return cooccurrence
+    #     return cooccurrence
+    
+    def forward(self, anonymized_nodes, walk_masks):
+        """Fully vectorized but memory-intensive version."""
+        batch_size, num_walks, walk_len = anonymized_nodes.shape
+        device = anonymized_nodes.device
+        
+        # Expand for all pairs: [batch, walks, 1, len] vs [batch, 1, walks, len]
+        nodes_expanded = anonymized_nodes.unsqueeze(2)  # [B, R, 1, L]
+        nodes_expanded_t = anonymized_nodes.unsqueeze(1)  # [B, 1, S, L]
+        
+        # Match matrix: [B, R, S, L, L] - True where node IDs match
+        match = (nodes_expanded.unsqueeze(-1) == nodes_expanded_t.unsqueeze(-2))  # [B, R, S, L, L]
+        
+        # Apply masks: [B, R, 1, L, 1] * [B, 1, S, 1, L]
+        mask_r = walk_masks.unsqueeze(2).unsqueeze(-1)  # [B, R, 1, L, 1]
+        mask_s = walk_masks.unsqueeze(1).unsqueeze(-2)  # [B, 1, S, 1, L]
+        match = match & mask_r.bool() & mask_s.bool()
+        
+        # Kernel: [L, L] -> [1, 1, 1, L, L]
+        kernel = self.kernel[:walk_len, :walk_len].to(device)
+        
+        # Weighted sum: [B, R, S, L, L] * [L, L] -> sum -> [B, R, S]
+        cooccurrence = (match.float() * kernel).sum(dim=[-2, -1])
+        
+        # Normalize
+        valid_r = walk_masks.sum(dim=-1, keepdim=True)  # [B, R, 1]
+        valid_s = walk_masks.sum(dim=-1, keepdim=True)  # [B, S, 1]
+        norm = valid_r * valid_s.transpose(1, 2) + 1e-8
+        
+        return cooccurrence / norm
 
 
 class InterWalkTransformer(nn.Module):
