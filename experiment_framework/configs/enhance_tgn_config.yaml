@@ -24,7 +24,7 @@ training:
   learning_rate: 0.001
   weight_decay: 0.0001
   max_epochs: 100
-  patience: 10
+  patience: 5 # 3/5/10
   val_check_interval: 1.0
   gradient_clip_val: 1.0
   log_every_n_steps: 10
@@ -43,6 +43,7 @@ data:
   evaluation_type: "transductive"
   negative_sampling_strategy: "random"
   unseen_ratio: 0.1
+  validate_batches: true
   
 # Experiment parameters
 experiment:
@@ -51,6 +52,7 @@ experiment:
   seed: 42  
   device: "auto"  # auto, cpu, cuda
   precision: 32
+  debug: False
   
 # Logging
 logging:
@@ -64,7 +66,11 @@ logging:
 evaluation:
   metrics: ["accuracy", "ap", "auc"]
   test_batch_size: 1000
-  
+
+profiling:
+  enabled: true
+  profile_type: 'pytorch'
+
 # Hardware
 hardware:
   gpus: 1  # null for CPU, number for GPU count

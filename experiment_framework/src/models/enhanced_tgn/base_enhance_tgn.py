@@ -27,7 +27,7 @@ from src.models.tgn_module.embedding_module import get_embedding_module
 
 
 class BaseEnhancedTGN(BaseDynamicGNN, ABC):
-    """Temporal Graph Networks.
+    """Base Enhance TGN.
    
     """    
     def __init__(
@@ -595,7 +595,8 @@ class BaseEnhancedTGN(BaseDynamicGNN, ABC):
             self.edge_raw_features = self.edge_raw_features.to(device)
             logger.info(f" Moved edge_raw_features to {device} in on_fit_start()")
 
-    def on_train_batch_start(self, batch, batch_idx):
+    def on_train_batch_start(self, batch, batch_idx):         
+
         if self.use_memory and self.memory is not None:
             mem_mean = self.memory.memory.mean().item()
             mem_std = self.memory.memory.std().item()

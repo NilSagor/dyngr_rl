@@ -1,3 +1,4 @@
+import os
 import torch 
 import torch.nn as nn
 import numpy as np
@@ -90,7 +91,9 @@ class TGNv5(BaseEnhancedTGN):
             memory_updater_type="none",  # Disable GRU updater - SAM handles updates
             **kwargs
         )
-        torch.autograd.set_detect_anomaly(True)
+        # torch.autograd.set_detect_anomaly(True)
+        if os.environ.get('DEBUG_GRADIENTS'):
+            torch.autograd.set_detect_anomaly(True)
         
         # Initialize SAM with ALL required parameters
         self.sam_module = StabilityAugmentedMemory(
@@ -138,6 +141,7 @@ class TGNv5(BaseEnhancedTGN):
             # We project SAM memory into HCT space
             self.hct = HierarchicalCooccurrenceTransformer(
                 d_model=hct_d_model, # HCT operates in this space
+                memory_dim=memory_dim,
                 nhead=hct_nhead,
                 num_intra_layers=hct_num_intra_layers,
                 num_inter_layers=hct_num_inter_layers,
@@ -262,7 +266,8 @@ class TGNv5(BaseEnhancedTGN):
             else torch.from_numpy(edge_times).float().to(device)
         
         # cache_key = (src_tensor.nbytes(), ts_tensor[0].item())  # Simple key
-
+        
+        # 1. Generate walks (indices only)
         if self._cache_walks:
             cache_key = self._get_cache_key(src_tensor, ts_tensor)
             if cache_key in self._walk_cache:
@@ -299,21 +304,21 @@ class TGNv5(BaseEnhancedTGN):
         #     edge_time=None
         # )
         
-        # 2. HCT encodes walks by looking up SAM memory
+        
         # 2. HCT encodes walks by looking up SAM memory
         if self.use_hct:
             # Pass walks_dict with 'nodes' (for lookup) and 'nodes_anon' (for co-occurrence)
             hct_src_output = self.hct(
                 walks_dict=walk_data['source'],
                 node_memory=self.sam_module.raw_memory,
-                memory_proj=self.memory_proj,
+                # memory_proj=self.memory_proj,
                 return_all=True  # Return dict with all intermediate outputs
             )
             
             hct_dst_output = self.hct(
                 walks_dict=walk_data['target'],
                 node_memory=self.sam_module.raw_memory,
-                memory_proj=self.memory_proj,
+                # memory_proj=self.memory_proj,
                 return_all=True
             )
             
@@ -336,6 +341,11 @@ class TGNv5(BaseEnhancedTGN):
         #     print(f"HCT output: mean={hct_src_emb.mean():.4f}, std={hct_src_emb.std():.4f}")
         #     print(f"HCT output range: [{hct_src_emb.min():.4f}, {hct_src_emb.max():.4f}]")
         
+        # if self.training and torch.rand(1).item() < 0.01:  # log ~1% of batches
+        #     logger.info(f"Short walks (first batch): {walk_data['source']['short']['nodes'][0, :, :]}")
+        #     logger.info(f"Anonymized short: {walk_data['source']['short']['nodes_anon'][0, :, :]}")
+        #     logger.info(f"Masks: {walk_data['source']['short']['masks'][0, :, :]}")
+
         
         # 3. Base TGN embeddings from SAM + graph attention
         if self.embedding_module is not None:
@@ -388,7 +398,37 @@ class TGNv5(BaseEnhancedTGN):
             'edge_features': edge_feats
         }
         
+    def set_neighbor_finder(self, neighbor_finder):
+        # First call the base method to initialize embedding module, etc.
+        super().set_neighbor_finder(neighbor_finder)
+
+        # Extract edge_index and edge_time from the neighbor finder
+        if hasattr(neighbor_finder, 'edge_index') and hasattr(neighbor_finder, 'edge_time'):
+            edge_index = neighbor_finder.edge_index
+            edge_time = neighbor_finder.edge_time
+
+            # Ensure they are torch tensors on CPU (update_neighbors handles device later)
+            if not isinstance(edge_index, torch.Tensor):
+                edge_index = torch.tensor(edge_index)
+            if not isinstance(edge_time, torch.Tensor):
+                edge_time = torch.tensor(edge_time)
+
+            # Initialize the walk sampler's neighbor cache
+            self.walk_sampler.update_neighbors(edge_index, edge_time)
+            logger.info(f"Walk sampler initialized with {edge_index.size(1)} edges")
+        else:
+            logger.warning("Neighbor finder missing edge_index/edge_time; walks will not work")
     
+    def set_graph(self, edge_index: torch.Tensor, edge_time: torch.Tensor):
+        """
+        Provide the full training graph to the walk sampler.
+        Must be called before any forward pass.
+        """
+        self.walk_sampler.update_neighbors(edge_index, edge_time)
+        self.walk_sampler.build_dense_neighbor_table()  # ADD THIS LINE
+        logger.info(f"Walk sampler initialized with {edge_index.size(1)} edges, "
+                    f"max_degree={self.walk_sampler.dense_neighbor_ids.size(1) if hasattr(self.walk_sampler, 'dense_neighbor_ids') else 'N/A'}")
+
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
         """Override to use SAM memory instead of GRU memory."""
         return self.sam_module.get_memory(node_ids)
@@ -396,6 +436,32 @@ class TGNv5(BaseEnhancedTGN):
     def _get_cache_key(self, src_tensor: torch.Tensor, ts_tensor: torch.Tensor) -> tuple:
         """Safe cache key generation."""
         return (src_tensor.data_ptr(), src_tensor.shape, ts_tensor[0].item())
+    
+    def on_load_checkpoint(self, checkpoint):
+        """Called when loading a checkpoint."""
+        # Rebuild neighbor cache from the dataset
+        if hasattr(self, 'neighbor_finder') and self.neighbor_finder is not None:
+            self._initialize_walk_sampler_from_neighbor_finder()
+    
+    def _initialize_walk_sampler_from_neighbor_finder(self):
+        """Extract edge_index and edge_time from neighbor_finder and initialize walk sampler."""
+        nf = self.neighbor_finder
+        
+        # Try to get edges from neighbor_finder
+        if hasattr(nf, '_edges') and hasattr(nf, '_timestamps'):
+            # Your neighbor finder stores edges internally
+            edge_index = torch.tensor(nf._edges, dtype=torch.long).t()  # [2, num_edges]
+            edge_time = torch.tensor(nf._timestamps, dtype=torch.float)  # [num_edges]
+            
+            self.walk_sampler.update_neighbors(edge_index, edge_time)
+            self.walk_sampler.build_dense_neighbor_table()
+            logger.info(f"Walk sampler reinitialized with {edge_index.shape[1]} edges")
+        elif hasattr(nf, 'edge_index') and hasattr(nf, 'edge_time'):
+            # Direct attributes
+            self.walk_sampler.update_neighbors(nf.edge_index, nf.edge_time)
+            self.walk_sampler.build_dense_neighbor_table()
+        else:
+            logger.error("Cannot find edge data in neighbor_finder for walk sampler")
     
     def on_fit_start(self):
         """Initialize SAM memory at start of training."""
@@ -427,12 +493,13 @@ class TGNv5(BaseEnhancedTGN):
             mem_after_std = self.sam_module.raw_memory.std().item()
             
             if batch_idx % 100 == 0:
-                logger.info(f"Batch {batch_idx}: SAM | "
-                        f"norm: {mem_before_norm:.2f} -> {mem_after_norm:.2f}, "
-                        f"std: {mem_before_std:.4f} -> {mem_after_std:.4f}")
-            
-            # Clear buffer
+                mem = self.sam_module.raw_memory
+                logger.info(f"Batch {batch_idx}: raw_memory | "
+                        f"mean={mem.mean().item():.4f}, "
+                        f"std={mem.std().item():.4f}, "
+                        f"nonzero={(mem.abs() > 1e-6).float().mean().item():.2%}")
             # CRITICAL: Delete buffer to prevent memory leak
+            # Clear buffer
             delattr(self, '_sam_batch_buffer')
     
     def on_validation_epoch_start(self):

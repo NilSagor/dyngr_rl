@@ -1,5 +1,6 @@
 """
-train.py - Clean, modular training pipeline for temporal graph models.
+train.py version 0.2- 
+Clean, modular training pipeline for temporal graph models.
 """
 
 import os
@@ -27,6 +28,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 from torch.utils.data import DataLoader
 from loguru import logger
+from torch.profiler import profile, record_function, ProfilerActivity
+from lightning.pytorch.profilers import PyTorchProfiler
 
 # Local imports
 from src.models.dygformer import DyGFormer
@@ -126,6 +129,22 @@ def apply_overrides(config: Dict, overrides: List[str]) -> Dict:
     
     return config
 
+def validate_model_ready(model, pipeline):
+    assert model.neighbor_finder is not None, "Neighbor finder not set"
+    
+    if hasattr(model, 'walk_sampler') and model.walk_sampler is not None:
+        # Check if walk sampler has required graph data
+        if hasattr(model.walk_sampler, 'edge_index'):
+            assert model.walk_sampler.edge_index is not None, \
+                "Walk sampler missing edge_index"
+            assert model.walk_sampler.edge_time is not None, \
+                "Walk sampler missing edge_time"
+        else:
+            logger.warning("Walk sampler may not be initialized - check set_graph() call")
+
+
+
+
 
 def build_experiment_config(config: Dict, seed: int) -> Dict:
     """Build final experiment configuration with derived fields."""
@@ -212,8 +231,9 @@ class DataPipeline:
             train_edges=train_edges,
             train_timestamps=train_ts,
             max_neighbors=self.config['data']['max_neighbors']
-        )
+        )       
         
+
         logger.info(f" Built leakage-proof NeighborFinder from {len(train_edges)} training edges")
         return self
     
@@ -416,11 +436,7 @@ class DataPipeline:
             'num_nodes': self.data['num_nodes'],
             'edge_feat_dim': train_edge_features.shape[1] if train_edge_features is not None else 0,
             'node_feat_dim': node_features.shape[1] if node_features is not None else 0,
-        }     
-        
-        
-    
-    
+        }  
     
     @property
     def num_nodes(self) -> int:
@@ -548,6 +564,20 @@ class TrainerSetup:
         accelerator = 'gpu' if config['hardware']['gpus'] else 'cpu'
         devices = config['hardware']['gpus'] if config['hardware']['gpus'] else 'auto'
         
+        profiler = None
+        if config.get('profiling', {}).get('enabled', False):
+            profiler = PyTorchProfiler(
+                dirpath=config['logging']['log_dir'],
+                filename="profile",
+                schedule=torch.profiler.schedule(wait=1, warmup=2, active=3, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    config['logging']['log_dir']
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+        
         return L.Trainer(
             max_epochs=config['training']['max_epochs'],
             accelerator=accelerator,
@@ -559,6 +589,7 @@ class TrainerSetup:
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
             enable_progress_bar=True,
+            # profiler=profiler,
         )
 
 
@@ -632,6 +663,19 @@ def load_checkpoint_safely(checkpoint_path, model, config):
     return model.load_from_checkpoint(checkpoint_path)
 
 
+def initialize_model_for_inference(model, pipeline, features, config):
+    """Ensure model is fully initialized for inference (post-checkpoint load)."""
+    model.set_raw_features(features['node_features'], features['edge_features'])
+    model.set_neighbor_finder(pipeline.neighbor_finder)
+    
+    # Critical for walk-based models (TGNv5, etc.)
+    # set_graph now handles building the dense table internally
+    if hasattr(model, 'set_graph'):
+        model.set_graph(pipeline.train_edges, pipeline.train_times)
+    
+    return model
+
+
 
 # ============================================================================
 # MAIN TRAINING LOOP
@@ -654,7 +698,33 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         .build_neighbor_finder()
         .build_samplers()
         .build_datasets()
-        .build_loaders())
+        .build_loaders()
+    )    
+
+    # Extract training edges (the same ones used for the neighbor finder)
+    train_edges = pipeline.data['edges'][pipeline.data['train_mask']]          # [2, num_train_edges]
+    train_times = pipeline.data['timestamps'][pipeline.data['train_mask']]     # [num_train_edges]
+
+    # Convert to torch tensors if needed
+    if not isinstance(train_edges, torch.Tensor):
+        train_edges = torch.tensor(train_edges)
+    if not isinstance(train_times, torch.Tensor):
+        train_times = torch.tensor(train_times)
+
+    # Ensure walk-sampler friendly shape: [2, num_edges]
+    if train_edges.shape[0] != 2:
+        # Assume shape is [num_edges, 2] -> transpose
+        train_edges = train_edges.T.contiguous()
+        logger.info(f"Transposed train_edges to shape {train_edges.shape}")
+
+    # Ensure train_times is 1D
+    if train_times.dim() == 2 and train_times.shape[1] == 1:
+        train_times = train_times.squeeze(1)
+    
+    # Store them to pass to the model later
+    pipeline.train_edges = train_edges
+    pipeline.train_times = train_times
+    
     
     # Model
     features = pipeline.get_features()
@@ -664,27 +734,26 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     model.set_raw_features(features['node_features'], features['edge_features'])
     
     model.set_neighbor_finder(pipeline.neighbor_finder)
+    model.set_graph(pipeline.train_edges, pipeline.train_times)
     
-    # CRITICAL: Set neighbor finder for TGN
-    # if hasattr(model, 'set_neighbor_finder'):
-    #     model.set_neighbor_finder(pipeline.neighbor_finder)
 
     # Debug: Verify embedding module initialized
     if hasattr(model, 'embedding_module'):
-        print(f"Embedding module initialized: {model.embedding_module is not None}")
+        logger.debug(f"Embedding module initialized: {model.embedding_module is not None}")
 
-    print(f"1. embedding_module exists: {model.embedding_module is not None}")
-    print(f"2. memory_updater exists: {model.memory_updater is not None}")
-    print(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
-    print(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
-    print(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
+    logger.debug(f"1. embedding_module exists: {model.embedding_module is not None}")
+    logger.debug(f"2. memory_updater exists: {model.memory_updater is not None}")
+    logger.debug(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
+    logger.debug(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
+    logger.debug(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
 
+    # logger.debug(f"Embedding module: {model.embedding_module is not None}")
        
     
     # Setup trainer
     trainer = TrainerSetup.create(config)
-    print(f"Trainer max_epochs: {trainer.max_epochs}")
-    print(f"EarlyStopping patience: {[c for c in trainer.callbacks if isinstance(c, EarlyStopping)]}")
+    logger.info(f"Trainer max_epochs: {trainer.max_epochs}")
+    logger.info(f"EarlyStopping patience: {[c for c in trainer.callbacks if isinstance(c, EarlyStopping)]}")
     
     # Train
     logger.info("Starting training...")
@@ -695,34 +764,76 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     )
 
     # Load the best checkpoint for testing
-    if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
-        best_path = trainer.checkpoint_callback.best_model_path
-        logger.info(f"Loading best checkpoint from {best_path}")
+    # if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
+    #     best_path = trainer.checkpoint_callback.best_model_path
+    #     logger.info(f"Loading best checkpoint from {best_path}")
         
-        # 1. Re‑create a fresh model with the same configuration and data
-        #    (ModelFactory.create already gives a new instance)
+    #     # 1. Re‑create a fresh model with the same configuration and data
+    #     #    (ModelFactory.create already gives a new instance)
+    #     model = ModelFactory.create(config, features)
+    #     model.set_raw_features(features['node_features'], features['edge_features'])
+    #     model.set_neighbor_finder(pipeline.neighbor_finder)
+
+    #     # set graph structure for walk sampling
+    #     model.set_graph(pipeline.train_edges, pipeline.train_times)
+        
+    #     # 2. Load the checkpoint with strict=False – ignore unexpected keys
+    #     checkpoint = torch.load(best_path, map_location='cpu', weights_only=True)
+    #     model.load_state_dict(checkpoint['state_dict'], strict=False)
+        
+    #     # 3. Ensure model is on correct device and in eval mode
+    #     model = model.to(get_device())  # Move after loading
+    #     # model = model.to(model.device)
+    #     model.eval()        
+    #     logger.info("Best checkpoint loaded successfully (strict=False).")
+    # else:
+    #     logger.warning("No checkpoint callback or best model path found. Using current model.")
+    
+    # Test
+    # logger.info("Running evaluation...")
+    # test_results = trainer.test(
+    #     model=model, 
+    #     dataloaders=pipeline.loaders['test'],
+    #     ckpt_path='best'
+    # )
+    if trainer.checkpoint_callback.best_model_path:
+        best_path = trainer.checkpoint_callback.best_model_path
+        
+        # 1. Create fresh model and initialize with pipeline data
         model = ModelFactory.create(config, features)
         model.set_raw_features(features['node_features'], features['edge_features'])
         model.set_neighbor_finder(pipeline.neighbor_finder)
         
-        # 2. Load the checkpoint with strict=False – ignore unexpected keys
-        checkpoint = torch.load(best_path, map_location=model.device)
-        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        # 2. CRITICAL: Initialize walk sampler with full graph BEFORE loading checkpoint
+        # This ensures the walk sampler has the graph structure
+        model.set_graph(pipeline.train_edges, pipeline.train_times)
         
-        # 3. Ensure model is on correct device and in eval mode
-        model = model.to(model.device)
-        model.eval()
+        # 3. Now load checkpoint weights
+        logger.info(f"Loading best checkpoint from {best_path}")
+
+        checkpoint = torch.load(best_path, map_location='cpu', weights_only=True)
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
         
-        logger.info("Best checkpoint loaded successfully (strict=False).")
-    else:
-        logger.warning("No checkpoint callback or best model path found. Using current model.")
+        # 4. Move to device and set to eval mode
+        model = model.to(get_device()).eval()
+
+        # 5. Validate model is ready
+        if config['experiment'].get('debug', False):
+            validate_model_ready(model, pipeline)
+        
+        logger.info("Best checkpoint loaded and walk sampler initialized successfully.")
+        
+                 
+        
+       
+
+    # Test - Lightning auto-loads best checkpoint via ckpt_path='best'
+    logger.info("Running evaluation with best checkpoint...")
     
-    # Test
-    logger.info("Running evaluation...")
     test_results = trainer.test(
-        model=model, 
+        model=model,  # Same model instance (no recreation needed)
         dataloaders=pipeline.loaders['test'],
-        ckpt_path='best'
+        ckpt_path='best'  # ← Lightning handles loading + proper init
     )
     
     # Log results
@@ -777,3 +888,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# python experiment_framework/src/experiments/train_v2.py --config experiment_framework/configs/enhance_tgn_config.yaml --override model.name=TGNv5  data.dataset=wikipedia  data.evaluation_type=transductive data.negative_sampling_strategy=random experiment.seed=42

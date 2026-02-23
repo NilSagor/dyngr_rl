@@ -1,6 +1,6 @@
 import torch 
 import torch.nn as nn
-
+from loguru import logger
 
 class TimeEncoder(nn.Module):
     """ Fixed Time Encoder using trigeometric feature
@@ -44,6 +44,11 @@ class TimeEncoder(nn.Module):
             flattened = True
         else:
             raise ValueError(f"Expected 1D or 2D tensor, got shape {original_shape}")
+        
+        if torch.isnan(times).any() or torch.isinf(times).any():
+            logger.error(f"times contains NaN/Inf: {times}")
+            raise RuntimeError("Invalid times in TimeEncoder")
+        
         
         # compute projection = times*freqs
         projection = times.unsqueeze(-1) * self.freqs # [B, dim//2]
