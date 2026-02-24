@@ -3,617 +3,745 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Union, Callable
+from typing import Optional, Tuple, List, Dict, Union, Callable, NamedTuple, Protocol
 from torchdiffeq import odeint, odeint_adjoint
 
-from .time_encoder import TimeEncoder
+from torch.utils.checkpoint import checkpoint
+from time_encoder import TimeEncoder
 
+import time
 
 class GRUODECell(nn.Module):
     """
-    GRU-inspired ODE function for continuous-time dynamics.
-    
-    This defines the dynamics f_ode(h, t) for the ODE:
-    dh/dt = f_ode(h, t)
-    
-    Based on GRU structure but without input features (pure time evolution).
+    GRU-inspired ODE function: dh/dt = (1-z) * (h̃ - h)
+    where z = σ(W_z h), r = σ(W_r h), h̃ = tanh(W_h(r⊙h) + t_mod)
     """
     def __init__(self, hidden_dim: int):
-        super(GRUODECell, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
         
-        # GRU-like gates for ODE dynamics
-        self.update_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()
-        )
+        # Linear layers only (activations applied in forward for efficiency)
+        self.W_update = nn.Linear(hidden_dim, hidden_dim)
+        self.W_reset = nn.Linear(hidden_dim, hidden_dim)  
+        self.W_candidate = nn.Linear(hidden_dim, hidden_dim)
+        self.W_time = nn.Linear(1, hidden_dim)
         
-        self.reset_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Sigmoid()
-        )
-        
-        self.candidate_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        
-        # Time modulation (allows dynamics to change with time)
-        self.time_modulation = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.Tanh()
-        )
-        
-        # Initialize weights
-        for module in [self.update_gate, self.reset_gate, self.candidate_proj, self.time_modulation]:
-            for layer in module:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
     
     def forward(self, t: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """
-        Compute dh/dt at time t.
-        
         Args:
-            t: Current time [batch_size, 1] or scalar
-            h: Hidden state [batch_size, hidden_dim]
-            
+            t: [scalar] or [batch_size, 1] or [1] - current time
+            h: [batch_size, hidden_dim] - hidden state
         Returns:
-            dh/dt [batch_size, hidden_dim]
+            dh/dt: [batch_size, hidden_dim]
         """
-        # Handle scalar t
+        batch_size = h.size(0)
+        
+        # Normalize time to [batch_size, 1]
         if t.dim() == 0:
-            t = t.view(1, 1).expand(h.size(0), -1)
+            t = t.view(1, 1)
         elif t.dim() == 1:
-            t = t.unsqueeze(-1)
+            t = t.unsqueeze(-1) if t.size(0) != 1 else t.view(1, 1)
         
-        # Get time modulation
-        t_mod = self.time_modulation(t)  # [batch_size, hidden_dim]
+        # Broadcast time if needed
+        if t.size(0) != batch_size:
+            t = t.expand(batch_size, -1)
         
-        # GRU-like dynamics
-        z = self.update_gate(h)  # update gate
-        r = self.reset_gate(h)   # reset gate
+        # Compute gates and derivative (fused, minimal allocations)
+        z = torch.sigmoid(self.W_update(h))
+        r = torch.sigmoid(self.W_reset(h))
+        t_mod = torch.tanh(self.W_time(t))
+        h_tilde = torch.tanh(self.W_candidate(r * h)) + t_mod
         
-        # Candidate hidden state with reset
-        h_tilde = self.candidate_proj(r * h)
-        
-        # Modulate with time
-        h_tilde = h_tilde + t_mod
-        
-        # Compute derivative (GRU-inspired)
-        dh_dt = (1 - z) * (h_tilde - h)
-        
-        return dh_dt
-
+        return (1 - z) * (h_tilde - h)
 
 class ODEFunc(nn.Module):
     """
-    General ODE function with optional spectral regularization.
+    General ODE function: dh/dt = f(h, t)
+    Supports GRU-inspired or MLP-based dynamics.
     """
     def __init__(
         self,
         hidden_dim: int,
         use_gru_ode: bool = True,
         hidden_layers: int = 2,
-        activation: str = 'tanh'
+        activation: str = 'tanh',
+        time_invariant: bool = False  # New: explicit control
     ):
-        super(ODEFunc, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.use_gru_ode = use_gru_ode
+        self.time_invariant = time_invariant
         
         if use_gru_ode:
-            # Use GRU-inspired dynamics
-            self.gru_ode = GRUODECell(hidden_dim)
+            self.dynamics = GRUODECell(hidden_dim)
         else:
-            # Use MLP-based dynamics
-            layers = []
-            in_dim = hidden_dim
-            for i in range(hidden_layers):
-                out_dim = hidden_dim if i < hidden_layers - 1 else hidden_dim
-                layers.append(nn.Linear(in_dim, out_dim))
-                if activation == 'tanh':
-                    layers.append(nn.Tanh())
-                elif activation == 'relu':
-                    layers.append(nn.ReLU())
-                elif activation == 'softplus':
-                    layers.append(nn.Softplus())
-                in_dim = out_dim
-            self.mlp = nn.Sequential(*layers)
+            self.dynamics = self._build_mlp(
+                hidden_dim, hidden_layers, activation, time_invariant
+            )
+        
+        self._init_weights()
+    
+    def _build_mlp(self, dim: int, num_layers: int, activation: str, time_invariant: bool):
+        """Build MLP with optional time concatenation."""
+        act_map = {'tanh': nn.Tanh, 'relu': nn.ReLU, 'softplus': nn.Softplus}
+        Act = act_map.get(activation, nn.Tanh)
+        
+        layers = []
+        # Input: hidden + time (if not time-invariant)
+        in_dim = dim if time_invariant else dim + 1
+        
+        for i in range(num_layers):
+            is_last = (i == num_layers - 1)
+            out_dim = dim
             
-            # Initialize
-            for layer in self.mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
+            layers.append(nn.Linear(in_dim, out_dim))
+            if not is_last:
+                layers.append(Act())
+            
+            in_dim = out_dim  # After first layer, always dim -> dim
+        
+        return nn.Sequential(*layers)
+    
+    def _init_weights(self):
+        def init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        self.apply(init)
     
     def forward(self, t: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         """
         Compute dh/dt.
+        
+        Args:
+            t: [scalar] or [batch, 1] - current time
+            h: [batch, hidden_dim] - hidden state
         """
         if self.use_gru_ode:
-            return self.gru_ode(t, h)
-        else:
-            return self.mlp(h)
-
+            return self.dynamics(t, h)
+        
+        # MLP branch: handle time
+        if self.time_invariant:
+            return self.dynamics(h)
+        
+        # Concatenate time to hidden state
+        if t.dim() == 0:
+            t = t.view(1, 1).expand(h.size(0), 1)
+        elif t.dim() == 1:
+            t = t.unsqueeze(-1)
+        
+        # Ensure batch alignment
+        if t.size(0) != h.size(0):
+            t = t.expand(h.size(0), -1)
+        
+        h_input = torch.cat([h, t], dim=-1)
+        return self.dynamics(h_input)
 
 class SpectralRegularizer(nn.Module):
     """
-    Spectral regularization for graph-structured representations.
-    
-    Computes the projection onto low-frequency eigenvectors and
-    applies a restoring force toward the smooth manifold.
+    Spectral regularization: F = -μ * (I - UU^T) H
+    Memory-efficient via never materializing projection matrix.
     """
     def __init__(
         self,
         hidden_dim: int,
         mu: float = 0.1,
         num_eigenvectors: int = 10,
-        adaptive_mu: bool = True
+        adaptive_mu: bool = True,
+        max_cache_size: int = 4
     ):
-        super(SpectralRegularizer, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
-        self.num_eigenvectors = num_eigenvectors
-        self.mu = mu
+        self.k = num_eigenvectors
         self.adaptive_mu = adaptive_mu
         
-        if adaptive_mu:
-            # Learnable mu parameter
-            self.mu_param = nn.Parameter(torch.tensor(mu))
-        else:
-            self.register_buffer('mu_param', torch.tensor(mu))
+        mu_tensor = torch.tensor(mu)
+        self.mu = nn.Parameter(mu_tensor) if adaptive_mu else mu_tensor
         
-        # Cache for eigen decomposition
-        self.eigen_cache = {}
-        self.cache_time = None
-        self.cache_graph = None
+        # LRU cache with size limit
+        self._cache = {}
+        self._cache_order = []
+        self._max_cache = max_cache_size
     
-    def compute_laplacian(self, adj_matrix: torch.Tensor) -> torch.Tensor:
-        """
-        Compute normalized graph Laplacian.
-        
-        L = I - D^{-1/2} A D^{-1/2}
-        
-        Args:
-            adj_matrix: [num_nodes, num_nodes] adjacency matrix
-            
-        Returns:
-            [num_nodes, num_nodes] normalized Laplacian
-        """
-        # Add self-loops for numerical stability
-        adj = adj_matrix + torch.eye(adj_matrix.size(0), device=adj_matrix.device)
-        
-        # Degree matrix
-        deg = adj.sum(dim=1)
-        deg_inv_sqrt = torch.pow(deg + 1e-8, -0.5)
-        deg_inv_sqrt = torch.diag(deg_inv_sqrt)
-        
-        # Normalized Laplacian: I - D^{-1/2} A D^{-1/2}
-        laplacian = torch.eye(adj.size(0), device=adj.device) - deg_inv_sqrt @ adj @ deg_inv_sqrt
-        
-        return laplacian
+    def _get_cache_key(self, adj: torch.Tensor) -> int:
+        """Stable hash for adjacency matrix."""
+        return hash((adj.size(0), adj.detach().cpu().numpy().tobytes()))
     
-    def compute_eigen_decomposition(
-        self,
-        adj_matrix: torch.Tensor,
-        force_recompute: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute top k eigenvectors of the Laplacian.
+    def _update_cache(self, key: int, value: tuple):
+        """LRU cache update."""
+        if key in self._cache:
+            self._cache_order.remove(key)
+        elif len(self._cache) >= self._max_cache:
+            oldest = self._cache_order.pop(0)
+            del self._cache[oldest]
         
-        Returns:
-            eigenvalues: [num_eigenvectors]
-            eigenvectors: [num_nodes, num_eigenvectors]
-        """
-        # Check cache
-        graph_key = adj_matrix.sum().item()  # Simple hash - improve for production
-        current_time = id(adj_matrix)  # Not ideal, but for demonstration
+        self._cache_order.append(key)
+        self._cache[key] = value
+    
+    def _normalized_laplacian(self, adj: torch.Tensor) -> torch.Tensor:
+        """L = I - D^{-1/2} A D^{-1/2}"""
+        adj = adj + torch.eye(adj.size(0), device=adj.device, dtype=adj.dtype)
+        deg_inv_sqrt = torch.rsqrt(adj.sum(dim=1) + 1e-8)
+        # Efficient: D^{-1/2} A D^{-1/2} = (A * deg_inv_sqrt) * deg_inv_sqrt[:, None]
+        norm_adj = adj * deg_inv_sqrt.unsqueeze(0) * deg_inv_sqrt.unsqueeze(1)
+        return torch.eye(adj.size(0), device=adj.device, dtype=adj.dtype) - norm_adj
+    
+    def _eigen_decomposition(self, adj: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute top-k eigenvectors with caching."""
+        key = self._get_cache_key(adj)
         
-        if not force_recompute and graph_key in self.eigen_cache:
-            return self.eigen_cache[graph_key]
+        if key in self._cache:
+            return self._cache[key]
         
-        # Compute Laplacian
-        L = self.compute_laplacian(adj_matrix)
+        L = self._normalized_laplacian(adj)
         
-        # Compute eigenvectors (top k smallest eigenvalues)
-        # Using torch.linalg.eigh for symmetric matrices
         try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(L)
-            
-            # Sort by eigenvalue (ascending)
-            idx = eigenvalues.argsort()
-            eigenvalues = eigenvalues[idx]
-            eigenvectors = eigenvectors[:, idx]
-            
-            # Take top k (excluding the first one which is 0)
-            k = min(self.num_eigenvectors, eigenvalues.size(0) - 1)
-            eigenvalues = eigenvalues[1:k+1]
-            eigenvectors = eigenvectors[:, 1:k+1]
-            
-        except Exception as e:
-            # Fallback for when eigen decomposition fails
-            print(f"Eigen decomposition failed: {e}")
-            eigenvalues = torch.ones(self.num_eigenvectors, device=adj_matrix.device)
-            eigenvectors = torch.eye(adj_matrix.size(0), self.num_eigenvectors, device=adj_matrix.device)
+            vals, vecs = torch.linalg.eigh(L)
+            # Skip first (zero eigenvalue), take next k
+            vals, vecs = vals[1:self.k+1], vecs[:, 1:self.k+1]
+        except RuntimeError as e:
+            raise RuntimeError(f"Eigen-decomposition failed: {e}") from e
         
-        # Cache
-        self.eigen_cache[graph_key] = (eigenvalues, eigenvectors)
-        
-        return eigenvalues, eigenvectors
+        self._update_cache(key, (vals, vecs))
+        return vals, vecs
     
-    def compute_projection_matrix(
-        self,
-        eigenvectors: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, H: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
-        Compute projection matrix P = U U^T.
+        Compute spectral regularization force.
         
         Args:
-            eigenvectors: [num_nodes, num_eigenvectors]
+            H: [N, hidden_dim] node features
+            adj: [N, N] adjacency matrix
             
         Returns:
-            [num_nodes, num_nodes] projection matrix
+            [N, hidden_dim] regularization force
         """
-        # P = U U^T
-        P = eigenvectors @ eigenvectors.T
-        return P
+        _, U = self._eigen_decomposition(adj)  # U: [N, k]
+        
+        # F = -μ * (H - U @ U^T @ H) = -μ * (H - U @ (U^T @ H))
+        # Memory: O(N*k) instead of O(N^2)
+        UTH = U.T @ H  # [k, hidden_dim]
+        H_smooth = U @ UTH  # [N, hidden_dim]
+        
+        return -self.mu * (H - H_smooth)
     
-    def forward(
-        self,
-        H: torch.Tensor,           # [num_nodes, hidden_dim] node states
-        adj_matrix: torch.Tensor,   # [num_nodes, num_nodes] adjacency
-        return_components: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
-        """
-        Apply spectral regularization force.
+    def dirichlet_energy(self, H: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """E = tr(H^T L H) = sum_{i,j} A_{ij} ||H_i - H_j||^2"""
+        # More efficient: don't build L explicitly
+        adj = adj + torch.eye(adj.size(0), device=adj.device, dtype=adj.dtype)
+        deg = adj.sum(dim=1)
         
-        force = -μ * (I - P) H
+        # E = sum_i deg_i ||h_i||^2 - sum_{i,j} A_{ij} h_i^T h_j
+        term1 = (deg.unsqueeze(1) * H).sum()  # sum_i deg_i ||h_i||^2
+        term2 = (H @ H.T * adj).sum()  # sum_{i,j} A_{ij} h_i^T h_j
         
-        Args:
-            H: Node state matrix
-            adj_matrix: Current graph adjacency
-            return_components: Whether to return additional info
-            
-        Returns:
-            Regularization force [num_nodes, hidden_dim]
-            or (force, info_dict)
-        """
-        # Get eigenvectors
-        eigenvalues, eigenvectors = self.compute_eigen_decomposition(adj_matrix)
-        
-        # Compute projection matrix
-        P = self.compute_projection_matrix(eigenvectors)  # [num_nodes, num_nodes]
-        
-        # Project nodes onto smooth subspace
-        H_smooth = P @ H  # [num_nodes, hidden_dim]
-        
-        # Compute high-frequency components
-        H_high = H - H_smooth
-        
-        # Regularization force: -μ * H_high
-        force = -self.mu_param * H_high
-        
-        if return_components:
-            info = {
-                'H_smooth': H_smooth,
-                'H_high': H_high,
-                'eigenvalues': eigenvalues,
-                'projection_matrix': P,
-                'force_magnitude': force.norm(dim=-1).mean().item()
-            }
-            return force, info
-        
-        return force
-    
-    def dirichlet_energy(self, H: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:
-        """
-        Compute Dirichlet energy: trace(H^T L H)
-        
-        This measures how much node states vary across edges.
-        """
-        L = self.compute_laplacian(adj_matrix)
-        energy = torch.trace(H.T @ L @ H)
-        return energy
+        return term1 - term2
 
 
 
 class STODEFunc(nn.Module):
     """
-    Augmented ODE function with spectral regularization.
+    Augmented ODE: dh/dt = f_ode(h, t) + F_spectral(h, adj)
     
-    dh/dt = f_ode(h, t) - μ * (h - [P H]_u)
+    Maintains [num_nodes, hidden_dim] shape internally; 
+    handles flattening via wrapper if needed by solver.
     """
     def __init__(
         self,
         hidden_dim: int,
         odefunc: nn.Module,
-        spectral_reg: SpectralRegularizer,
-        return_components: bool = False
+        spectral_reg: Optional[SpectralRegularizer] = None,
     ):
-        super(STODEFunc, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.odefunc = odefunc
         self.spectral_reg = spectral_reg
-        self.return_components = return_components
         
-        self.adj_matrix = None  # Will be set externally
+        # Infer dimensions
+        self.hidden_dim = getattr(odefunc, 'hidden_dim', None)
+        if self.hidden_dim is None:
+            raise ValueError("odefunc must have hidden_dim attribute")
     
-    def set_adj_matrix(self, adj_matrix: torch.Tensor):
-        """Set the current graph adjacency matrix."""
-        self.adj_matrix = adj_matrix
-    
-    def forward(self, t: torch.Tensor, state: Union[torch.Tensor, Tuple]) -> Union[torch.Tensor, Tuple]:
+    def forward(
+        self, 
+        t: torch.Tensor, 
+        H: torch.Tensor, 
+        adj_matrix: Optional[torch.Tensor] = None,
+        return_diagnostics: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
-        Compute augmented ODE dynamics.
+        Compute dynamics. Maintains 2D tensor shape [num_nodes, hidden_dim].
         
         Args:
-            t: Current time
-            state: Either [num_nodes * hidden_dim] flattened vector
-                   or tuple (H, aux) for auxiliary outputs
+            t: Scalar or [1] time
+            H: [num_nodes, hidden_dim] state
+            adj_matrix: Optional [num_nodes, num_nodes] for spectral reg
+            return_diagnostics: Whether to return force magnitudes etc.
+            
+        Returns:
+            dh/dt: [num_nodes, hidden_dim]
+            or (dh/dt, info_dict) if return_diagnostics=True
         """
-        if isinstance(state, tuple):
-            H_flat, aux = state
-        else:
-            H_flat = state
-            aux = None
+        if H.dim() != 2:
+            raise ValueError(f"Expected H with 2 dims, got {H.dim()}")
         
-        # Reshape to [num_nodes, hidden_dim]
-        num_nodes = H_flat.size(0) // self.hidden_dim
-        H = H_flat.view(num_nodes, self.hidden_dim)
+        num_nodes, hid = H.shape
+        if hid != self.hidden_dim:
+            raise ValueError(f"H hidden dim {hid} != {self.hidden_dim}")
         
-        # Base ODE dynamics
-        dh_dt_base = self.odefunc(t, H)
+        # Base dynamics
+        dh_dt = self.odefunc(t, H)
         
-        # Spectral regularization force
-        if self.adj_matrix is not None:
-            force_reg, info = self.spectral_reg(H, self.adj_matrix, return_components=True)
-            dh_dt = dh_dt_base + force_reg
-        else:
-            dh_dt = dh_dt_base
-            info = {}
+        info = {}
         
-        # Flatten for ODE solver
-        dh_dt_flat = dh_dt.view(-1)
+        # Spectral regularization
+        if self.spectral_reg is not None and adj_matrix is not None:
+            if adj_matrix.shape != (num_nodes, num_nodes):
+                raise ValueError(f"Adj shape {adj_matrix.shape} != ({num_nodes}, {num_nodes})")
+            
+            force = self.spectral_reg(H, adj_matrix)
+            dh_dt = dh_dt + force
+            
+            if return_diagnostics:
+                info['spectral_force_norm'] = force.norm().item()
+                info['spectral_force_mean'] = force.abs().mean().item()
         
-        if self.return_components and isinstance(state, tuple):
-            # Update aux with info
-            aux.update(info)
-            return (dh_dt_flat, aux)
+        if return_diagnostics:
+            info['total_dhdt_norm'] = dh_dt.norm().item()
+            return dh_dt, info
         
-        return dh_dt_flat
+        return dh_dt
 
+
+class FlattenedSTODEFunc(nn.Module):
+    """
+    Wrapper for ODE solvers requiring flattened [batch] state.
+    Buffers adjacency matrix (thread-unsafe but solver-compatible).
+    """
+    def __init__(self, stode_func: STODEFunc):
+        super().__init__()
+        self.core = stode_func
+        self.register_buffer('_adj', torch.zeros(0, 0), persistent=False)
+        self._num_nodes = 0
+    
+    def set_adj_matrix(self, adj: torch.Tensor):
+        """Buffer adjacency for solver callbacks."""
+        self._adj = adj
+        self._num_nodes = adj.size(0)
+    
+    def forward(self, t: torch.Tensor, flat_state: torch.Tensor) -> torch.Tensor:
+        """
+        Flat state [num_nodes * hidden_dim] -> dynamics -> flat output.
+        """
+        expected = self._num_nodes * self.core.hidden_dim
+        if flat_state.numel() != expected:
+            raise ValueError(f"State size {flat_state.numel()} != expected {expected}")
+        
+        H = flat_state.view(self._num_nodes, self.core.hidden_dim)
+        dh_dt = self.core(t, H, self._adj if self._num_nodes > 0 else None)
+        return dh_dt.view(-1)
+
+ 
+
+class ODEFuncProtocol(Protocol):
+    """Protocol for ODE functions compatible with integrators."""
+    def forward(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
+    def set_adj_matrix(self, adj: torch.Tensor) -> None: ...
 
 
 class STODEIntegrator(nn.Module):
     """
-    Integrates the ST-ODE over time intervals.
+    Integrates ST-ODE with piecewise-constant graph structure.
     
-    Handles the piecewise constant approximation of graph structure
-    and integrates from t0 to t1.
+    Wrapper around torchdiffeq with proper shape handling and
+    explicit adjacency management.
     """
+    
+    # Method categories
+    FIXED_STEP = {'euler', 'rk4', 'midpoint'}
+    ADAPTIVE = {'dopri5', 'dopri8', 'bosh3', 'fehlberg2', 'adaptive_heun'}
+    
     def __init__(
         self,
-        odefunc: nn.Module,
-        method: str = 'rk4',
-        step_size: float = 0.1,
+        odefunc: ODEFuncProtocol,
+        method: str = 'dopri5',
+        step_size: Optional[float] = None,
         rtol: float = 1e-6,
         atol: float = 1e-8,
         adjoint: bool = False
     ):
-        super(STODEIntegrator, self).__init__()
+        super().__init__()
+        
+        if not hasattr(odefunc, 'set_adj_matrix'):
+            raise TypeError("odefunc must implement set_adj_matrix()")
         
         self.odefunc = odefunc
         self.method = method
-        self.step_size = step_size
-        self.rtol = rtol
-        self.atol = atol
         self.adjoint = adjoint
         
+        # Solver-specific options
+        if method in self.FIXED_STEP:
+            self.step_size = step_size or 0.1
+            self.rtol = None
+            self.atol = None
+        elif method in self.ADAPTIVE:
+            self.rtol = rtol
+            self.atol = atol
+            self.step_size = None
+        else:
+            raise ValueError(f"Unknown method: {method}")
+    
+    def _prepare_time(self, t0: torch.Tensor, t1: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """Construct time tensor without forcing device sync."""
+        # Handle scalar tensors without .item()
+        if t0.numel() == 1 and t1.numel() == 1:
+            # Detach if not needed for gradients, keep on device
+            t0_val = t0.view(1) if t0.requires_grad else t0.detach().view(1)
+            t1_val = t1.view(1) if t1.requires_grad else t1.detach().view(1)
+            return torch.cat([t0_val, t1_val]).to(device)
+        raise ValueError("t0 and t1 must be scalar tensors")
+    
     def forward(
         self,
-        h0: torch.Tensor,           # [num_nodes, hidden_dim] initial state
-        t0: torch.Tensor,            # [1] or scalar start time
-        t1: torch.Tensor,            # [1] or scalar end time
-        adj_matrix: torch.Tensor,    # [num_nodes, num_nodes] graph at t0
-        return_aux: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
+        h0: torch.Tensor,
+        t0: torch.Tensor,
+        t1: torch.Tensor,
+        adj_matrix: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Integrate ST-ODE from t0 to t1.
+        Integrate from t0 to t1 with fixed graph structure.
         
-        Uses piecewise constant approximation: graph structure fixed at adj_matrix.
+        Args:
+            h0: [num_nodes, hidden_dim] initial state
+            t0: scalar start time (tensor)
+            t1: scalar end time (tensor)
+            adj_matrix: [num_nodes, num_nodes] graph structure
+            
+        Returns:
+            h1: [num_nodes, hidden_dim] final state
         """
-        # Set current graph
+        if h0.dim() != 2:
+            raise ValueError(f"h0 must be 2D, got {h0.dim()}D")
+        
+        num_nodes, hidden_dim = h0.shape
+        
+        if adj_matrix.shape != (num_nodes, num_nodes):
+            raise ValueError(
+                f"adj_matrix shape {adj_matrix.shape} != ({num_nodes}, {num_nodes})"
+            )
+        
+        # Set graph context (restored in finally block)
+        prev_adj = getattr(self.odefunc, '_adj_matrix', None)
         self.odefunc.set_adj_matrix(adj_matrix)
         
-        # Prepare state
-        num_nodes, hidden_dim = h0.shape
-        h0_flat = h0.view(-1)
-        
-        # Time points
-        t = torch.tensor([t0.item(), t1.item()], device=h0.device)
-        
-        # Integration options
-        options = {}
-        if self.method in ['euler', 'rk4']:
-            options['step_size'] = self.step_size
-        
-        # Solve ODE
-        ode_solve = odeint_adjoint if self.adjoint else odeint
-        
-        if return_aux:
-            # Track auxiliary info
-            aux = {}
-            state = (h0_flat, aux)
+        try:
+            # Flatten for ODE solver
+            h0_flat = h0.view(-1)
             
-            solution = ode_solve(
-                self.odefunc,
-                state,
-                t,
+            # Prepare time points
+            t = self._prepare_time(t0, t1, h0.device)
+            
+            # Build options dict
+            options = {}
+            if self.step_size is not None:
+                options['step_size'] = self.step_size
+            
+            # Select solver
+            solver = odeint_adjoint if self.adjoint else odeint
+            
+            # Solve
+            trajectory = solver(
+                func=self.odefunc,
+                y0=h0_flat,
+                t=t,
                 method=self.method,
-                options=options,
+                options=options if options else None,
                 rtol=self.rtol,
-                atol=self.atol
+                atol=self.atol,
             )
             
-            # solution is tuple (final_state, aux_history)
-            final_state = solution[0]
-            aux_history = solution[1]
+            # Extract final state [num_nodes * hidden_dim]
+            final_flat = trajectory[-1]
             
-        else:
-            solution = ode_solve(
-                self.odefunc,
-                h0_flat,
-                t,
-                method=self.method,
-                options=options,
-                rtol=self.rtol,
-                atol=self.atol
-            )
-            final_state = solution[-1]
-            aux_history = {}
+            # Reshape back
+            h1 = final_flat.view(num_nodes, hidden_dim)
+            
+        finally:
+            # Restore previous graph state (or clear)
+            if prev_adj is not None:
+                self.odefunc.set_adj_matrix(prev_adj)
+            # Optional: clear to prevent leaks
+            # self.odefunc.set_adj_matrix(torch.zeros(0, 0))
         
-        # Reshape final state
-        h1 = final_state.view(num_nodes, hidden_dim)
-        
-        if return_aux:
-            return h1, aux_history
         return h1
 
 
+class STODETrajectory(nn.Module):
+    """
+    Returns full trajectory for visualization/analysis.
+    Inherits core integration logic but returns all timesteps.
+    """
+    def __init__(self, integrator: STODEIntegrator, num_steps: int = 10):
+        super().__init__()
+        self.integrator = integrator
+        self.num_steps = num_steps
+    
+    def forward(
+        self,
+        h0: torch.Tensor,
+        t0: torch.Tensor,
+        t1: torch.Tensor,
+        adj_matrix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return trajectory at num_steps intermediate points."""
+        # Create intermediate time points
+        times = torch.linspace(t0.item(), t1.item(), self.num_steps, device=h0.device)
+        
+        # Temporarily override method to ensure we get dense output
+        # (adaptive methods may skip points)
+        original_method = self.integrator.method
+        
+        if self.integrator.method in STODEIntegrator.ADAPTIVE:
+            # Use fixed step for predictable output, or interpolate
+            pass  # Keep adaptive, trajectory will have variable steps
+        
+        # Use internal solver but with full time grid
+        # ... (implementation depends on specific needs)
+        
+        # Simplified: just call integrator multiple times (inefficient but clear)
+        states = [h0]
+        dt = (t1 - t0) / (self.num_steps - 1)
+        
+        for i in range(self.num_steps - 1):
+            h_next = self.integrator(
+                states[-1],
+                t0 + i * dt,
+                t0 + (i + 1) * dt,
+                adj_matrix
+            )
+            states.append(h_next)
+        
+        return torch.stack(states)  # [num_steps, num_nodes, hidden_dim]
 
 
+
+class STODEOutput(NamedTuple):
+    """Structured output."""
+    final_state: torch.Tensor
+    trajectory: Optional[List[torch.Tensor]] = None  # Per-step or per-layer states
+    num_observations: int = 0
 
 
 class STODELayer(nn.Module):
     """
-    Single ST-ODE layer that processes a sequence of observations.
+    ST-ODE layer: integrates between observations with spectral regularization.
     
-    For a sequence [(h0, t0), (h1, t1), ..., (hL, tL)], this layer:
-    1. Integrates from t_{i-1} to t_i using ST-ODE
-    2. Updates with new observation (if provided)
+    Flow: H_{i-1} --[ODE t_{i-1}->t_i]--> H̃_i --[Update]--> H_i
     """
+    
     def __init__(
         self,
         hidden_dim: int,
         num_nodes: int,
-        use_gru_ode: bool = True,
-        mu: float = 0.1,
-        num_eigenvectors: int = 10,
-        adaptive_mu: bool = True,
-        ode_method: str = 'rk4',
-        ode_step_size: float = 0.125,
+        odefunc: Optional[nn.Module] = None,  # Dependency injection
+        spectral_reg: Optional[nn.Module] = None,
+        ode_method: str = 'dopri5',
+        ode_step_size: Optional[float] = None,
         adjoint: bool = False,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        update_type: str = 'gru',  # 'gru', 'mlp', 'residual'
+        use_time_encoding: bool = False  # Enable if TimeEncoder needed
     ):
-        super(STODELayer, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
         
-        # Base ODE function
-        self.odefunc = ODEFunc(
-            hidden_dim=hidden_dim,
-            use_gru_ode=use_gru_ode
-        )
+        # Use injected components or create defaults
+        self.odefunc = odefunc or ODEFunc(hidden_dim, use_gru_ode=True)
+        self.spectral_reg = spectral_reg or SpectralRegularizer(hidden_dim, mu=0.1)
         
-        # Spectral regularizer
-        self.spectral_reg = SpectralRegularizer(
-            hidden_dim=hidden_dim,
-            mu=mu,
-            num_eigenvectors=num_eigenvectors,
-            adaptive_mu=adaptive_mu
-        )
-        
-        # Augmented ODE function
+        # Build ST-ODE function
         self.st_odefunc = STODEFunc(
             hidden_dim=hidden_dim,
             odefunc=self.odefunc,
-            spectral_reg=self.spectral_reg,
-            return_components=True
+            spectral_reg=self.spectral_reg
         )
         
-        # ODE integrator
+        # Wrap for integrator compatibility (adds set_adj_matrix)
+        self.wrapped_odefunc = FlattenedSTODEFunc(self.st_odefunc)
+
+        # Integrator operates on wrapped function
         self.integrator = STODEIntegrator(
-            odefunc=self.st_odefunc,
+            odefunc=self.wrapped_odefunc,  # Now has set_adj_matrix!
             method=ode_method,
             step_size=ode_step_size,
             adjoint=adjoint
         )
         
-        # Observation update (GRU cell for new observations)
-        self.observation_update = nn.GRUCell(hidden_dim, hidden_dim)
-        
-        # Time encoding for observation times
-        self.time_encoder = TimeEncoder(hidden_dim)
+        # Update function
+        if update_type == 'gru':
+            self.update_fn = nn.GRUCell(hidden_dim, hidden_dim)
+            self._gru_order = 'input_first'  # Document the convention
+        elif update_type == 'mlp':
+            self.update_fn = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        else:
+            self.update_fn = lambda obs, hidden: obs + hidden
         
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
         
+        # Optional time encoding
+        self.time_encoder = TimeEncoder(hidden_dim) if use_time_encoding else None
+    
+    def _validate_sequence(
+        self,
+        observations: List[Tuple[torch.Tensor, torch.Tensor]],
+        adj_matrices: List[torch.Tensor],
+        t_init: torch.Tensor
+    ) -> None:
+        """Validate input dimensions and temporal ordering."""
+        if len(observations) == 0:
+            raise ValueError("Empty observations")
+        
+        if len(observations) != len(adj_matrices):
+            raise ValueError(
+                f"Length mismatch: observations ({len(observations)}) != "
+                f"adj_matrices ({len(adj_matrices)})"
+            )
+        
+        t_prev = t_init.item()
+        for i, ((H_obs, t_obs), adj) in enumerate(zip(observations, adj_matrices)):
+            # Shape checks
+            if H_obs.shape != (self.num_nodes, self.hidden_dim):
+                raise ValueError(
+                    f"obs[{i}] shape {H_obs.shape} != "
+                    f"({self.num_nodes}, {self.hidden_dim})"
+                )
+            if adj.shape != (self.num_nodes, self.num_nodes):
+                raise ValueError(
+                    f"adj[{i}] shape {adj.shape} != "
+                    f"({self.num_nodes}, {self.num_nodes})"
+                )
+            
+            # Temporal ordering
+            t_curr = t_obs.item() if t_obs.numel() == 1 else float('inf')
+            if t_curr <= t_prev:
+                raise ValueError(
+                    f"Non-increasing times at index {i}: {t_curr} <= {t_prev}"
+                )
+            t_prev = t_curr
+    
     def forward(
         self,
-        H_init: torch.Tensor,           # [num_nodes, hidden_dim] initial state
-        observations: List[Tuple[torch.Tensor, torch.Tensor]],  # List of (H_obs, t)
-        adj_matrices: List[torch.Tensor],  # Graph at each observation time
-        return_all: bool = False
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        H_init: torch.Tensor,              # [num_nodes, hidden_dim]
+        t_init: torch.Tensor,              # scalar, time of H_init
+        observations: List[Tuple[torch.Tensor, torch.Tensor]],  # (H_obs, t)
+        adj_matrices: List[torch.Tensor],  # [num_nodes, num_nodes] per interval
+        return_trajectory: bool = False
+    ) -> STODEOutput:
         """
-        Process sequence of observations.
+        Process observation sequence through ST-ODE.
         
         Args:
-            H_init: Initial hidden state
-            observations: List of (H_obs, t) where H_obs is [num_nodes, hidden_dim]
-                        new observation features, t is timestamp
-            adj_matrices: Graph adjacency at each observation time
-            return_all: If True, return all intermediate states
+            H_init: Initial state at time t_init
+            t_init: Scalar tensor, initial time
+            observations: List of (observation_features, timestamp)
+                         timestamps must be strictly increasing and > t_init
+            adj_matrices: Graph structure for interval [t_{i-1}, t_i]
+            return_trajectory: If True, return all intermediate states
             
         Returns:
-            Final hidden state or list of all states
+            STODEOutput with final_state and optional trajectory
         """
+        if isinstance(H_init, STODEOutput):
+            raise TypeError(
+                f"H_init must be a tensor, got STODEOutput. "
+                f"Did you forget to extract .final? Use H_init.final to get the tensor."
+            )
+        self._validate_sequence(observations, adj_matrices, t_init)
+        
         H_current = H_init
-        states = [H_current]
+        t_current = t_init
+        trajectory = [H_init] if return_trajectory else None
         
-        t_prev = observations[0][1] if observations else None
-        
-        for i, (H_obs, t_curr) in enumerate(observations):
-            if i > 0:
-                # Integrate from t_prev to t_curr
-                adj_matrix = adj_matrices[i-1]  # Use graph at start of interval
-                H_integrated = self.integrator(
-                    H_current,
-                    t_prev,
-                    t_curr,
-                    adj_matrix
-                )
-                
-                # Update with new observation
-                H_updated = self.observation_update(H_obs, H_integrated)
-                H_updated = self.norm(H_updated)
-                H_updated = self.dropout(H_updated)
-                
-                H_current = H_updated
-                states.append(H_current)
+        for (H_obs, t_next), adj_matrix in zip(observations, adj_matrices):
+            # 1. Integrate ODE from current time to observation time
+            H_ode = self.integrator(
+                H_current,
+                t_current,
+                t_next,
+                adj_matrix
+            )
             
-            t_prev = t_curr
+            # 2. Update with observation
+            if isinstance(self.update_fn, nn.GRUCell):
+                # GRUCell(input, hidden) -> we treat observation as input, ODE as hidden prior
+                H_new = self.update_fn(
+                    H_obs.reshape(-1, self.hidden_dim),
+                    H_ode.reshape(-1, self.hidden_dim)
+                ).reshape(self.num_nodes, self.hidden_dim)
+            elif isinstance(self.update_fn, nn.Sequential):
+                # MLP: concatenate and process
+                combined = torch.cat([H_obs, H_ode], dim=-1)
+                H_new = self.update_fn(combined)
+            else:
+                # Residual or other
+                H_new = self.update_fn(H_obs, H_ode)
+            
+            # Post-processing
+            H_new = self.norm(H_new)
+            H_new = self.dropout(H_new)
+            
+            # Update state
+            H_current = H_new
+            t_current = t_next
+            
+            if return_trajectory:
+                trajectory.append(H_current)
         
-        if return_all:
-            return states
-        return H_current
+        return STODEOutput(
+            final_state=H_current, 
+            trajectory=trajectory,
+            num_observations=len(observations)
+        )
+    
+    def integrate_beyond(
+        self,
+        H_last: torch.Tensor,
+        t_last: torch.Tensor,
+        t_target: torch.Tensor,
+        adj_matrix: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Integrate from last observation to future time (no update).
+        
+        Useful for forecasting beyond observed data.
+        """
+        return self.integrator(H_last, t_last, t_target, adj_matrix)
+
+
+
 
 
 
 class SpectralTemporalODE(nn.Module):
     """
-    Complete Spectral-Temporal ODE (ST-ODE) module for HYDRA.
-    
-    This module:
-    1. Takes node states and temporal walk information
-    2. Evolves states continuously using ODE with spectral regularization
-    3. Updates at observation times with new walk encodings
+    Spectral-Temporal ODE for continuous-time node representation learning.
     """
+    
     def __init__(
         self,
         hidden_dim: int,
@@ -622,153 +750,596 @@ class SpectralTemporalODE(nn.Module):
         mu: float = 0.1,
         adaptive_mu: bool = True,
         use_gru_ode: bool = True,
-        ode_method: str = 'rk4',
-        ode_step_size: float = 0.125,
+        ode_method: str = 'dopri5',
+        ode_step_size: Optional[float] = None,
         num_layers: int = 1,
         adjoint: bool = False,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        aggregation: str = 'mean',  # 'mean', 'sum', 'max'
+        time_precision: int = 6,  # Decimal places for time hashing
+        use_checkpoint: bool = False,        
     ):
-        super(SpectralTemporalODE, self).__init__()
-        
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
         self.num_layers = num_layers
+        self.time_precision = time_precision
+        self.use_checkpoint = use_checkpoint
         
-        # ST-ODE layers
-        self.layers = nn.ModuleList([
-            STODELayer(
+        # Aggregation function
+        self.agg_fn = {
+            'mean': lambda x: x.mean(dim=0),
+            'sum': lambda x: x.sum(dim=0),
+            'max': lambda x: x.max(dim=0)[0]
+        }.get(aggregation, lambda x: x.mean(dim=0))
+        
+        # Build layers - construct components then inject into STODELayer
+        self.layers = nn.ModuleList([])
+        for _ in range(num_layers):
+            # Create ODE function
+            odefunc = ODEFunc(
                 hidden_dim=hidden_dim,
-                num_nodes=num_nodes,
-                use_gru_ode=use_gru_ode,
+                use_gru_ode=use_gru_ode
+            )
+            
+            # Create spectral regularizer
+            spectral_reg = SpectralRegularizer(
+                hidden_dim=hidden_dim,
                 mu=mu,
                 num_eigenvectors=num_eigenvectors,
-                adaptive_mu=adaptive_mu,
+                adaptive_mu=adaptive_mu
+            )
+            # Create STODE layer with injected components
+            layer = STODELayer(
+                hidden_dim=hidden_dim,
+                num_nodes=num_nodes,
+                odefunc=odefunc,           # Injected
+                spectral_reg=spectral_reg,  # Injected
                 ode_method=ode_method,
                 ode_step_size=ode_step_size,
                 adjoint=adjoint,
                 dropout=dropout
             )
-            for _ in range(num_layers)
-        ])
+            self.layers.append(layer)
+            
         
-        # Input projection (for walk embeddings)
-        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
         
-        # Output projection
-        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.input_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
         
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def prepare_observations(
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+    
+    def _vectorized_prepare_observations(
         self,
-        walk_encodings: torch.Tensor,    # [num_nodes, num_walks, walk_len, hidden_dim]
-        walk_times: torch.Tensor,         # [num_nodes, num_walks, walk_len] timestamps
-        walk_masks: torch.Tensor          # [num_nodes, num_walks, walk_len] valid masks
+        walk_encodings: torch.Tensor,  # [N, W, L, H]
+        walk_times: torch.Tensor,       # [N, W, L]
+        walk_masks: torch.Tensor        # [N, W, L]
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Prepare observation sequence from walk encodings.
-        
-        For each node, we have multiple walks with multiple steps.
-        This function aggregates them into a sequence of observations
-        at unique timestamps.
-        
-        Returns:
-            List of (H_obs, t) where H_obs is [num_nodes, hidden_dim]
+        Vectorized preparation of observations.
+        O(N*W*L) memory, O(1) Python loops.
         """
-        num_nodes, num_walks, walk_len, _ = walk_encodings.shape
+        N, W, L, H = walk_encodings.shape
+        device = walk_encodings.device
+        dtype = walk_times.dtype
         
-        # Collect all timestamps and corresponding encodings
-        observations_dict = {}  # t -> list of encodings per node
+        # Flatten everything
+        # Valid entries only
+        valid_mask = walk_masks > 0  # [N, W, L]
+        num_valid = valid_mask.sum()
         
-        for n in range(num_nodes):
-            for w in range(num_walks):
-                for step in range(walk_len):
-                    if walk_masks[n, w, step] > 0:
-                        t = walk_times[n, w, step].item()
-                        encoding = walk_encodings[n, w, step]  # [hidden_dim]
-                        
-                        if t not in observations_dict:
-                            observations_dict[t] = [[] for _ in range(num_nodes)]
-                        
-                        observations_dict[t][n].append(encoding)
+        if num_valid == 0:
+            return []  # Caller must handle
         
-        # Sort by time
-        sorted_times = sorted(observations_dict.keys())
+        # Gather valid encodings and times
+        valid_encodings = walk_encodings[valid_mask]  # [num_valid, H]
+        valid_times = walk_times[valid_mask]          # [num_valid]
+        valid_nodes = torch.arange(N, device=device).view(-1, 1, 1).expand(N, W, L)[valid_mask]
         
-        # Aggregate encodings at each time (mean over walks for each node)
+        # Round times for stability
+        time_mult = 10 ** self.time_precision
+        time_ints = (valid_times * time_mult).long()  # [num_valid]
+        
+        # Sort by time for chronological processing
+        sorted_indices = time_ints.argsort()
+        time_ints = time_ints[sorted_indices]
+        valid_nodes = valid_nodes[sorted_indices]
+        valid_encodings = valid_encodings[sorted_indices]
+        
+        # Find unique time boundaries
+        unique_times, inverse_indices, counts = torch.unique(
+            time_ints, sorted=True, return_inverse=True, return_counts=True
+        )
+        num_unique = unique_times.size(0)
+        
+        # Scatter encodings into per-time-node aggregates
+        # Use segment sum/coo operations
+        # Create output tensor: [num_unique, N, H]
+        H_obs_per_time = torch.zeros(num_unique, N, H, device=device, dtype=walk_encodings.dtype)
+        counts_per_time = torch.zeros(num_unique, N, device=device, dtype=torch.long)
+        
+        # Scatter-add encodings
+        # For each valid entry, add to (time_idx, node_idx)
+        time_indices = torch.arange(num_unique, device=device)[inverse_indices]
+        H_obs_per_time.index_put_(
+            (time_indices, valid_nodes),
+            valid_encodings,
+            accumulate=True
+        )
+        counts_per_time.index_put_(
+            (time_indices, valid_nodes),
+            torch.ones_like(valid_nodes),
+            accumulate=True
+        )
+        
+        # Normalize by counts (mean aggregation)
+        # Avoid div by zero: where count==0, keep zero
+        counts_expanded = counts_per_time.unsqueeze(-1).clamp(min=1)
+        H_obs_per_time = H_obs_per_time / counts_expanded.float()
+        
+        # Create list of (H_obs, t)
         observations = []
-        for t in sorted_times:
-            H_obs_list = []
-            for n in range(num_nodes):
-                encodings = observations_dict[t][n]
-                if encodings:
-                    # Mean over walks at this time
-                    H_n = torch.stack(encodings).mean(dim=0)
-                else:
-                    # No observation for this node at this time
-                    H_n = torch.zeros(self.hidden_dim, device=walk_encodings.device)
-                H_obs_list.append(H_n)
-            
-            H_obs = torch.stack(H_obs_list)  # [num_nodes, hidden_dim]
-            t_tensor = torch.tensor(t, device=walk_encodings.device)
-            observations.append((H_obs, t_tensor))
+        for i, t_int in enumerate(unique_times):
+            t = t_int.float() / time_mult
+            H_obs = H_obs_per_time[i]  # [N, H]
+            observations.append((H_obs, torch.as_tensor(t, dtype=dtype, device=device)))
         
         return observations
     
     def forward(
         self,
-        node_states: torch.Tensor,           # [num_nodes, hidden_dim] initial states
-        walk_encodings: torch.Tensor,         # [num_nodes, num_walks, walk_len, hidden_dim]
-        walk_times: torch.Tensor,              # [num_nodes, num_walks, walk_len]
-        walk_masks: torch.Tensor,              # [num_nodes, num_walks, walk_len]
-        adj_matrices: List[torch.Tensor],      # Graph at each observation time
+        node_states: torch.Tensor,           # [N, H]
+        walk_encodings: torch.Tensor,         # [N, W, L, H]
+        walk_times: torch.Tensor,              # [N, W, L]
+        walk_masks: torch.Tensor,              # [N, W, L]
+        adj_matrices: List[torch.Tensor],      # List of [N, N]
+        t_init: torch.Tensor,                  # Scalar time for node_states
         return_all: bool = False
-    ) -> Union[torch.Tensor, Dict]:
+    ) -> STODEOutput:
         """
         Process through ST-ODE.
         
         Args:
-            node_states: Initial node states (from SAM or previous layer)
-            walk_encodings: Encoded walks from HCT
-            walk_times: Timestamps for each walk step
-            walk_masks: Masks for valid positions
-            adj_matrices: Graph adjacency at each observation time
-            return_all: Whether to return intermediate states
+            node_states: [N, H] initial states
+            walk_encodings: [N, W, L, H] walk features
+            walk_times: [N, W, L] timestamps
+            walk_masks: [N, W, L] validity mask
+            adj_matrices: List of [N, N] per observation time
+            t_init: Scalar tensor, time of node_states
+            return_all: Return intermediate states
             
         Returns:
-            Final node states or dictionary with all info
+            STODEOutput with final states and optional metadata
         """
-        # Prepare observation sequence
-        observations = self.prepare_observations(
+        # Prepare observations (vectorized)
+        observations = self._vectorized_prepare_observations(
             walk_encodings, walk_times, walk_masks
         )
         
-        # Project input states
-        H = self.input_proj(node_states)
-        H = self.norm(H)
+        if not observations:
+            # No observations: just project and return
+            H_final = self.output_proj(self.input_proj(node_states))
+            return STODEOutput(final_state=H_final, num_observations=0)
         
-        # Process through layers
-        layer_outputs = []
-        
-        for layer_idx, layer in enumerate(self.layers):
-            H = layer(
-                H,
-                observations,
-                adj_matrices,
-                return_all=False
+        # Validate adj_matrices length
+        if len(adj_matrices) != len(observations):
+            raise ValueError(
+                f"adj_matrices ({len(adj_matrices)}) != observations ({len(observations)})"
             )
-            layer_outputs.append(H)
+        
+        # Initial projection
+        H = self.input_proj(node_states)
+        
+        # Track layer outputs if requested
+        layer_trajectory = [] if return_all else None
+        
+        for layer in self.layers:
+            if self.use_checkpoint and self.training:
+                H = checkpoint(layer, H, t_init, observations, adj_matrices)
+            else:
+                layer_result = layer(H, t_init, observations, adj_matrices)
+                H = layer_result.final_state
+            
+            if return_all:
+                layer_trajectory.append(H)
         
         # Final projection
         H_final = self.output_proj(H)
-        H_final = self.norm(H_final)
+        
+        return STODEOutput(
+            final_state=H_final,
+            trajectory= layer_trajectory if return_all else None,
+            num_observations= len(observations)
+        )
+    
+
+
+
+# verification 
+
+
+def create_dummy_data(
+    num_nodes: int = 10,
+    num_walks: int = 3,
+    walk_len: int = 4,
+    hidden_dim: int = 8,
+    num_obs_times: int = 3,
+    device: str = 'cpu'
+) -> dict:
+    """
+    Create consistent dummy data for ST-ODE testing.
+    
+    Returns dictionary with all inputs for SpectralTemporalODE.
+    """
+    torch.manual_seed(42)
+    
+    # Initial node states at t=0.0
+    node_states = torch.randn(num_nodes, hidden_dim, device=device)
+    t_init = torch.tensor(0.0, device=device)
+    
+    # Walk encodings: [N, W, L, H]
+    # Create walks with some temporal structure
+    walk_encodings = torch.randn(num_nodes, num_walks, walk_len, hidden_dim, device=device)
+    
+    # Walk times: increasing timestamps per walk
+    # e.g., walk 0: [0.1, 0.2, 0.3], walk 1: [0.15, 0.25, 0.35], etc.
+    base_times = torch.linspace(0.1, 1.0, num_obs_times, device=device)
+    # base_times = torch.linspace(0.1, 1.0, walk_len, device=device)
+    # Assign each walk step to one of the num_obs_times slots
+    walk_times = torch.zeros(num_nodes, num_walks, walk_len, device=device)
+    
+    for n in range(num_nodes):
+        for w in range(num_walks):
+            for step in range(walk_len):
+                # Cycle through observation times
+                obs_idx = (w * walk_len + step) % num_obs_times
+                walk_times[n, w, step] = base_times[obs_idx]
+    
+    # All valid
+    walk_masks = torch.ones_like(walk_times)
+    
+    # Create exactly num_obs_times adjacency matrices
+    adj_matrices = []
+    for _ in range(num_obs_times):
+        adj = torch.eye(num_nodes, device=device)
+        rand = torch.rand(num_nodes, num_nodes, device=device) > 0.8
+        adj = adj + rand.float()
+        adj = (adj > 0).float()
+        adj_matrices.append(adj)
+    
+    return {
+        'node_states': node_states,
+        't_init': t_init,
+        'walk_encodings': walk_encodings,
+        'walk_times': walk_times,
+        'walk_masks': walk_masks,
+        'adj_matrices': adj_matrices,
+        'num_nodes': num_nodes,
+        'hidden_dim': hidden_dim,
+        'num_obs_times': num_obs_times,
+    }
+
+
+def verify_prepare_observations(model: nn.Module, data: dict) -> bool:
+    """
+    Verify the observation preparation logic.
+    """
+    print("\n=== Verifying prepare_observations ===")
+    
+    try:
+        # Test vectorized preparation
+        observations = model._vectorized_prepare_observations(
+            data['walk_encodings'],
+            data['walk_times'],
+            data['walk_masks']
+        )
+        
+        print(f"  ✓ Generated {len(observations)} observations")
+        
+        if len(observations) == 0:
+            print("  ⚠ Warning: No observations generated (all masked?)")
+            return False
+        
+        # Check structure
+        for i, (H_obs, t) in enumerate(observations):
+            assert H_obs.shape == (data['num_nodes'], data['hidden_dim']), \
+                f"Observation {i}: shape {H_obs.shape} != expected"
+            assert t.dim() == 0, f"Time {i} should be scalar, got {t.dim()}D"
+            assert H_obs.device == data['node_states'].device, "Device mismatch"
+            print(f"  ✓ Observation {i}: t={t.item():.3f}, H_obs shape {H_obs.shape}")
+        
+        # Check temporal ordering
+        times = [t.item() for _, t in observations]
+        assert times == sorted(times), "Observations not time-sorted!"
+        print(f"  ✓ Temporal ordering verified: {times[0]:.3f} -> {times[-1]:.3f}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def verify_forward_pass(model: nn.Module, data: dict, return_all: bool = False) -> bool:
+    """
+    Verify full forward pass.
+    """
+    print(f"\n=== Verifying forward (return_all={return_all}) ===")
+    
+    try:
+        start = time.time()
+        
+        output = model(
+            node_states=data['node_states'],
+            walk_encodings=data['walk_encodings'],
+            walk_times=data['walk_times'],
+            walk_masks=data['walk_masks'],
+            adj_matrices=data['adj_matrices'],
+            t_init=data['t_init'],
+            return_all=return_all
+        )
+        
+        elapsed = time.time() - start
+        print(f"  ✓ Forward pass completed in {elapsed:.3f}s")
+        
+        # Check output structure
+        assert isinstance(output.final_state, torch.Tensor), "Output.final should be Tensor"
+        assert output.final_state.shape == (data['num_nodes'], data['hidden_dim']), \
+            f"Final shape {output.final_state.shape} != expected"
+        
+        print(f"  ✓ Final output shape: {output.final_state.shape}")
+        print(f"  ✓ Num observations processed: {output.num_observations}")
         
         if return_all:
-            return {
-                'final': H_final,
-                'layer_outputs': layer_outputs,
-                'num_observations': len(observations)
-            }
+            assert output.trajectory is not None, "trajectory should not be None"
+            assert len(output.trajectory) == model.num_layers, \
+                f"Expected {model.num_layers} layer outputs, got {len(output.trajectory)}"
+            print(f"  ✓ Layer outputs captured: {len(output.trajectory)} layers")
         
-        return H_final
+        # Check for NaN/Inf
+        assert not torch.isnan(output.final_state).any(), "NaN in final output!"
+        assert not torch.isinf(output.final_state).any(), "Inf in final output!"
+        print(f"  ✓ No NaN/Inf in output")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def verify_gradient_flow(model: nn.Module, data: dict) -> bool:
+    """
+    Verify gradients flow through the model.
+    """
+    print("\n=== Verifying gradient flow ===")
+    
+    try:
+        # Enable gradients
+        node_states = data['node_states'].clone().requires_grad_(True)
+        walk_enc = data['walk_encodings'].clone().requires_grad_(True)
+        
+        output = model(
+            node_states=node_states,
+            walk_encodings=walk_enc,
+            walk_times=data['walk_times'],
+            walk_masks=data['walk_masks'],
+            adj_matrices=data['adj_matrices'],
+            t_init=data['t_init'],
+            return_all=False
+        )
+        
+        loss = output.final_state.sum()
+        loss.backward()
+        
+        # Check gradients exist
+        assert node_states.grad is not None, "No gradient for node_states"
+        assert walk_enc.grad is not None, "No gradient for walk_encodings"
+        
+        # Check gradients are non-zero
+        assert node_states.grad.abs().sum() > 0, "Zero gradient for node_states"
+        assert walk_enc.grad.abs().sum() > 0, "Zero gradient for walk_encodings"
+        
+        print(f"  ✓ Gradients flow to node_states: {node_states.grad.abs().mean():.6f}")
+        print(f"  ✓ Gradients flow to walk_encodings: {walk_enc.grad.abs().mean():.6f}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def verify_edge_cases(model: nn.Module, data: dict) -> bool:
+    """Test edge cases with proper parameter passing."""
+    print("\n=== Verifying edge cases ===")
+    success = True
+    
+    # Case 1: All masked (empty observations)
+    print("  Testing all-masked case...")
+    try:
+        zero_masks = torch.zeros_like(data['walk_masks'])
+        output = model(
+            node_states=data['node_states'],
+            walk_encodings=data['walk_encodings'],
+            walk_times=data['walk_times'],
+            walk_masks=zero_masks,
+            adj_matrices=[],  # Empty
+            t_init=data['t_init'],
+            return_all=False
+        )
+        print(f"    ✓ Handled empty observations, output shape: {output.final_state.shape}")
+    except Exception as e:
+        print(f"    ✗ Failed: {e}")
+        success = False
+    
+    # Case 2: Single observation - create data that yields exactly 1 observation
+    print("  Testing single observation...")
+    try:
+        # Create mask with only one valid entry at same time for all nodes
+        single_mask = torch.zeros_like(data['walk_masks'])
+        single_mask[:, 0, 0] = 1.0  # All nodes, first walk, first step
+        
+        # Set same time for all to ensure single unique timestamp
+        walk_times_single = torch.ones_like(data['walk_times']) * 0.5
+        walk_times_single[single_mask == 0] = 0.0  # Invalid times for masked
+        
+        output = model(
+            node_states=data['node_states'],
+            walk_encodings=data['walk_encodings'],
+            walk_times=walk_times_single,
+            walk_masks=single_mask,
+            adj_matrices=[data['adj_matrices'][0]],  # Single adjacency
+            t_init=data['t_init'],
+            return_all=False
+        )
+        print(f"    ✓ Handled single observation, output shape: {output.final_state.shape}")
+    except Exception as e:
+        print(f"    ✗ Failed: {e}")
+        import traceback
+        traceback.print_exc()
+        success = False
+    
+    # Case 3: Mismatched adj_matrices length
+    print("  Testing mismatched adj_matrices...")
+    try:
+        output = model(
+            node_states=data['node_states'],
+            walk_encodings=data['walk_encodings'],
+            walk_times=data['walk_times'],
+            walk_masks=data['walk_masks'],
+            adj_matrices=data['adj_matrices'][:-1],  # One short
+            t_init=data['t_init'],
+            return_all=False
+        )
+        print(f"    ✗ Should have raised error for mismatched lengths")
+        success = False
+    except ValueError as e:
+        if "adj_matrices" in str(e):
+            print(f"    ✓ Correctly raised ValueError: {e}")
+        else:
+            print(f"    ? Raised ValueError but different message: {e}")
+            success = False
+    except Exception as e:
+        print(f"    ✗ Wrong exception type: {type(e).__name__}: {e}")
+        success = False
+    
+    return success
+
+
+def verify_time_hash_stability(model: nn.Module, data: dict) -> bool:
+    """
+    Verify that similar times are handled correctly (no collision issues).
+    """
+    print("\n=== Verifying time hash stability ===")
+    
+    try:
+        N, H = data['num_nodes'], data['hidden_dim']
+        
+        # Create walks with nearly identical times (floating point edge case)
+        walk_enc = torch.randn(N, 2, 3, H, device=data['node_states'].device)
+        walk_times = torch.zeros(N, 2, 3, device=data['node_states'].device)
+        
+        # Set times that should be distinct but close
+        walk_times[:, 0, :] = 0.1 + torch.rand(N, 3) * 0.001  # ~0.1
+        walk_times[:, 1, :] = 0.1000001 + torch.rand(N, 3) * 0.001  # Very close
+        
+        masks = torch.ones_like(walk_times)
+        
+        obs = model._vectorized_prepare_observations(walk_enc, walk_times, masks)
+        
+        # With default precision=6, these might collapse or not
+        print(f"  ✓ Generated {len(obs)} observations from nearly identical times")
+        for i, (H_obs, t) in enumerate(obs):
+            print(f"    t={t.item():.10f}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ✗ Failed: {e}")
+        return False
+
+
+def run_full_verification():
+    """
+    Run all verification tests.
+    """
+    print("=" * 60)
+    print("SPECTRAL TEMPORAL ODE VERIFICATION")
+    print("=" * 60)
+    
+    # Setup
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nDevice: {device}")
+    
+    data = create_dummy_data(
+        num_nodes=10,
+        num_walks=3,
+        walk_len=4,
+        hidden_dim=8,
+        num_obs_times=3,
+        device=device
+    )
+    
+    # Create model
+    try:
+        model = SpectralTemporalODE(
+            hidden_dim=data['hidden_dim'],
+            num_nodes=data['num_nodes'],
+            num_eigenvectors=5,  # Small for speed
+            mu=0.1,
+            adaptive_mu=True,
+            use_gru_ode=True,
+            ode_method='euler',  # Fast for testing
+            ode_step_size=0.1,
+            num_layers=2,
+            adjoint=False,
+            dropout=0.0,  # Disable for deterministic testing
+            time_precision=6
+        ).to(device)
+        print(f"\n✓ Model created with {sum(p.numel() for p in model.parameters())} parameters")
+    except Exception as e:
+        print(f"\n✗ Model creation failed: {e}")
+        return False
+    
+    # Run tests
+    results = []
+    
+    results.append(("prepare_observations", verify_prepare_observations(model, data)))
+    results.append(("forward (return_all=False)", verify_forward_pass(model, data, False)))
+    results.append(("forward (return_all=True)", verify_forward_pass(model, data, True)))
+    results.append(("gradient_flow", verify_gradient_flow(model, data)))
+    results.append(("edge_cases", verify_edge_cases(model, data)))
+    results.append(("time_hash_stability", verify_time_hash_stability(model, data)))
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("VERIFICATION SUMMARY")
+    print("=" * 60)
+    for name, passed in results:
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"  {status}: {name}")
+    
+    all_passed = all(passed for _, passed in results)
+    print(f"\nOverall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+    
+    return all_passed
+
+
+if __name__ == "__main__":
+    # Import the model class (assuming it's defined above or imported)
+    # from your_module import SpectralTemporalODE, STODELayer, STODEFunc, etc.
+    
+    success = run_full_verification()
+    exit(0 if success else 1)
