@@ -7,7 +7,7 @@ from typing import Optional, Tuple, List, Dict, Union, Callable, NamedTuple, Pro
 from torchdiffeq import odeint, odeint_adjoint
 
 from torch.utils.checkpoint import checkpoint
-from time_encoder import TimeEncoder
+from .time_encoder import TimeEncoder
 
 import time
 
@@ -44,6 +44,12 @@ class GRUODECell(nn.Module):
         """
         batch_size = h.size(0)
         
+        # Check inputs
+        if torch.isnan(h).any():
+            print(f"GRUODECell input h has NaN!")
+        if torch.isnan(t).any():
+            print(f"GRUODECell input t has NaN!")
+        
         # Normalize time to [batch_size, 1]
         if t.dim() == 0:
             t = t.view(1, 1)
@@ -58,9 +64,23 @@ class GRUODECell(nn.Module):
         z = torch.sigmoid(self.W_update(h))
         r = torch.sigmoid(self.W_reset(h))
         t_mod = torch.tanh(self.W_time(t))
+
+
         h_tilde = torch.tanh(self.W_candidate(r * h)) + t_mod
+        dh_dt = (1 - z) * (h_tilde - h)
+        # Check for NaN
+        if torch.isnan(dh_dt).any():
+            print(f"NaN in dh_dt! z: {z.min():.4f}/{z.max():.4f}, h_tilde: {h_tilde.min():.4f}/{h_tilde.max():.4f}, h: {h.min():.4f}/{h.max():.4f}")
         
-        return (1 - z) * (h_tilde - h)
+        # Check output
+        if torch.isnan(dh_dt).any():
+            print(f"GRUODECell output dh_dt has NaN!")
+            print(f"  z: {z.min():.4f}/{z.max():.4f}")
+            print(f"  h_tilde: {h_tilde.min():.4f}/{h_tilde.max():.4f}")
+            print(f"  h: {h.min():.4f}/{h.max():.4f}")
+            print(f"  t: {t}")
+        
+        return dh_dt
 
 class ODEFunc(nn.Module):
     """
@@ -172,9 +192,18 @@ class SpectralRegularizer(nn.Module):
         self._cache_order = []
         self._max_cache = max_cache_size
     
-    def _get_cache_key(self, adj: torch.Tensor) -> int:
-        """Stable hash for adjacency matrix."""
-        return hash((adj.size(0), adj.detach().cpu().numpy().tobytes()))
+    # def _get_cache_key(self, adj: torch.Tensor) -> int:
+    #     """Stable hash for adjacency matrix."""
+    #     return hash((adj.size(0), adj.detach().cpu().numpy().tobytes()))
+    
+    def _get_cache_key(self, adj):
+        if adj.is_sparse:
+            # Use indices and values for hashing
+            indices = adj._indices().cpu().numpy().tobytes()
+            values = adj._values().cpu().numpy().tobytes()
+            return hash((adj.size(0), indices, values))
+        else:
+            return hash((adj.size(0), adj.cpu().numpy().tobytes()))
     
     def _update_cache(self, key: int, value: tuple):
         """LRU cache update."""
@@ -225,6 +254,8 @@ class SpectralRegularizer(nn.Module):
         Returns:
             [N, hidden_dim] regularization force
         """
+        if self.mu == 0.0:
+            return torch.zeros_like(H) 
         _, U = self._eigen_decomposition(adj)  # U: [N, k]
         
         # F = -μ * (H - U @ U^T @ H) = -μ * (H - U @ (U^T @ H))
@@ -606,6 +637,44 @@ class STODELayer(nn.Module):
         # Optional time encoding
         self.time_encoder = TimeEncoder(hidden_dim) if use_time_encoding else None
     
+    # def _validate_sequence(
+    #     self,
+    #     observations: List[Tuple[torch.Tensor, torch.Tensor]],
+    #     adj_matrices: List[torch.Tensor],
+    #     t_init: torch.Tensor
+    # ) -> None:
+    #     """Validate input dimensions and temporal ordering."""
+    #     if len(observations) == 0:
+    #         raise ValueError("Empty observations")
+        
+    #     if len(observations) != len(adj_matrices):
+    #         raise ValueError(
+    #             f"Length mismatch: observations ({len(observations)}) != "
+    #             f"adj_matrices ({len(adj_matrices)})"
+    #         )
+        
+    #     t_prev = t_init.item()
+    #     for i, ((H_obs, t_obs), adj) in enumerate(zip(observations, adj_matrices)):
+    #         # Shape checks
+    #         if H_obs.shape != (self.num_nodes, self.hidden_dim):
+    #             raise ValueError(
+    #                 f"obs[{i}] shape {H_obs.shape} != "
+    #                 f"({self.num_nodes}, {self.hidden_dim})"
+    #             )
+    #         if adj.shape != (self.num_nodes, self.num_nodes):
+    #             raise ValueError(
+    #                 f"adj[{i}] shape {adj.shape} != "
+    #                 f"({self.num_nodes}, {self.num_nodes})"
+    #             )
+            
+    #         # Temporal ordering
+    #         t_curr = t_obs.item() if t_obs.numel() == 1 else float('inf')
+    #         if t_curr <= t_prev:
+    #             raise ValueError(
+    #                 f"Non-increasing times at index {i}: {t_curr} <= {t_prev}"
+    #             )
+    #         t_prev = t_curr
+    
     def _validate_sequence(
         self,
         observations: List[Tuple[torch.Tensor, torch.Tensor]],
@@ -614,35 +683,31 @@ class STODELayer(nn.Module):
     ) -> None:
         """Validate input dimensions and temporal ordering."""
         if len(observations) == 0:
-            raise ValueError("Empty observations")
+            return [], []
         
-        if len(observations) != len(adj_matrices):
-            raise ValueError(
-                f"Length mismatch: observations ({len(observations)}) != "
-                f"adj_matrices ({len(adj_matrices)})"
-            )
+        t_init_val = t_init.item()
+        valid_obs = []
+        valid_adjs = []
         
-        t_prev = t_init.item()
         for i, ((H_obs, t_obs), adj) in enumerate(zip(observations, adj_matrices)):
             # Shape checks
             if H_obs.shape != (self.num_nodes, self.hidden_dim):
-                raise ValueError(
-                    f"obs[{i}] shape {H_obs.shape} != "
-                    f"({self.num_nodes}, {self.hidden_dim})"
-                )
+                raise ValueError(f"obs[{i}] shape {H_obs.shape} != ({self.num_nodes}, {self.hidden_dim})")
             if adj.shape != (self.num_nodes, self.num_nodes):
-                raise ValueError(
-                    f"adj[{i}] shape {adj.shape} != "
-                    f"({self.num_nodes}, {self.num_nodes})"
-                )
+                raise ValueError(f"adj[{i}] shape {adj.shape} != ({self.num_nodes}, {self.num_nodes})")
             
-            # Temporal ordering
             t_curr = t_obs.item() if t_obs.numel() == 1 else float('inf')
-            if t_curr <= t_prev:
-                raise ValueError(
-                    f"Non-increasing times at index {i}: {t_curr} <= {t_prev}"
-                )
-            t_prev = t_curr
+            
+            # Skip observations at or before t_init (they can't be evolved to)
+            if t_curr <= t_init_val + 1e-6:
+                continue
+                
+            valid_obs.append((H_obs, t_obs))
+            valid_adjs.append(adj)
+        
+        return valid_obs, valid_adjs
+    
+    
     
     def forward(
         self,
@@ -666,12 +731,16 @@ class STODELayer(nn.Module):
         Returns:
             STODEOutput with final_state and optional trajectory
         """
+        observations, adj_matrices = self._validate_sequence(observations, adj_matrices, t_init)
+        if len(observations) == 0:
+            # No valid observations, return input unchanged
+            return STODEOutput(final_state=H_init, num_observations=0)
         if isinstance(H_init, STODEOutput):
             raise TypeError(
                 f"H_init must be a tensor, got STODEOutput. "
                 f"Did you forget to extract .final? Use H_init.final to get the tensor."
             )
-        self._validate_sequence(observations, adj_matrices, t_init)
+        # self._validate_sequence(observations, adj_matrices, t_init)
         
         H_current = H_init
         t_current = t_init
@@ -940,7 +1009,7 @@ class SpectralTemporalODE(nn.Module):
         
         for layer in self.layers:
             if self.use_checkpoint and self.training:
-                H = checkpoint(layer, H, t_init, observations, adj_matrices)
+                H = checkpoint(layer, H, t_init, observations, adj_matrices, use_reentrant=False).final_state
             else:
                 layer_result = layer(H, t_init, observations, adj_matrices)
                 H = layer_result.final_state

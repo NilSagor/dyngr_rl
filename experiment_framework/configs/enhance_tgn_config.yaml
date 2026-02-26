@@ -2,7 +2,7 @@
 
 # Model parameters
 model:
-  name: "TGNv3"
+  name: "TGNv6"
   # num_nodes: null  # Will be set based on dataset
   # node_features: 0  # Use learned embeddings
   hidden_dim: 172
@@ -17,10 +17,19 @@ model:
   aggregator_type: "mean"  
   use_memory: true
   n_neighbors: 20
+  memory_updater_type: 'gru'  
+  # ST ODE
+  mu: 0.0
+  adaptive_mu: false
+  use_st_ode: false
+  ode_method: rk4
+  ode_step_size: 10000   # increase step size to reduce steps
+  adjoint: true
+  use_checkpoint: true
   
 # Training parameters
 training:
-  batch_size: 200
+  batch_size: 512 # 200 
   learning_rate: 0.001
   weight_decay: 0.0001
   max_epochs: 100
@@ -36,6 +45,7 @@ training:
 # Data parameters
 data:
   dataset: "wikipedia"
+  shuffle: false
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15

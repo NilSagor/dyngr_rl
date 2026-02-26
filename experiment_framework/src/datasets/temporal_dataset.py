@@ -6,6 +6,8 @@ import numpy as np
 from torch.utils.data import Dataset
 from loguru import logger
 
+from torch.utils.data import BatchSampler, SequentialSampler
+
 if TYPE_CHECKING:
     from .negative_sampling import NegativeSampler
 
@@ -65,10 +67,10 @@ class TemporalDataset(Dataset):
         neg_srcs = self.edges[:, 0].numpy()
         neg_timestamps = self.timestamps.numpy()
         
-        # ✅ CRITICAL FIX #1: Sample destinations ONLY (no edge feature retrieval)
+        #  Sample destinations ONLY (no edge feature retrieval)
         neg_dsts = self._sample_negatives(neg_srcs, neg_timestamps)
         
-        # ✅ CRITICAL FIX #2: ZERO edge features for ALL negatives (TGN standard)
+        #  ZERO edge features for ALL negatives (TGN standard)
         # Synthetic negatives have no real edge features - using real features causes leakage
         neg_edge_features = [
             torch.zeros_like(self.edge_features[0]) if self.edge_features is not None else None
@@ -83,9 +85,9 @@ class TemporalDataset(Dataset):
                 'edge_feature': neg_edge_features[i],  # ZERO features for negatives
                 'label': 0.0,
                 'is_positive': False,
-            })
-        
-        # ✅ CRITICAL FIX #3: INTERLEAVE positives/negatives for eval splits (prevents single-class batches)
+            })       
+            
+   
         if self.split != 'train':
             interleaved = []
             for i in range(num_positives):
@@ -94,7 +96,8 @@ class TemporalDataset(Dataset):
             self.samples = interleaved
         else:
             # Shuffle training only (temporal order not critical for training)
-            self.rng.shuffle(self.samples)
+            # self.rng.shuffle(self.samples)
+            pass
         
         # Validation: check label balance
         pos_ratio = sum(s['label'] for s in self.samples) / len(self.samples)

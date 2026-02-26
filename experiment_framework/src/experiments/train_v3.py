@@ -29,7 +29,8 @@ DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 from lightning.pytorch.callbacks import EarlyStopping
 
 from src.utils.general_utils import set_seed, get_device
-from src.datasets.load_dataset import load_dataset, DATA_ROOT
+# from src.datasets.load_dataset import load_dataset, DATA_ROOT
+
 
 
 from src.experiments.exp_utils.data_pipeline import DataPipeline
@@ -157,26 +158,28 @@ def sanity_check_test_evaluation(model, test_loader, pipeline):
         # 1. Check prediction range
         logits = model.forward(batch)
         probs = torch.sigmoid(logits)
-        print(f"✓ Prediction range: [{probs.min():.3f}, {probs.max():.3f}]")
+        print(f"Prediction range: [{probs.min():.3f}, {probs.max():.3f}]")
         
         # 2. Check label distribution
         labels = batch['labels']
-        print(f"✓ Label distribution: 0={(~labels).sum()}, 1={labels.sum()}")
+        print(f"Label distribution: 0={(~labels).sum()}, 1={labels.sum()}")
         
         # 3. Check correlation (should be positive)
         if len(labels) > 1:
             corr = torch.corrcoef(torch.stack([probs.squeeze(), labels.float()]))[0,1]
-            print(f"⚠ Prediction-label correlation: {corr:.3f} "
+            print(f"Prediction-label correlation: {corr:.3f} "
                   f"{'(NEGATIVE! Check sign)' if corr < 0 else ''}")
         
         # 4. Verify features are used
         if model.edge_raw_features is not None:
-            print(f"✓ Edge features shape: {model.edge_raw_features.shape}")
+            print(f"Edge features shape: {model.edge_raw_features.shape}")
+
+
+
 
 # ============================================================================
 # MAIN TRAINING LOOP
 # ============================================================================
-
 def train_single_run(config: Dict) -> Dict[str, Any]:
     """Execute single training run."""
     start_time = datetime.now()
@@ -195,8 +198,7 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         .build_samplers()
         .build_datasets()
         .build_loaders()
-    )
-       
+    )    
 
     # Extract training edges (the same ones used for the neighbor finder)
     train_edges = pipeline.data['edges'][pipeline.data['train_mask']]          # [2, num_train_edges]
@@ -236,15 +238,15 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
 
     # Debug: Verify embedding module initialized
     if hasattr(model, 'embedding_module'):
-        print(f"Embedding module initialized: {model.embedding_module is not None}")
+        logger.debug(f"Embedding module initialized: {model.embedding_module is not None}")
 
-    if config['experiment'].get('debug', False):
-        logger.debug(f"1. embedding_module exists: {model.embedding_module is not None}")
-        logger.debug(f"2. memory_updater exists: {model.memory_updater is not None}")
-        logger.debug(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
-        logger.debug(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
-        logger.debug(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
-    
+    logger.debug(f"1. embedding_module exists: {model.embedding_module is not None}")
+    logger.debug(f"2. memory_updater exists: {model.memory_updater is not None}")
+    logger.debug(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
+    logger.debug(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
+    logger.debug(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
+
+    # logger.debug(f"Embedding module: {model.embedding_module is not None}")
        
     
     # Setup trainer
@@ -254,54 +256,48 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     
     # Train
     logger.info("Starting training...")
-    # Train
     trainer.fit(
         model=model,
         train_dataloaders=pipeline.loaders['train'],
         val_dataloaders=pipeline.loaders['val'],
     )
 
-    # Test - Lightning auto-loads best checkpoint via ckpt_path='best'
-    logger.info("Running evaluation with best checkpoint...")
-
-    # test_results = trainer.test(
-    #     model=model,  # Same model instance (no recreation needed)
-    #     dataloaders=pipeline.loaders['test'],
-    #     ckpt_path='best'  # ← Lightning handles loading + proper init
-    # )
-
-    # Load the best checkpoint for testing
-    if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
+    if trainer.checkpoint_callback.best_model_path:
         best_path = trainer.checkpoint_callback.best_model_path
-        logger.info(f"Loading best checkpoint from {best_path}")
         
-        # 1. Re‑create a fresh model with the same configuration and data
-        #    (ModelFactory.create already gives a new instance)
+        # 1. Create fresh model and initialize with pipeline data
         model = ModelFactory.create(config, features)
         model.set_raw_features(features['node_features'], features['edge_features'])
         model.set_neighbor_finder(pipeline.neighbor_finder)
         
-        # 2. Load the checkpoint with strict=False – ignore unexpected keys
-        # checkpoint = torch.load(best_path, map_location=model.device)
+        # 2. CRITICAL: Initialize walk sampler with full graph BEFORE loading checkpoint
+        # This ensures the walk sampler has the graph structure
+        model.set_graph(pipeline.train_edges, pipeline.train_times)
+        
+        # 3. Now load checkpoint weights
+        logger.info(f"Loading best checkpoint from {best_path}")
+
         checkpoint = torch.load(best_path, map_location='cpu', weights_only=True)
-        # model.load_state_dict(checkpoint['state_dict'], strict=True)
         model.load_state_dict(checkpoint['state_dict'], strict=False)
         
-        # 3. Ensure model is on correct device and in eval mode
-        model = model.to(get_device())  # Move after loading
-        # model = model.to(model.device)
-        model.eval()
+        # 4. Move to device and set to eval mode
+        model = model.to(get_device()).eval()
+
+        # 5. Validate model is ready
+        if config['experiment'].get('debug', False):
+            validate_model_ready(model, pipeline)
         
-        logger.info("Best checkpoint loaded successfully (strict=False).")
-    else:
-        logger.warning("No checkpoint callback or best model path found. Using current model.")
+        logger.info("Best checkpoint loaded and walk sampler initialized successfully.")
+        
+        
+
+    # Test - Lightning auto-loads best checkpoint via ckpt_path='best'
+    logger.info("Running evaluation with best checkpoint...")
     
-    # Test
-    logger.info("Running evaluation...")
     test_results = trainer.test(
-        model=model, 
+        model=model,  # Same model instance (no recreation needed)
         dataloaders=pipeline.loaders['test'],
-        ckpt_path='best'
+        ckpt_path='best'  # ← Lightning handles loading + proper init
     )
     
     # Log results

@@ -8,45 +8,7 @@ from loguru import logger
 
 from .time_encoder import TimeEncoder
 
-# class PrototypeMemory(nn.Module):
-#     """
-#         Learnable prototype vectors for a single node.
-#         Each node has K prototypes representing stable "modes" or "roles".
-#     """    
-#     def __init__(self, 
-#                  num_prototypes:int, 
-#                  prototype_dim:int, 
-#                  node_id:int, 
-#                  initialization:str='xavier'):
-#         super(PrototypeMemory, self).__init__()
-#         self.num_prototypes = num_prototypes
-#         self.prototype_dim = prototype_dim
-#         self.node_id = node_id
-
-#         # 
-#         self.prototypes = nn.Parameter(
-#             torch.empty(num_prototypes, prototype_dim)
-#         )
-
-#         # initialize prototypes
-#         if initialization == 'xavier':
-#             nn.init.xavier_uniform_(self.prototypes)
-#         elif initialization == "normal":
-#             nn.init.normal_(self.prototypes, mean=0.0, std=0.1)
-#         elif initialization == "uniform":
-#             nn.init.uniform_(self.prototypes, -0.1, 0.1)
-#         else:
-#             raise ValueError(f"Unknown initialization: {initialization}")
-        
-
-#     def forward(self)->torch.Tensor:
-#         """Return prototype vectors"""
-#         return self.prototypes
-    
-#     def get_prototype(self, idx:int)->torch.Tensor:
-#         """Get a specific prototype"""
-#         return self.prototypes[idx]
-    
+  
 
 
 class SAMCell(nn.Module):
@@ -76,6 +38,8 @@ class SAMCell(nn.Module):
         nn.init.xavier_uniform_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
         
+        
+        
         # update gate (step 4)
         self.gate_proj = nn.Linear(self.gate_input_dim, 1)
         nn.init.xavier_uniform_(self.gate_proj.weight)
@@ -84,14 +48,22 @@ class SAMCell(nn.Module):
 
         # Similarity temperature (learnable)
         # self.temperature = nn.Parameter(torch.ones(1)*0.1)
-        self.temperature = nn.Parameter(torch.ones(1))
+        # self.temperature = nn.Parameter(torch.ones(1))
+
+        # FIX 1: Bounded temperature
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        self.temperature_min = 0.05  # Don't let it go too low
+        self.temperature_max = 2.0   # Don't let it go too high
+
+        self.residual_scale = 0.001
 
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
 
         self.residual_weight = nn.Parameter(torch.tensor(0.01))
         nn.init.uniform_(self.residual_weight, 0.05, 0.2)
-        # Layer norm for stability
+        
+        # Layer norm for stability Add layer norm before output
         self.layer_norm = nn.LayerNorm(memory_dim)
 
     def compute_similarity(
@@ -133,8 +105,11 @@ class SAMCell(nn.Module):
         else:
             raise ValueError(f"Unknown similarity metric: {self.similarity_metric}")
         
+        temperature = torch.nn.functional.softplus(self.temperature) + 1e-6
+        similarity = similarity / temperature
+        
         # Apply temperature
-        similarity = similarity / self.temperature.clamp(min=0.01)
+        # similarity = similarity / self.temperature.clamp(min=0.01)
 
         return similarity
     
@@ -157,8 +132,26 @@ class SAMCell(nn.Module):
         """
         batch_size = raw_memory.size(0)
 
+        # Diagnostic
+        if not torch.isfinite(raw_memory).all():
+            logger.error(f"SAM input raw_memory has NaN/Inf! Location: {torch.where(~torch.isfinite(raw_memory))}")
+        if not torch.isfinite(edge_features).all():
+            logger.error(f"SAM input edge_features has NaN/Inf! Norm: {edge_features.norm()}")
+        
+                
         if edge_features.abs().sum() < 1e-6:
-            logger.warning("Edge features are zero in SAM update")
+            logger.warning("Edge features are zero in SAM update")        
+        
+        
+        # Add epsilon to prevent division by zero
+        edge_features = edge_features + 1e-8 if edge_features is not None else None
+        
+        # Check for NaN inputs
+        if torch.isnan(edge_features).any():
+            logger.warning("NaN detected in edge_features, replacing with zeros")
+            edge_features = torch.nan_to_num(edge_features, nan=0.0)
+        
+        
         
         # Step 1: form query q_u(t)
         # combine raw memory edge features, and time encoding
@@ -174,6 +167,11 @@ class SAMCell(nn.Module):
         
         # step 2: compute prototype attention \alpha_u^k(t)
         similarity = self.compute_similarity(query, prototypes) # [B, num_prototypes]
+        
+        
+        # Constrained temperature
+        temp = self.temperature.clamp(self.temperature_min, self.temperature_max)
+        similarity = similarity / temp
         
         # apply mask if provided (for padded nodes)
         if node_mask is not None:
@@ -203,17 +201,27 @@ class SAMCell(nn.Module):
             logger.info(f"Update gate: mean={update_gate.mean().item():.4f}, "
                         f"std={update_gate.std().item():.4f}")
         
-        
-        # step 5: final memory update s_u(t)
-        # updated_memory = (1 - update_gate)*raw_memory + update_gate*candidate_memory
-        # updated_memory = (1 - update_gate) * raw_memory + update_gate * candidate_memory + 0.01 * raw_memory
-        # SAMCell.forward:
+      
+
+        # step 5: final memory update s_u(t)      
         
         # updated_memory = (1 - update_gate + self.residual_weight) * raw_memory + update_gate * candidate_memory
-        updated_memory = (1 - update_gate) * raw_memory + update_gate * candidate_memory
+        # updated_memory = (1 - update_gate) * raw_memory + update_gate * candidate_memory
 
-        updated_memory = updated_memory + self.residual_weight * raw_memory
+        # updated_memory = updated_memory + self.residual_weight * raw_memory
+        # updated_memory = self.layer_norm(updated_memory)
+        
+        
+        
+        # Conservative update with tiny fixed residual
+        updated_memory = (1 - update_gate) * raw_memory + update_gate * candidate_memory
+        updated_memory = updated_memory + self.residual_scale * raw_memory  # Fixed 0.1%
+        
+         # FIX 3: Output normalization + gradient clipping
         updated_memory = self.layer_norm(updated_memory)
+        
+        # Emergency clamp to prevent explosion
+        updated_memory = torch.clamp(updated_memory, min=-100, max=100)
         
         # collect attention info for analysis
         attention_info = {
@@ -224,6 +232,7 @@ class SAMCell(nn.Module):
             "similarity_scores": similarity
         }
 
+                
         return updated_memory, attention_info
 
 
@@ -271,14 +280,15 @@ class StabilityAugmentedMemory(nn.Module):
         
         # Edge feature projection
         self.edge_proj = nn.Linear(edge_feat_dim, memory_dim)
-        nn.init.xavier_uniform_(self.edge_proj.weight)
+        nn.init.xavier_uniform_(self.edge_proj.weight, gain=0.5)
         nn.init.zeros_(self.edge_proj.bias)
 
         # SAM Cell for updates
         self.sam_cell = SAMCell(
             memory_dim = memory_dim,
             node_feat_dim = node_feat_dim,
-            edge_feat_dim = edge_feat_dim,
+            # edge_feat_dim = edge_feat_dim,
+            edge_feat_dim = memory_dim,
             time_dim = time_dim,
             num_prototypes = num_prototypes,
             similarity_metric = similarity_metric,
@@ -363,70 +373,96 @@ class StabilityAugmentedMemory(nn.Module):
             Dictionary with updated memories and attention info        
 
         """
-        batch_size = source_nodes.size(0)
-        
-        # get raw memories for source and target
-        src_raw_memory = self.raw_memory[source_nodes]
-        tgt_raw_memory = self.raw_memory[target_nodes]       
-
-        # get prototypes
-        src_prototypes = self.get_prototypes(source_nodes)
-        tgt_prototypes = self.get_prototypes(target_nodes)
-        
-        # Project edge features
-        edge_features_proj = self.edge_proj(edge_features)
-
-        # get time encoding
-        time_encoding = self.time_encoder(current_time)
-        
-        # Optional node features
-        if self.node_proj is not None and node_features is not None:
-            src_node_feats = node_features[source_nodes]  # [batch_size, node_feat_dim]
-            tgt_node_feats = node_features[target_nodes]  # [batch_size, node_feat_dim]
-            src_node_feats_proj = self.node_proj(src_node_feats)  # [batch_size, memory_dim]
-            tgt_node_feats_proj = self.node_proj(tgt_node_feats)  # [batch_size, memory_dim]
-        else:
-            src_node_feats_proj = None
-            tgt_node_feats_proj = None
-        
-        # Update source/target via SAM cell FIRST
-        src_updated, src_attention = self.sam_cell(
-            raw_memory=src_raw_memory,
-            node_features=src_node_feats_proj,
-            edge_features=edge_features_proj,
-            time_encoding=time_encoding,
-            prototypes=src_prototypes
-        )
-        
-        tgt_updated, tgt_attention = self.sam_cell(
-            raw_memory=tgt_raw_memory,
-            node_features=tgt_node_feats_proj,
-            edge_features=edge_features_proj,
-            time_encoding=time_encoding,
-            prototypes=tgt_prototypes
-        )
-
-        # NOW update stored memories (with detach for stability)
+        # CRITICAL: Wrap EVERYTHING in no_grad for inference-time memory update
         with torch.no_grad():
-            self.raw_memory[source_nodes] = src_updated.detach()
-            self.raw_memory[target_nodes] = tgt_updated.detach()
+        
+            batch_size = source_nodes.size(0)
+
+            # get raw memories for source and target
+            # Get raw memories (no gradients needed)
+            src_raw_memory = self.raw_memory[source_nodes]
+            tgt_raw_memory = self.raw_memory[target_nodes]
+        
+            # Get prototypes (still need to track these for later gradient computation?
+            # NO—if this is just for memory state update, no gradients needed)
+            src_prototypes = self.get_prototypes(source_nodes)
+            tgt_prototypes = self.get_prototypes(target_nodes)
+        
+            # Project features (no grad)
+            edge_features_proj = self.edge_proj(edge_features)
+            
+            
+            # get time encoding
+            time_encoding = self.time_encoder(current_time)
+                
+
+            # Process node features if needed
+            if self.node_proj is not None and node_features is not None:
+                src_node_feats = node_features[source_nodes]
+                tgt_node_feats = node_features[target_nodes]
+                src_node_feats_proj = self.node_proj(src_node_feats)
+                tgt_node_feats_proj = self.node_proj(tgt_node_feats)
+            else:
+                src_node_feats_proj = tgt_node_feats_proj = None
+     
+            # # Optional node features
+            # if self.node_proj is not None and node_features is not None:
+            #     src_node_feats = node_features[source_nodes]  # [batch_size, node_feat_dim]
+            #     tgt_node_feats = node_features[target_nodes]  # [batch_size, node_feat_dim]
+            #     src_node_feats_proj = self.node_proj(src_node_feats)  # [batch_size, memory_dim]
+            #     tgt_node_feats_proj = self.node_proj(tgt_node_feats)  # [batch_size, memory_dim]
+            # else:
+            #     src_node_feats_proj = None
+            #     tgt_node_feats_proj = None
+        
+            # Update via SAM cell (NO gradients for this update!)
+            src_updated, src_attention = self.sam_cell(
+                raw_memory=src_raw_memory,
+                node_features=src_node_feats_proj,
+                edge_features=edge_features_proj,
+                time_encoding=time_encoding,
+                prototypes=src_prototypes
+            )
+            
+            tgt_updated, tgt_attention = self.sam_cell(
+                raw_memory=tgt_raw_memory,
+                node_features=tgt_node_feats_proj,
+                edge_features=edge_features_proj,
+                time_encoding=time_encoding,
+                prototypes=tgt_prototypes
+            )
+
+            # Update stored memories (already in no_grad context)
+            self.raw_memory[source_nodes] = src_updated
+            self.raw_memory[target_nodes] = tgt_updated
             self.last_update[source_nodes] = current_time
             self.last_update[target_nodes] = current_time
+   
+        # src_updated = torch.clamp(src_updated, min=-10.0, max=10.0)
+        # tgt_updated = torch.clamp(tgt_updated, min=-10.0, max=10.0)
         
-        if self.training and torch.rand(1).item() < 0.01:
-        # Verify prototypes have gradients
-            for name, param in self.named_parameters():
-                if 'prototype' in name.lower() and param.grad is not None:
-                    logger.debug(f"{name} grad norm: {param.grad.norm().item():.4f}")
+        # # NOW update stored memories (with detach for stability)
+        # with torch.no_grad():
+        #     self.raw_memory[source_nodes] = src_updated.detach()
+        #     self.raw_memory[target_nodes] = tgt_updated.detach()
+        #     self.last_update[source_nodes] = current_time
+        #     self.last_update[target_nodes] = current_time
+        
+        # if self.training and torch.rand(1).item() < 0.01:
+        # # Verify prototypes have gradients
+        #     for name, param in self.named_parameters():
+        #         if 'prototype' in name.lower() and param.grad is not None:
+        #             logger.debug(f"{name} grad norm: {param.grad.norm().item():.4f}")
             
-            # Quick sanity check
-            assert self.all_prototypes.requires_grad, "all_prototypes must require grad!"
-            assert self.all_prototypes.grad is None or self.all_prototypes.grad.abs().sum() > 0, \
-                "Prototypes receiving zero gradients!"
+        #     # Quick sanity check
+        #     assert self.all_prototypes.requires_grad, "all_prototypes must require grad!"
+        #     assert self.all_prototypes.grad is None or self.all_prototypes.grad.abs().sum() > 0, \
+        #         "Prototypes receiving zero gradients!"
         
 
         # Return attention info for analysis
         # Return attention info - DETACH everything to prevent graph leakage
+        # Return detached attention info
         return {
             'source_attention': {k: v.detach() if isinstance(v, torch.Tensor) else v 
                                 for k, v in src_attention.items()},

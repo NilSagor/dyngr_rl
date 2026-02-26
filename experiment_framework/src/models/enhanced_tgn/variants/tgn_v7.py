@@ -6,9 +6,6 @@ import numpy as np
 from typing import Dict, Optional, Tuple
 from loguru import logger
 
-import torch.nn.functional as F
-
-
 from ..base_enhance_tgn import BaseEnhancedTGN
 from ..component.time_encoder import TimeEncoder
 from ..component.sam_module import StabilityAugmentedMemory
@@ -336,7 +333,130 @@ class TGNv6(BaseEnhancedTGN):
             'adjs': [adj_t] * T   # same adjacency for each time slice
         }       
         
-   
+        
+        # # Get current batch time (single time point for ODE evolution)
+        # current_time = batch['timestamps'].max()
+        
+        # # Create observation encodings from ALL interactions in the batch
+        # # Treat the entire batch as observations at the current time
+        # src_nodes = batch['src_nodes']
+        # dst_nodes = batch['dst_nodes']
+
+        # # Build adjacency for the batch
+        # adj_t = self._build_temporal_adjacency(src_nodes, dst_nodes, num_nodes)
+        
+        # # Create observation encodings: [num_nodes, num_walks, walk_len, memory_dim]
+        # # For batch interactions, we create a single "walk" per interacting node
+        # obs_encoding = self._create_observation_encoding(
+        #     src_nodes, dst_nodes, batch.get('edge_features'), batch['timestamps']
+        # )
+        
+        # # Reshape to [N, W, L, H] format expected by ST-ODE
+        # # Current shape is [N, 1, 3, memory_dim], need to ensure it's 4D
+        # if obs_encoding.dim() == 5:
+        #     # If somehow we got [T, N, W, L, H], take the last time step or mean
+        #     obs_encoding = obs_encoding[-1]  # Take last time step: [N, W, L, H]
+        
+
+
+        # # Get unique timestamps in batch
+        # unique_times, inverse_indices = torch.unique(
+        #     batch['timestamps'], sorted=True, return_inverse=True
+        # )
+        
+        # # For each unique time, create "walk" observations
+        # # These represent the structural perturbations at that time
+        
+        # observations_list = []
+        # adj_matrices = []
+        
+        # for t in unique_times:
+        #     # Find interactions at this time
+        #     mask = (batch['timestamps'] == t)
+        #     src_nodes = batch['src_nodes'][mask]
+        #     dst_nodes = batch['dst_nodes'][mask]
+            
+        #     # Build adjacency at time t
+        #     # This is the graph structure for the spectral regularization
+        #     adj_t = self._build_temporal_adjacency(src_nodes, dst_nodes, num_nodes)
+        #     adj_matrices.append(adj_t)
+            
+        #     # Create observation encodings from edge features + node features
+        #     # Shape: [num_nodes, num_walks, walk_len, memory_dim]
+        #     # For interactions, we treat each edge as a "walk" of length 2 (src->dst)
+        #     obs_encoding = self._create_observation_encoding(
+        #         src_nodes, dst_nodes, batch.get('edge_features'), t
+        #     )
+        #     observations_list.append(obs_encoding)
+        
+        # # Stack: [T, num_nodes, 1, 3, memory_dim]
+        # encodings = torch.stack(observations_list)  # [T, N, 1, 3, H]
+        
+        
+        # # Get unique timestamps and their indices
+        # unique_times, inverse_indices = torch.unique(timestamps, sorted=True, return_inverse=True)
+        
+        # # For ST-ODE, we need to provide observations at specific times
+        # # The ODE will evolve from last_update_time to current_time
+        # current_time = timestamps.max()
+
+
+        # # Build adjacency for the entire batch (or use a sliding window)
+        # adj_t = self._build_temporal_adjacency(src_nodes, dst_nodes, num_nodes)
+        
+        # # Create sparse observation tensor: [num_nodes, num_walks=1, walk_len=3, memory_dim]
+        # # This represents the "perturbation" from new edges
+        
+        # # Fill with actual interaction data
+        # src_emb = self.sam_module.raw_memory[src_nodes]
+        # dst_emb = self.sam_module.raw_memory[dst_nodes]
+        
+        # # Time encoding for each interaction
+        # time_emb = self.time_encoder(timestamps.float())
+        # if time_emb.shape[-1] != self.memory_dim:
+        #     if self._time_proj is None:
+        #         self._time_proj = nn.Linear(self.time_encoding_dim, self.memory_dim).to(device)
+        #     time_emb = self._time_proj(time_emb)
+
+        # # Aggregate observations per node by summing contributions
+        # # Initialize [num_nodes, memory_dim]
+        # node_obs = torch.zeros(num_nodes, self.memory_dim, device=device)
+        
+        # # Add src embeddings
+        # node_obs.index_add_(0, src_nodes, src_emb)
+        # # Add dst embeddings  
+        # node_obs.index_add_(0, dst_nodes, dst_emb)
+        # # Add time embeddings to both
+        # node_obs.index_add_(0, src_nodes, time_emb)
+        # node_obs.index_add_(0, dst_nodes, time_emb)               
+
+        # # Create mask for nodes that appear in this batch
+        # unique_nodes = torch.unique(torch.cat([src_nodes, dst_nodes]))
+        # mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        # mask[unique_nodes] = True
+
+
+        # # Reshape to [N, 1, 1, H] for walk_encodings
+        # encodings_4d = node_obs.unsqueeze(1).unsqueeze(2)          # [N, 1, 1, H]
+        
+        # # Current time (scalar) for all nodes/walks
+        # current_time = batch['timestamps'].max().to(node_obs.device)
+        # times_4d = current_time.view(1, 1, 1).expand(num_nodes, 1, 1)   # [N, 1, 1]
+        
+        # # Boolean mask for nodes that have any observation
+        # masks_4d = mask.unsqueeze(1).unsqueeze(2)                  # [N, 1, 1]
+        
+        # # Note: This requires careful reshaping to match [N, W, L, H] format
+        
+        # return {
+        #     'encodings': encodings_4d,
+        #     'times': times_4d,
+        #     'masks': masks_4d,
+        #     'adjs': [adj_t]
+        # }
+        
+    
+    
     def _build_temporal_adjacency(self, src_nodes, dst_nodes, num_nodes):
         """Build SPARSE adjacency matrix for specific time snapshot."""
         device = src_nodes.device
@@ -359,7 +479,18 @@ class TGNv6(BaseEnhancedTGN):
             size=(num_nodes, num_nodes),
             device=device
         )
-
+        
+        
+        # adj = torch.zeros(num_nodes, num_nodes, device=src_nodes.device)
+        
+        # # Add edges
+        # for s, d in zip(src_nodes, dst_nodes):
+        #     adj[s, d] = 1.0
+        #     if not self.directed:  # Assuming undirected
+        #         adj[d, s] = 1.0
+        
+        # # Add self-loops for numerical stability
+        # adj = adj + torch.eye(num_nodes, device=adj.device)
         
         return adj.coalesce()   # ensure coalesced for efficiency
     
@@ -431,11 +562,7 @@ class TGNv6(BaseEnhancedTGN):
         scores = self.link_predictor(
             source_emb, dest_emb
         ).squeeze(-1)
-
-        # Debug NaN
-        if torch.isnan(scores).any():
-            logger.error(f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, dest_emb: {torch.isnan(dest_emb).any()}")
-            
+        
         return scores 
         
     
@@ -572,17 +699,6 @@ class TGNv6(BaseEnhancedTGN):
             base_src_emb = self.sam_module.raw_memory[src_tensor]
             base_dst_emb = self.sam_module.raw_memory[dst_tensor]
         
-        # 3a. Compute stabilized memory from prototypes
-        stabilized_src = self.sam_module.get_stabilized_memory(
-            node_ids=source_nodes,
-            current_time=edge_times,
-            node_features=self.node_raw_features
-        )  # [B, hidden_dim]
-        
-        # 3b. Combine with base embedding (simple addition or concatenation)
-        base_src_emb = base_src_emb + 0.1 * stabilized_src   # or use a learnable gate
-        
-        
         # 4. Fusion
         combined_src = torch.cat([base_src_emb, walk_src_emb], dim=-1)
         combined_dst = torch.cat([base_dst_emb, walk_dst_emb], dim=-1)
@@ -684,80 +800,6 @@ class TGNv6(BaseEnhancedTGN):
         else:
             logger.error("Cannot find edge data in neighbor_finder for walk sampler")
     
-    def training_step(self, batch, batch_idx):
-        src = batch['src_nodes']
-        dst = batch['dst_nodes'] 
-        ts = batch['timestamps']
-        labels = batch['labels']
-        edge_feats = batch.get('edge_features')
-
-        # 1. FORWARD PASS: Compute embeddings using CURRENT memory state
-        # This establishes the computational graph for link prediction loss
-        
-        # 1. FORWARD PASS: Compute embeddings using CURRENT memory state
-        source_emb, dest_emb = self.compute_temporal_embeddings(src, dst, ts)
-        
-        # 2. LINK PREDICTION
-        scores = self.link_predictor(source_emb, dest_emb).squeeze(-1)
-    
-        
-        # Debug NaN in scores
-        if torch.isnan(scores).any():
-            logger.error(f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, "
-                        f"dest_emb: {torch.isnan(dest_emb).any()}")
-        
-        # 3. COMPUTE LOSS
-        loss = F.binary_cross_entropy_with_logits(scores, labels.float())
-        
-        # 3. COMPUTE LOSS - Create loss input dict
-        # loss_input = {
-        #     'scores': scores,
-        #     'labels': batch['labels'].float()
-        # }
-        
-        # loss = self._compute_loss(loss_input)
-
-
-
-        # 4. DEFERRED SAM UPDATE: Store interactions for update AFTER backward
-        # We don't update here to avoid creating gradients that pollute the optimizer
-        if self.training and self.use_memory:
-            self._store_sam_interactions(batch)
-        
-        # 5. LOGGING
-        self.log('train_loss', loss, prog_bar=True, on_step=True)
-        
-        if torch.isnan(loss):
-            logger.error(f"NaN loss! scores range: [{scores.min():.4f}, {scores.max():.4f}]")            
-        
-            logger.error(f"NaN loss! scores: {scores.min():.4f}/{scores.max():.4f}, labels: {batch['labels'].unique()}")
-        
-            
-        return {'loss': loss}
-        
-    def _store_sam_interactions(self, batch: Dict[str, torch.Tensor]):
-        """Store interactions in buffer for deferred SAM update in on_train_batch_end."""
-        device = self.device
-        
-        src_nodes = batch['src_nodes'].to(device)
-        dst_nodes = batch['dst_nodes'].to(device)
-        timestamps = batch['timestamps'].to(device)
-        
-        # Get edge features
-        if 'edge_features' in batch and batch['edge_features'] is not None:
-            edge_feats = batch['edge_features'].to(device)
-        else:
-            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=device)
-        
-        # Store in buffer - will be consumed by on_train_batch_end
-        self._sam_batch_buffer = {
-            'src_nodes': src_nodes,
-            'dst_nodes': dst_nodes,
-            'timestamps': timestamps,
-            'edge_features': edge_feats
-        }  
-        
-    
     def on_fit_start(self):
         """Initialize SAM memory at start of training."""
         super().on_fit_start()
@@ -766,151 +808,178 @@ class TGNv6(BaseEnhancedTGN):
             logger.info(" SAM memory initialized for training")
     
        
-    # def on_train_batch_start(self, batch, batch_idx):
-    #     times = batch['timestamps']
-    #     logger.info(f"Batch {batch_idx}: min={times.min():.0f}, max={times.max():.0f}")
-    
     def on_train_batch_start(self, batch, batch_idx):
         times = batch['timestamps']
-        current_max = times.max().item()
-        
-        if batch_idx == 0:
-            logger.info(f"Epoch start - Batch 0 time range: [{times.min():.0f}, {times.max():.0f}]")
-        
-        if hasattr(self, '_prev_max_time'):
-            if current_max < self._prev_max_time:
-                logger.error(f"TEMPORAL VIOLATION: Batch {batch_idx} max {current_max:.0f} < prev {self._prev_max_time:.0f}")
-                # Print first few timestamps for debugging
-                logger.error(f"First 10 timestamps: {times[:10].tolist()}")
-        
-        self._prev_max_time = current_max
+        logger.info(f"Batch {batch_idx}: min={times.min():.0f}, max={times.max():.0f}")
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """
-        CRITICAL: SAM update happens HERE after backward pass, with NO_GRAD protection.
-        This prevents gradient accumulation and NaN explosions.
+        ST-ODE-based memory update: continuous evolution + observation update.
         """
-        # 1. SAM DISCRETE UPDATE (with gradient protection)
+        # 1. SAM discrete update
         if self.training and self.use_memory and hasattr(self, '_sam_batch_buffer'):
             buffer = self._sam_batch_buffer
             
-            # CRITICAL FIX: Wrap entire update in no_grad to prevent gradient pollution
-            with torch.no_grad():
-                mem_before_norm = torch.norm(self.sam_module.raw_memory).item()
-                mem_before_std = self.sam_module.raw_memory.std().item()
-
-                # Get node features (detach to be safe)
-                node_feats = self.node_embedding.weight.detach()
-
-                # SAM update - no gradients should flow from this
-                self.sam_module.update_memory_batch(
-                    source_nodes=buffer['src_nodes'],
-                    target_nodes=buffer['dst_nodes'],
-                    edge_features=buffer['edge_features'],  # Already detached in buffer
-                    current_time=buffer['timestamps'],
-                    node_features=node_feats
-                )
-                
-                # EMERGENCY: Hard clamp memory to prevent explosion
-                with torch.no_grad():
-                    self.sam_module.raw_memory.data.clamp_(-50, 50)
-                
-                # Verify update didn't explode
-                mem_after_norm = torch.norm(self.sam_module.raw_memory).item()
-                
-                # Check for NaN/Inf and reset if needed
-                if not torch.isfinite(self.sam_module.raw_memory).all():
-                    logger.error(f"Batch {batch_idx}: SAM memory NaN/Inf detected, resetting affected nodes")
-                    # Reset only affected nodes
-                    src_unique = buffer['src_nodes'].unique()
-                    dst_unique = buffer['dst_nodes'].unique()
-                    self.sam_module.raw_memory[src_unique] = 0
-                    self.sam_module.raw_memory[dst_unique] = 0
-                
-                # Safety check: if memory exploded, reset and log
-                if torch.isnan(self.sam_module.raw_memory).any() or mem_after_norm > 1000:
-                    logger.error(f"Batch {batch_idx}: SAM memory exploded (norm: {mem_before_norm:.2f} -> {mem_after_norm:.2f})")
-                    # Reset to prevent cascade
-                    self.sam_module.reset_memory(buffer['src_nodes'].unique())
-                    self.sam_module.reset_memory(buffer['dst_nodes'].unique())
+            mem_before_norm = torch.norm(self.sam_module.raw_memory).item()
+            mem_before_std = self.sam_module.raw_memory.std().item()
             
-            # Clean up buffer
+            self.sam_module.update_memory_batch(
+                source_nodes=buffer['src_nodes'],
+                target_nodes=buffer['dst_nodes'],
+                edge_features=buffer['edge_features'],
+                current_time=buffer['timestamps'],
+                node_features=self.node_raw_features
+            )
+            
+            mem_after_norm = torch.norm(self.sam_module.raw_memory).item()
+            mem_after_std = self.sam_module.raw_memory.std().item()
+            
+            if batch_idx % 100 == 0:
+                logger.info(f"Batch {batch_idx}: SAM | "
+                        f"norm: {mem_before_norm:.2f} -> {mem_after_norm:.2f}, "
+                        f"std: {mem_before_std:.4f} -> {mem_after_std:.4f}")
+            
             delattr(self, '_sam_batch_buffer')
 
-        # 2. ST-ODE CONTINUOUS EVOLUTION (only if time has advanced)
+        # 2. ST-ODE continuous evolution
         if self.use_st_ode:
+            obs_data = self._prepare_stode_observations(batch)
             current_time = batch['timestamps'].max()
-            time_delta = current_time - self.last_update_time
             
-            # Skip if no time has passed
-            if time_delta < 1e-6:
+            # Safety check: skip if times are before last_update_time
+            if obs_data['times'].min() <= self.last_update_time:
+                logger.debug(f"Batch {batch_idx}: Skipping ST-ODE (times before last_update_time)")
+                self.last_update_time = current_time  # Still advance time
+            else:
+                # Run ST-ODE
+                evolved_memory = self.st_ode(
+                    node_states=self.sam_module.raw_memory,
+                    walk_encodings=obs_data['encodings'],
+                    walk_times=obs_data['times'],
+                    walk_masks=obs_data['masks'],
+                    adj_matrices=obs_data['adjs'],
+                    t_init=self.last_update_time,
+                    return_all=False
+                )
+                
+                # Extract final state
+                if hasattr(evolved_memory, 'final_state'):
+                    evolved_state = evolved_memory.final_state
+                else:
+                    evolved_state = evolved_memory
+                
+                # Update memory
+                self.sam_module.raw_memory.data.copy_(evolved_state)
                 self.last_update_time = current_time
-                return
+    
+    
+    # def on_train_batch_end(self, outputs, batch, batch_idx):
+    #     """ST-ODE-based memory update: continuous evolution + observation update."""
+    
+    #     # if self.use_st_ode and self.training and self.use_memory:
+    #     if self.use_st_ode and self.training and self.use_memory:
+    #         current_time = batch['timestamps'].max()
+    #         # First batch: only record the time, do not run ODE
+    #         if self.last_update_time == 0:
+    #             self.last_update_time = current_time
+    #             return
+    #         # Prepare observations from batch interactions
+    #         # Prepare observations and run ODE for subsequent batches
+    #         obs_data = self._prepare_stode_observations(batch)
             
-            # Check memory health before ST-ODE
-            if torch.isnan(self.sam_module.raw_memory).any():
-                logger.error(f"Batch {batch_idx}: Memory NaN before ST-ODE, skipping")
-                self.last_update_time = current_time
-                return
+    #         # Evolve memory from last_update_time to current batch time
+    #         # current_time = batch['timestamps'].max()
             
-            # Prepare and filter observations
-            try:
-                obs_data = self._prepare_stode_observations(batch)
-                
-                # Filter to valid times only
-                times_flat = obs_data['times'].reshape(-1)
-                valid_mask = times_flat > (self.last_update_time + 1e-6)
-                
-                if not valid_mask.any():
-                    self.last_update_time = current_time
-                    return
-                
-                # Get valid time indices
-                time_dim = obs_data['times'].shape[1]
-                original_times = times_flat[:time_dim]
-                valid_time_mask = original_times > (self.last_update_time + 1e-6)
-                valid_indices = torch.where(valid_time_mask)[0]
-                
-                if len(valid_indices) == 0:
-                    self.last_update_time = current_time
-                    return
-                
-                # Filter tensors
-                filtered_encodings = obs_data['encodings'][:, valid_indices]
-                filtered_times = obs_data['times'][:, valid_indices]
-                filtered_masks = obs_data['masks'][:, valid_indices]
-                filtered_adjs = [obs_data['adjs'][i] for i in valid_indices.tolist()]
-                
-                # Run ST-ODE (wrapped in no_grad since this is state evolution)
-                with torch.no_grad():
-                    evolved_memory = self.st_ode(
-                        node_states=self.sam_module.raw_memory,
-                        walk_encodings=filtered_encodings,
-                        walk_times=filtered_times,
-                        walk_masks=filtered_masks,
-                        adj_matrices=filtered_adjs,
-                        t_init=self.last_update_time,
-                        return_all=False
-                    )
-                    
-                    # Extract final state
-                    evolved_state = evolved_memory.final_state if hasattr(evolved_memory, 'final_state') else evolved_memory
-                    
-                    # Validate output
-                    if torch.isnan(evolved_state).any():
-                        logger.error(f"Batch {batch_idx}: ST-ODE produced NaN, skipping update")
-                    elif evolved_state.abs().max() < 1e-8:
-                        logger.warning(f"Batch {batch_idx}: ST-ODE produced near-zero state")
-                    else:
-                        # Update memory
-                        self.sam_module.raw_memory.data.copy_(evolved_state)
-                    
-                    self.last_update_time = current_time
-                    
-            except Exception as e:
-                logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
-                self.last_update_time = current_time
+    #         # Ensure times are properly shaped
+    #         # if current_time.dim() == 0:
+    #         #     current_time = current_time.unsqueeze(0)
+            
+    #         # SAFETY: Skip if observation times are before last_update_time
+    #         if obs_data['times'].min() <= self.last_update_time:
+    #             logger.debug(f"Batch {batch_idx}: Skipping ST-ODE (times before last_update_time)")
+    #             # Still update last_update_time to current batch max
+    #             self.last_update_time = current_time
+    #         else:
+    #             evolved_memory = self.st_ode(
+    #                 node_states=self.sam_module.raw_memory,
+    #                 walk_encodings=obs_data['encodings'],
+    #                 walk_times=obs_data['times'],
+    #                 walk_masks=obs_data['masks'],
+    #                 adj_matrices=obs_data['adjs'],
+    #                 t_init=self.last_update_time,
+    #                 return_all=False
+    #             )
         
+    #     # Update memory
+    #     if hasattr(evolved_memory, 'final_state'):
+    #         evolved_state = evolved_memory.final_state
+    #     else:
+    #         evolved_state = evolved_memory
+            
+    #     self.sam_module.raw_memory.data.copy_(evolved_state)
+    #     # self.last_update_time = current_time.item() if current_time.numel() == 1 else current_time[-1].item()
+    #     self.last_update_time = current_time
+        
+        # """
+        # ST-ODE-based memory update: continuous evolution + observation update.
+        # """
+        
+        # if self.training and self.use_memory and hasattr(self, '_sam_batch_buffer'):
+        #     buffer = self._sam_batch_buffer
+            
+        #     # Log L2 norm (more meaningful for symmetric distributions)
+        #     # mem_before_norm = torch.norm(self.sam_module.raw_memory).item()
+        #     # mem_before_std = self.sam_module.raw_memory.std().item()
+            
+        #     # FIX: Replace ... with actual arguments from buffer
+        #     # self.sam_module.update_memory_batch(
+        #     #     source_nodes=buffer['src_nodes'],
+        #     #     target_nodes=buffer['dst_nodes'],
+        #     #     edge_features=buffer['edge_features'],
+        #     #     current_time=buffer['timestamps'],
+        #     #     node_features=self.node_raw_features
+        #     # )
+            
+        #     # mem_after_norm = torch.norm(self.sam_module.raw_memory).item()
+        #     # mem_after_std = self.sam_module.raw_memory.std().item()
+            
+        #     # if batch_idx % 100 == 0:
+        #     #     logger.info(f"Batch {batch_idx}: SAM | "
+        #     #             f"norm: {mem_before_norm:.2f} -> {mem_after_norm:.2f}, "
+        #     #             f"std: {mem_before_std:.4f} -> {mem_after_std:.4f}")
+            
+            
+        #     # CRITICAL: Delete buffer to prevent memory leak
+        #     # Clear buffer
+        #     # delattr(self, '_sam_batch_buffer')
+
+        # if self.use_st_ode:
+        #     # Prepare observations from batch interactions
+        #     # Each interaction is an "observation" that perturbs the smooth evolution
+            
+        #     obs_data = self._prepare_stode_observations(batch)
+            
+        #     # Evolve memory from last_update_time to current batch time
+        #     # This is the core ST-ODE integration
+        #     current_time = batch['timestamps'].max()
+            
+        #     evolved_memory = self.st_ode(
+        #         node_states=self.sam_module.raw_memory,  # [num_nodes, memory_dim]
+        #         walk_encodings=obs_data['encodings'],    # Observations as walk-like data
+        #         walk_times=obs_data['times'],
+        #         walk_masks=obs_data['masks'],
+        #         adj_matrices=obs_data['adjs'],           # Graph snapshots over time
+        #         t_init=self.last_update_time,
+        #         return_all=False
+        #     )
+        #     if hasattr(evolved_memory, 'final_state'):
+        #         evolved_state = evolved_memory.final_state
+        #     else:
+        #         evolved_state = evolved_memory  # Assume direct tensor return
+            
+        #     # Update memory with evolved state
+        #     self.sam_module.raw_memory.data.copy_(evolved_state)
+        #     self.last_update_time = current_time
     def on_train_epoch_start(self):
         """Reset ST-ODE temporal state at epoch start."""
         super().on_train_epoch_start()

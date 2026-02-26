@@ -39,6 +39,7 @@ from src.models.enhanced_tgn.variants.tgn_v2 import TGNv2
 from src.models.enhanced_tgn.variants.tgn_v3 import TGNv3
 from src.models.enhanced_tgn.variants.tgn_v4 import TGNv4
 from src.models.enhanced_tgn.variants.tgn_v5 import TGNv5
+from src.models.enhanced_tgn.variants.tgn_v6 import TGNv6
 from src.models.enhanced_tgn.base_enhance_tgn import BaseEnhancedTGN
 
 from src.utils.general_utils import set_seed, get_device
@@ -55,6 +56,7 @@ MODEL_REGISTRY = {
     "TGNv3": TGNv3,
     "TGNv4": TGNv4,
     "TGNv5": TGNv5,
+    "TGNv6": TGNv6,
 }
 
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
@@ -345,11 +347,11 @@ class DataPipeline:
         num_workers = self.config['hardware'].get('num_workers', 0)
         
         for split, dataset in self.datasets.items():
-            shuffle = (split == 'train')
+            # shuffle = (split == 'train')
             self.loaders[split] = DataLoader(
                 dataset,
                 batch_size=batch_size,
-                shuffle=shuffle,
+                shuffle=False,
                 num_workers=num_workers,
                 collate_fn=TemporalDataset.collate_fn,
                 pin_memory=self.config['hardware'].get('pin_memory', False),
@@ -763,39 +765,7 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         val_dataloaders=pipeline.loaders['val'],
     )
 
-    # Load the best checkpoint for testing
-    # if trainer.checkpoint_callback and trainer.checkpoint_callback.best_model_path:
-    #     best_path = trainer.checkpoint_callback.best_model_path
-    #     logger.info(f"Loading best checkpoint from {best_path}")
-        
-    #     # 1. Re‑create a fresh model with the same configuration and data
-    #     #    (ModelFactory.create already gives a new instance)
-    #     model = ModelFactory.create(config, features)
-    #     model.set_raw_features(features['node_features'], features['edge_features'])
-    #     model.set_neighbor_finder(pipeline.neighbor_finder)
-
-    #     # set graph structure for walk sampling
-    #     model.set_graph(pipeline.train_edges, pipeline.train_times)
-        
-    #     # 2. Load the checkpoint with strict=False – ignore unexpected keys
-    #     checkpoint = torch.load(best_path, map_location='cpu', weights_only=True)
-    #     model.load_state_dict(checkpoint['state_dict'], strict=False)
-        
-    #     # 3. Ensure model is on correct device and in eval mode
-    #     model = model.to(get_device())  # Move after loading
-    #     # model = model.to(model.device)
-    #     model.eval()        
-    #     logger.info("Best checkpoint loaded successfully (strict=False).")
-    # else:
-    #     logger.warning("No checkpoint callback or best model path found. Using current model.")
-    
-    # Test
-    # logger.info("Running evaluation...")
-    # test_results = trainer.test(
-    #     model=model, 
-    #     dataloaders=pipeline.loaders['test'],
-    #     ckpt_path='best'
-    # )
+   
     if trainer.checkpoint_callback.best_model_path:
         best_path = trainer.checkpoint_callback.best_model_path
         

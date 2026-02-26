@@ -4,10 +4,14 @@ from loguru import logger
 
 from torch.utils.data import DataLoader
 
-from src.datasets.load_dataset import load_dataset
-from src.datasets.negative_sampling import NegativeSampler
-from src.datasets.neighbor_finder import NeighborFinder
-from src.datasets.temporal_dataset import TemporalDataset
+# from src.datasets.load_dataset import load_dataset
+from src.datasets.sam_dataloading.data_loader import load_dataset
+from src.datasets.sam_dataloading.negative_sample import NegativeSampler
+from src.datasets.sam_dataloading.neighbor_finder import NeighborFinder
+from src.datasets.sam_dataloading.temporal_data import TemporalDataset
+
+
+from torch.utils.data import BatchSampler, SequentialSampler
 
 # ============================================================================
 # DATA PIPELINE
@@ -81,14 +85,7 @@ class DataPipeline:
             edges = self.data['edges'][self.data[mask_key]]
             timestamps = self.data['timestamps'][self.data[mask_key]]
             
-            #  TGN paper standard - random sampling for TRAINING ONLY
-            # Historical/inductive sampling ONLY for evaluation ablation studies
-            # if split == 'train':
-            #     # Force random sampling regardless of config (prevents easy negatives)
-            #     pass  # NegativeSampler will use .random() method when called
             
-            # strategy = 'random' if split == 'train' else self.config['data']['negative_sampling_strategy']
-
             self.samplers[split] = NegativeSampler(
                 edges=edges,
                 timestamps=timestamps,
@@ -184,16 +181,17 @@ class DataPipeline:
         num_workers = self.config['hardware'].get('num_workers', 0)
         
         for split, dataset in self.datasets.items():
-            shuffle = (split == 'train')
+            # shuffle = (split == 'train')
             self.loaders[split] = DataLoader(
                 dataset,
                 batch_size=batch_size,
-                shuffle=shuffle,
+                shuffle=False,
                 num_workers=num_workers,
                 collate_fn=TemporalDataset.collate_fn,
                 pin_memory=self.config['hardware'].get('pin_memory', False),
+                sampler=torch.utils.data.SequentialSampler(dataset),
             )
-        
+        logger.info("DataLoaders built with STRICT temporal ordering (shuffle=False for all splits)")
         return self
     
     def get_features(self) -> Dict[str, Optional[torch.Tensor]]:
@@ -256,12 +254,7 @@ class DataPipeline:
                 'edge_feat_dim': 2,  # Critical: NOT 1!
                 'node_feat_dim': 100 if self.data.get('node_features') is not None else 0,
             }
-        
-        # Standard datasets (Wikipedia/Reddit/MOOC)
-        # if dataset == "wikipedia":
-        #     node_features = None
-        # else:
-        #     node_features = self.data.get('node_features')
+              
         
         node_features = self.data.get("node_features")
 

@@ -77,6 +77,6 @@ class TrainerSetup:
             gradient_clip_val=config['training']['gradient_clip_val'],
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
-            enable_progress_bar=True,
+            enable_progress_bar=True,            
             # profiler=profiler,
         )

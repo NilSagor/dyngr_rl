@@ -98,11 +98,18 @@ class TemporalAttentionLayer(nn.Module):
 
     self.merger = MergeLayer(self.query_dim, n_node_features, n_node_features, output_dimension)
 
-    self.multi_head_target = nn.MultiheadAttention(embed_dim=self.query_dim,
-                                                   kdim=self.key_dim,
-                                                   vdim=self.key_dim,
-                                                   num_heads=n_head,
-                                                   dropout=dropout)
+    self.multi_head_target = nn.MultiheadAttention(
+        embed_dim=self.query_dim,
+        kdim=self.key_dim,
+        vdim=self.key_dim,
+        num_heads=n_head,
+        dropout=dropout
+    )
+
+    if self.query_dim != n_node_features:
+        self.attn_proj = nn.Linear(self.query_dim, n_node_features)   # or vice versa
+    else:
+        self.attn_proj = nn.Identity()
 
   def forward(self, src_node_features, src_time_features, neighbors_features,
               neighbors_time_features, edge_features, neighbors_padding_mask):
@@ -140,6 +147,10 @@ class TemporalAttentionLayer(nn.Module):
     query = query.permute([1, 0, 2])  # [1, batch_size, num_of_features]
     key = key.permute([1, 0, 2])  # [n_neighbors, batch_size, num_of_features]
 
+    # Reshape for multi-head attention
+    # query = query.permute([1, 0, 2])  # [1, batch, 344]
+    # key   = key.permute([1, 0, 2])    # [n_neighbors, batch, ?]
+    
     # Compute mask of which source nodes have no valid neighbors
     # invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
     # If a source node has no valid neighbor, set it's first neighbor to be valid. This will
@@ -151,29 +162,46 @@ class TemporalAttentionLayer(nn.Module):
     # print(query.shape, key.shape)
 
     # Handle zero neighbors edge case
-    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
-    if invalid_neighborhood_mask.any() and neighbors_padding_mask.size(1) > 0:  
-        neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
+    # invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
+    # if invalid_neighborhood_mask.any() and neighbors_padding_mask.size(1) > 0:  
+    #     neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
 
-    attn_output, attn_output_weights = self.multi_head_target(query=query, key=key, value=key,
-                                                              key_padding_mask=neighbors_padding_mask)
+    # attn_output, attn_output_weights = self.multi_head_target(query=query, key=key, value=key,
+    #                                                           key_padding_mask=neighbors_padding_mask)
 
+    
+    # Multi-head attention (output dim = embed_dim = 344)
+    attn_output, attn_output_weights = self.multi_head_target(
+        query=query, key=key, value=key,
+        key_padding_mask=neighbors_padding_mask
+    )
+    
+    
     # mask = torch.unsqueeze(neighbors_padding_mask, dim=2)  # mask [B, N, 1]
     # mask = mask.permute([0, 2, 1])
     # attn_output, attn_output_weights = self.multi_head_target(q=query, k=key, v=key,
     #                                                           mask=mask)
 
-    attn_output = attn_output.squeeze()
-    attn_output_weights = attn_output_weights.squeeze()
+    
 
+    attn_output = attn_output.squeeze()          # [batch, 344]
+    attn_output_weights = attn_output_weights.squeeze()
+    
     # Source nodes with no neighbors have an all zero attention output. The attention output is
     # then added or concatenated to the original source node features and then fed into an MLP.
     # This means that an all zero vector is not used.
+    # Mask invalid neighborhoods
+    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
     attn_output = attn_output.masked_fill(invalid_neighborhood_mask, 0)
-    attn_output_weights = attn_output_weights.masked_fill(invalid_neighborhood_mask, 0)
+    # attn_output_weights = attn_output_weights.masked_fill(invalid_neighborhood_mask, 0)
 
-    # Skip connection with temporal attention over neighborhood and the features of the node itself
+    # Skip connection with temporal attention over neighborhood and the features of the node itself    
     attn_output = self.merger(attn_output, src_node_features)
+
+
+    # print(f"src_time_features shape: {src_time_features.shape}")
+    # print(f"query shape before attention: {query.shape}")
+    # print(f"attn_output shape after attention: {attn_output.shape}")
 
     return attn_output, attn_output_weights
   
