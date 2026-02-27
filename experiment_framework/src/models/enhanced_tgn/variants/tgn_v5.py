@@ -493,11 +493,11 @@ class TGNv5(BaseEnhancedTGN):
             mem_after_std = self.sam_module.raw_memory.std().item()
             
             if batch_idx % 100 == 0:
-                mem = self.sam_module.raw_memory
-                logger.info(f"Batch {batch_idx}: raw_memory | "
-                        f"mean={mem.mean().item():.4f}, "
-                        f"std={mem.std().item():.4f}, "
-                        f"nonzero={(mem.abs() > 1e-6).float().mean().item():.2%}")
+                logger.info(f"Batch {batch_idx}: SAM | "
+                        f"norm: {mem_before_norm:.2f} -> {mem_after_norm:.2f}, "
+                        f"std: {mem_before_std:.4f} -> {mem_after_std:.4f}")
+            
+            
             # CRITICAL: Delete buffer to prevent memory leak
             # Clear buffer
             delattr(self, '_sam_batch_buffer')

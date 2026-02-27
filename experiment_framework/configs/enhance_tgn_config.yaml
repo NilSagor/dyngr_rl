@@ -21,6 +21,7 @@ model:
   # ST ODE
   mu: 0.0
   adaptive_mu: false
+  use_hct: false
   use_st_ode: false
   ode_method: rk4
   ode_step_size: 10000   # increase step size to reduce steps

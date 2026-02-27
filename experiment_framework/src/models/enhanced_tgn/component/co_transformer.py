@@ -113,59 +113,7 @@ class IntraWalkEncoder(nn.Module):
         return encoded_walks, walk_summaries
 
 
-# class CooccurrenceMatrix(nn.Module):
-#     """
-#     Constructs co-occurrence matrix between walks based on anonymized node positions.
-    
-#     C_u[r,s] = Σ_i Σ_j I(a_i^(r) = a_j^(s)) · κ(i, j)
-#     where κ(i,j) = exp(-|i-j|²/σ²) is a positional kernel.
-#     """
-#     def __init__(self, max_walk_length: int = 20, sigma: float = 2.0):
-#         super(CooccurrenceMatrix, self).__init__()
-        
-#         self.max_walk_length = max_walk_length
-#         self.sigma = sigma
-        
-#         # Pre-compute positional kernel matrix
-#         kernel = torch.zeros(max_walk_length, max_walk_length)
-#         for i in range(max_walk_length):
-#             for j in range(max_walk_length):
-#                 kernel[i, j] = math.exp(-((i - j) ** 2) / (sigma ** 2))
-        
-#         self.register_buffer('kernel', kernel)   
-    
-    
-#     def forward(self, anonymized_nodes, walk_masks):
-#         """Fully vectorized but memory-intensive version."""
-#         batch_size, num_walks, walk_len = anonymized_nodes.shape
-#         cooccurrence = torch.zeros(batch_size, num_walks, num_walks, 
-#                                device=anonymized_nodes.device)
-        
-#         device = anonymized_nodes.device
-#         # Ensure walk_masks is boolean for bitwise operations
-#         walk_masks_bool = walk_masks.bool() if walk_masks.dtype != torch.bool else walk_masks
 
-#         for r in range(num_walks):
-#             for s in range(num_walks):
-#                 # Vectorized comparison for one pair only
-#                 nodes_r = anonymized_nodes[:, r, :].unsqueeze(-1)  # [B, L, 1]
-#                 nodes_s = anonymized_nodes[:, s, :].unsqueeze(1)   # [B, 1, L]
-                
-#                 # match = (nodes_r == nodes_s) & walk_masks[:, r, :, None] & walk_masks[:, s, None, :]
-#                 # Use boolean masks for bitwise AND
-#                 mask_r = walk_masks_bool[:, r, :, None]  # [B, L, 1]
-#                 mask_s = walk_masks_bool[:, s, None, :]  # [B, 1, L]
-                
-#                 match = (nodes_r == nodes_s) & mask_r & mask_s
-                
-#                 kernel = self.kernel[:walk_len, :walk_len].to(anonymized_nodes.device)
-                
-#                 # Per-sample normalization
-#                 norm_factor = (walk_masks[:, r].sum(dim=-1) * walk_masks[:, s].sum(dim=-1)) + 1e-8  # [batch_size]
-#                 cooccurrence[:, r, s] = (match.float() * kernel).sum(dim=[-2, -1]) / norm_factor  # Both [batch_size]
-        
-#         return cooccurrence
-        
         
 class CooccurrenceMatrix(nn.Module):
     """
@@ -220,29 +168,47 @@ class CooccurrenceMatrix(nn.Module):
                 start = change_indices[i].item()
                 end = change_indices[i + 1].item() if i + 1 < len(change_indices) else len(sorted_node_ids)
                 
+                
+
                 # Walks containing this node
                 walks_with_node = sorted_walks[start:end]      # [n_occurrences]
                 positions_in_walks = sorted_pos[start:end]     # [n_occurrences]
                 
-                # All pairs of occurrences
-                if len(walks_with_node) > 1:
-                    # Outer product of positions to get kernel values
-                    pos_i = positions_in_walks.unsqueeze(1)  # [n, 1]
-                    pos_j = positions_in_walks.unsqueeze(0)  # [1, n]
+                
+                # All pairs of occurrences (including i=j)
+                pos_i = positions_in_walks.unsqueeze(1)        # [n, 1]
+                pos_j = positions_in_walks.unsqueeze(0)        # [1, n]
+                kernel_vals = kernel[pos_i, pos_j]              # [n, n]
+
+                w_i = walks_with_node.unsqueeze(1)              # [n, 1]
+                w_j = walks_with_node.unsqueeze(0)              # [1, n]
+
+
+                cooccurrence[b].index_put_(
+                    (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
+                    kernel_vals,
+                    accumulate=True
+                )
+                
+                # # All pairs of occurrences
+                # if len(walks_with_node) > 1:
+                #     # Outer product of positions to get kernel values
+                #     pos_i = positions_in_walks.unsqueeze(1)  # [n, 1]
+                #     pos_j = positions_in_walks.unsqueeze(0)  # [1, n]
                     
-                    # Kernel values for all pairs
-                    kernel_vals = kernel[pos_i, pos_j]  # [n, n]
+                #     # Kernel values for all pairs
+                #     kernel_vals = kernel[pos_i, pos_j]  # [n, n]
                     
-                    # Walk indices for all pairs
-                    w_i = walks_with_node.unsqueeze(1)  # [n, 1]
-                    w_j = walks_with_node.unsqueeze(0)  # [1, n]
+                #     # Walk indices for all pairs
+                #     w_i = walks_with_node.unsqueeze(1)  # [n, 1]
+                #     w_j = walks_with_node.unsqueeze(0)  # [1, n]
                     
-                    # Scatter add to cooccurrence matrix
-                    cooccurrence[b].index_put_(
-                        (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
-                        kernel_vals,
-                        accumulate=True
-                    )
+                #     # Scatter add to cooccurrence matrix
+                #     cooccurrence[b].index_put_(
+                #         (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
+                #         kernel_vals,
+                #         accumulate=True
+                #     )
         
         # Normalize
         walk_lens = walk_masks.sum(dim=-1)  # [B, W]
