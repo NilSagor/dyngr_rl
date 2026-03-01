@@ -436,9 +436,9 @@ class STODEIntegrator(nn.Module):
         # Handle scalar tensors without .item()
         if t0.numel() == 1 and t1.numel() == 1:
             # Detach if not needed for gradients, keep on device
-            t0_val = t0.view(1) if t0.requires_grad else t0.detach().view(1)
-            t1_val = t1.view(1) if t1.requires_grad else t1.detach().view(1)
-            return torch.cat([t0_val, t1_val]).to(device)
+            t0_val = (t0.view(1) if t0.requires_grad else t0.detach().view(1)).to(device)
+            t1_val = (t1.view(1) if t1.requires_grad else t1.detach().view(1)).to(device)
+            return torch.cat([t0_val, t1_val])
         raise ValueError("t0 and t1 must be scalar tensors")
     
     def forward(

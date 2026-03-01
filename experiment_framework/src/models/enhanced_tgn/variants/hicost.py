@@ -17,9 +17,11 @@ from ..component.transformer_encoder import MergeLayer
 
 
 
-class TGNv6(BaseEnhancedTGN):
+class HiCoST(nn.Module):
     """
-    TGN + SAM + Multi-Scale Walk Sampler + Hierarchical Co-occurrence Transformer (HCT) + ST ODE
+     Hierarchical Co‑occurrence Spectral Temporal
+     hierarchical co‑occurrence + spectral‑temporal ODE
+     SAM + Multi-Scale Walk Sampler + Hierarchical Co-occurrence Transformer (HCT) + ST ODE
     
     Architecture:
     1. SAM maintains stable node memory via prototypes

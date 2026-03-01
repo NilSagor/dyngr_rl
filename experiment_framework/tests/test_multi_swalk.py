@@ -39,14 +39,32 @@ def test_intra_walk_encoder_pooling():
 # ----------------------------------------------------------------------
 # CooccurrenceMatrix tests
 # ----------------------------------------------------------------------
+def test_cooccurrence_matrix_deterministic():
+    """Simple deterministic case to verify correctness."""
+    nodes = torch.tensor([[[1, 2],
+                           [1, 3]]])  # batch=1, walks=2, length=2
+    mask = torch.ones(1, 2, 2).bool()
+    mat = CooccurrenceMatrix(max_walk_length=2, sigma=2.0)
+    result = mat(nodes, mask.float())
+    # Expected values computed manually:
+    # kernel[0,0]=1, kernel[1,1]=1, kernel[0,1]=exp(-1/4)=~0.7788
+    # Walk0: [1,2]; Walk1: [1,3]
+    # (0,0): sum of kernel[i,i] = 1+1=2, norm=4 -> 0.5
+    # (0,1): match at (0,0) only -> 1, norm=4 -> 0.25
+    # (1,0): same 0.25
+    # (1,1): 0.5
+    expected = torch.tensor([[[0.5, 0.25],
+                              [0.25, 0.5]]], dtype=torch.float32)
+    torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
 def test_cooccurrence_matrix_naive_vs_sparse():
-    torch.manual_seed(42)  # fixed seed for reproducibility
+    torch.manual_seed(42)
     B, W, L = 2, 3, 4
     nodes = torch.randint(1, 5, (B, W, L))
     mask = torch.randint(0, 2, (B, W, L)).bool()
     # Force some matches
     nodes[0, 0, 0] = 10
-    nodes[0, 1, 2] = 10  # same node in different walks
+    nodes[0, 1, 2] = 10
 
     def naive_cooccurrence(nodes, mask, kernel):
         B, W, L = nodes.shape
@@ -67,15 +85,56 @@ def test_cooccurrence_matrix_naive_vs_sparse():
     sparse_result = mat(nodes, mask.float())
     naive_result = naive_cooccurrence(nodes, mask, kernel)
 
-    # Print differences for debugging
+    # Debug prints
+    print("Nodes:\n", nodes)
+    print("Mask:\n", mask)
     diff = (sparse_result - naive_result).abs()
     print("Max diff:", diff.max().item())
     print("Indices with diff > 1e-4:", torch.nonzero(diff > 1e-4))
     print("Sparse result:\n", sparse_result)
     print("Naive result:\n", naive_result)
 
-    # Use a slightly larger tolerance if needed, but first check the print output
+    # Use a slightly larger tolerance; if still failing, investigate the printed values
     torch.testing.assert_close(sparse_result, naive_result, rtol=1e-3, atol=1e-3)
+
+
+# def test_cooccurrence_matrix_naive_vs_sparse():
+#     torch.manual_seed(42)  # fixed seed for reproducibility
+#     B, W, L = 2, 3, 4
+#     nodes = torch.randint(1, 5, (B, W, L))
+#     mask = torch.randint(0, 2, (B, W, L)).bool()
+#     # Force some matches
+#     nodes[0, 0, 0] = 10
+#     nodes[0, 1, 2] = 10  # same node in different walks
+
+#     def naive_cooccurrence(nodes, mask, kernel):
+#         B, W, L = nodes.shape
+#         cooc = torch.zeros(B, W, W)
+#         for b in range(B):
+#             for r in range(W):
+#                 for s in range(W):
+#                     match = (nodes[b, r] == nodes[b, s].unsqueeze(-1)) & mask[b, r].unsqueeze(-1) & mask[b, s].unsqueeze(-2)
+#                     val = (match.float() * kernel[:L, :L]).sum()
+#                     norm = (mask[b, r].sum() * mask[b, s].sum()).clamp_min(1e-8)
+#                     cooc[b, r, s] = val / norm
+#         return cooc
+
+#     kernel = torch.exp(-((torch.arange(L).float().unsqueeze(0) - torch.arange(L).float().unsqueeze(1))**2) / 2.0**2)
+#     mat = CooccurrenceMatrix(max_walk_length=L, sigma=2.0)
+#     mat.kernel = kernel  # inject for test
+
+#     sparse_result = mat(nodes, mask.float())
+#     naive_result = naive_cooccurrence(nodes, mask, kernel)
+
+#     # Print differences for debugging
+#     diff = (sparse_result - naive_result).abs()
+#     print("Max diff:", diff.max().item())
+#     print("Indices with diff > 1e-4:", torch.nonzero(diff > 1e-4))
+#     print("Sparse result:\n", sparse_result)
+#     print("Naive result:\n", naive_result)
+
+#     # Use a slightly larger tolerance if needed, but first check the print output
+#     torch.testing.assert_close(sparse_result, naive_result, rtol=1e-3, atol=1e-3)
 
 def test_cooccurrence_matrix_edge_cases():
     mat = CooccurrenceMatrix(max_walk_length=5, sigma=2.0)
@@ -112,6 +171,52 @@ def test_inter_walk_attention_bias():
 # ----------------------------------------------------------------------
 # HierarchicalCooccurrenceTransformer full forward test
 # ----------------------------------------------------------------------
+# def test_hct_full_forward():
+#     hct = HierarchicalCooccurrenceTransformer(
+#         d_model=16,
+#         memory_dim=16,
+#         max_walk_length=5,
+#         max_num_walks=4
+#     )
+#     batch = 2
+#     walks_dict = {
+#         'short': {
+#             'nodes': torch.randint(0, 10, (batch, 2, 5)),
+#             'nodes_anon': torch.randint(1, 5, (batch, 2, 5)),
+#             'masks': torch.ones(batch, 2, 5).bool()
+#         },
+#         'long': {
+#             'nodes': torch.randint(0, 10, (batch, 2, 5)),
+#             'nodes_anon': torch.randint(1, 5, (batch, 2, 5)),
+#             'masks': torch.ones(batch, 2, 5).bool()
+#         },
+#         'tawr': {
+#             'nodes': torch.randint(0, 10, (batch, 2, 5)),
+#             'nodes_anon': torch.randint(1, 5, (batch, 2, 5)),
+#             'masks': torch.ones(batch, 2, 5).bool(),
+#             'restart_flags': torch.randint(0, 2, (batch, 2, 5))
+#         }
+#     }
+#     node_memory = torch.randn(10, 16, requires_grad=True)
+
+#     # Test with return_all=False
+#     fused = hct(walks_dict, node_memory)
+#     assert fused.shape == (batch, 16)
+
+#     # Test with return_all=True
+#     output_dict = hct(walks_dict, node_memory, return_all=True)
+#     assert 'fused' in output_dict
+#     for t in ['short', 'long', 'tawr']:
+#         assert t in output_dict
+#         assert 'encoded_walks' in output_dict[t]
+#         assert 'walk_summaries' in output_dict[t]
+#         assert 'refined_walks' in output_dict[t]
+#         assert 'cooccurrence' in output_dict[t]
+#         assert 'walk_masks' in output_dict[t]
+
+#     # Gradient check
+#     fused.sum().backward()
+#     assert node_memory.grad is not None
 def test_hct_full_forward():
     hct = HierarchicalCooccurrenceTransformer(
         d_model=16,
@@ -140,11 +245,9 @@ def test_hct_full_forward():
     }
     node_memory = torch.randn(10, 16, requires_grad=True)
 
-    # Test with return_all=False
     fused = hct(walks_dict, node_memory)
     assert fused.shape == (batch, 16)
 
-    # Test with return_all=True
     output_dict = hct(walks_dict, node_memory, return_all=True)
     assert 'fused' in output_dict
     for t in ['short', 'long', 'tawr']:
@@ -155,7 +258,6 @@ def test_hct_full_forward():
         assert 'cooccurrence' in output_dict[t]
         assert 'walk_masks' in output_dict[t]
 
-    # Gradient check
     fused.sum().backward()
     assert node_memory.grad is not None
 
