@@ -12,5 +12,4 @@ class TGNv2(BaseEnhancedTGN):
         super().__init__(*args, **kwargs)
         self.time_encoder = TimeEncoder(dimension=self.time_encoding_dim)
     
-    # def forward(self, batch):
-    #     pass
+    
