@@ -46,7 +46,8 @@ class SAMCell(nn.Module):
 
         # Handle all similarity metrics
         if self.similarity_metric == "cosine":
-            query_norm = F.normalize(query, dim=-1, eps=1e-6)  # FIX: Larger epsilon
+            # FIX: Use larger epsilon for normalize
+            query_norm = F.normalize(query, dim=-1, eps=1e-6)
             proto_norm = F.normalize(prototypes, dim=-1, eps=1e-6)
             sim = torch.bmm(query_norm.unsqueeze(1), proto_norm.transpose(1, 2)).squeeze(1)
         elif self.similarity_metric == "dot":
@@ -88,9 +89,6 @@ class SAMCell(nn.Module):
                 time_encoding = time_encoding[:batch_size] if time_encoding.size(0) > batch_size else \
                                F.pad(time_encoding, (0, 0, 0, batch_size - time_encoding.size(0)))
         
-        
-        
-        
         if edge_features is not None and edge_features.size(0) != batch_size:
             if edge_features.size(0) == 1:
                 edge_features = edge_features.repeat(batch_size, 1)
@@ -125,9 +123,7 @@ class SAMCell(nn.Module):
         if node_mask is not None:
             all_masked = (~node_mask).all(dim=-1, keepdim=True)
             if all_masked.any():
-                # For all-masked rows, use uniform attention directly
                 uniform = torch.ones_like(similarity) / similarity.shape[-1]
-                # Only compute softmax for non-masked rows
                 masked_similarity = similarity.masked_fill(~node_mask, float('-inf'))
                 attention_weights = torch.where(
                     all_masked,
@@ -250,11 +246,11 @@ class StabilityAugmentedMemory(nn.Module):
         # Last update time for each node
         self.register_buffer("last_update", torch.zeros(num_nodes))
 
+        
         # Learnable prototypes [num_nodes, num_prototypes, memory_dim]
         self.all_prototypes = nn.Parameter(
             torch.empty(num_nodes, num_prototypes, memory_dim)
         )
-        # Vectorized initialization
         nn.init.xavier_uniform_(self.all_prototypes)
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
@@ -268,7 +264,6 @@ class StabilityAugmentedMemory(nn.Module):
         if not torch.isfinite(prototypes).all():
             logger.warning("Prototypes contain NaN - resetting to small random values")
             with torch.no_grad():
-                # Re-initialise only the affected prototypes
                 new_protos = torch.empty_like(prototypes).normal_(0, 0.01)
                 # FIX: Clamp to prevent rare Inf from normal_
                 new_protos = torch.clamp(new_protos, min=-1.0, max=1.0)
@@ -312,7 +307,6 @@ class StabilityAugmentedMemory(nn.Module):
         # Validate memory state
         if not torch.isfinite(self.raw_memory).all():
             logger.warning("Memory contains NaN/Inf, resetting affected nodes...")
-            # Reset only corrupted nodes
             nan_mask = ~torch.isfinite(self.raw_memory).any(dim=-1)
             self.raw_memory[nan_mask] = 0
             self.last_update[nan_mask] = 0
@@ -322,27 +316,27 @@ class StabilityAugmentedMemory(nn.Module):
             edge_proj = self.edge_proj(edge_features)
             if not torch.isfinite(edge_proj).all():
                 edge_proj = torch.nan_to_num(edge_proj, nan=0.0, posinf=10.0, neginf=-10.0)
-            # L2 normalize and scale
-            edge_proj_norm = edge_proj.norm(dim=-1, keepdim=True) + 1e-6  # FIX: Larger epsilon
+            # FIX: Use larger epsilon for norm
+            edge_proj_norm = edge_proj.norm(dim=-1, keepdim=True) + 1e-6
             edge_proj = (edge_proj / edge_proj_norm) * 10.0
             edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
         else:
-            edge_proj = torch.zeros(batch_size, self.memory_dim, 
-                                  device=source_nodes.device)
+            batch_size = max(source_nodes.size(0), target_nodes.size(0))
+            edge_proj = torch.zeros(batch_size, self.memory_dim, device=source_nodes.device)
         
         
         # Time encoding
         time_enc = self.time_encoder(current_time)
-
+        assert time_enc.shape[-1] == self.time_dim, "Time encoder dimension mismatch"
 
         # Full shape validation for time encoding
-        assert time_enc.shape[-1] == self.time_dim, f"Time encoder dimension mismatch: {time_enc.shape[-1]} vs {self.time_dim}"
-        if time_enc.size(0) == 1 and batch_size > 1:
-            time_enc = time_enc.repeat(batch_size, 1)
-        elif time_enc.size(0) != batch_size:
-            logger.warning(f"Time encoding batch mismatch: {time_enc.size(0)} vs {batch_size}")
-            time_enc = time_enc[:batch_size] if time_enc.size(0) > batch_size else \
-                      F.pad(time_enc, (0, 0, 0, batch_size - time_enc.size(0)))
+        # assert time_enc.shape[-1] == self.time_dim, f"Time encoder dimension mismatch: {time_enc.shape[-1]} vs {self.time_dim}"
+        # if time_enc.size(0) == 1 and batch_size > 1:
+        #     time_enc = time_enc.repeat(batch_size, 1)
+        # elif time_enc.size(0) != batch_size:
+        #     logger.warning(f"Time encoding batch mismatch: {time_enc.size(0)} vs {batch_size}")
+        #     time_enc = time_enc[:batch_size] if time_enc.size(0) > batch_size else \
+        #               F.pad(time_enc, (0, 0, 0, batch_size - time_enc.size(0)))
 
 
         # Get node-specific data
@@ -392,7 +386,7 @@ class StabilityAugmentedMemory(nn.Module):
         # Handle overlapping source/target nodes
         with torch.no_grad():
             src_new = torch.nan_to_num(src_new, nan=0.0, posinf=5.0, neginf=-5.0)
-            tgt_new = torch.nan_to_num(tgt_new, nan=0.0, posinf=5.0, neginf=-5.0)            
+            tgt_new = torch.nan_to_num(tgt_new, nan=0.0, posinf=5.0, neginf=-5.0)
             
             # Handle overlapping nodes by averaging updates
             all_nodes = torch.cat([source_nodes, target_nodes])
@@ -465,7 +459,7 @@ class StabilityAugmentedMemory(nn.Module):
         
         time_enc = self.time_encoder(current_time)
         
-        # Validate time encoding shape
+        # FIX: Validate time encoding shape
         if time_enc.size(0) == 1 and node_ids.size(0) > 1:
             time_enc = time_enc.repeat(node_ids.size(0), 1)
         elif time_enc.size(0) != node_ids.size(0):
@@ -475,16 +469,18 @@ class StabilityAugmentedMemory(nn.Module):
         
         raw = self.raw_memory[node_ids]
         proto = self.get_prototypes(node_ids)        
-        
+                
         # Handle edge features
         if edge_features is not None and edge_features.numel() > 0:
             edge_proj = self.edge_proj(edge_features)
             if not torch.isfinite(edge_proj).all():
                 edge_proj = torch.nan_to_num(edge_proj, nan=0.0, posinf=10.0, neginf=-10.0)
-            edge_proj = F.normalize(edge_proj, dim=-1) * 10.0
+            # FIX: Use larger epsilon
+            edge_proj = F.normalize(edge_proj, dim=-1, eps=1e-6) * 10.0
             edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
         else:
-            edge_proj = torch.zeros(node_ids.size(0), self.memory_dim, device=raw.device)
+            edge_proj = torch.zeros(node_ids.size(0), self.memory_dim, device=device)
+        
         
         stabilized, _ = self.sam_cell(
             raw_memory=raw,

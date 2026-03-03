@@ -798,15 +798,26 @@ class TGNv6(BaseEnhancedTGN):
                 
                 # FIX 5: Remove manual raw_memory.data copy (SAM handles it internally)
                 # Only sanitize prototypes
-                if not torch.isfinite(self.sam_module.all_prototypes).all():
-                    logger.error(f"Batch {batch_idx}: Prototypes NaN, resetting")
-                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
-                else:
-                    self.sam_module.all_prototypes.data.clamp_(-10.0, 10.0)
-                
                 if not torch.isfinite(self.sam_module.raw_memory).all():
                     logger.error(f"Batch {batch_idx}: SAM memory NaN AFTER update! RESETTING")
                     self.sam_module.reset_memory()
+                
+                if not torch.isfinite(self.sam_module.all_prototypes).all():
+                    logger.error(f"Batch {batch_idx}: Prototypes NaN! RESETTING")
+                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
+                
+                self.sam_module.raw_memory.data = torch.nan_to_num(
+                    self.sam_module.raw_memory.data,
+                    nan=0.0,
+                    posinf=10.0,
+                    neginf=-10.0
+                ).clamp_(-10, 10)
+                self.sam_module.all_prototypes.data = torch.nan_to_num(
+                    self.sam_module.all_prototypes.data,
+                    nan=0.0,
+                    posinf=10.0,
+                    neginf=-10.0
+                ).clamp_(-10, 10)
             
             delattr(self, '_sam_batch_buffer')
         
