@@ -312,7 +312,16 @@ def test_sam_gradient_flow(basic_sam, sample_batch):
     assert basic_sam.all_prototypes.grad is not None
     assert basic_sam.all_prototypes.grad.abs().sum() > 0
 
-    
+def test_samcell_zero_memory():
+    cell = SAMCell(memory_dim=8, edge_feat_dim=8, time_dim=4, num_prototypes=3)
+    batch = 2
+    raw_mem = torch.zeros(batch, 8)          # zero memory
+    edge_feat = torch.randn(batch, 8) * 0    # zero edge features
+    time_enc = torch.randn(batch, 4) * 0     # zero time encoding
+    prototypes = torch.randn(batch, 3, 8)
+    updated, info = cell(raw_mem, None, edge_feat, time_enc, prototypes)
+    assert not torch.isnan(updated).any()
+    assert not torch.isnan(info["similarity_scores"]).any()  
 
 def test_sam_update_memory_batch_extreme_values(basic_sam):
     # Very large edge features, times, etc.

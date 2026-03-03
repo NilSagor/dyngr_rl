@@ -272,7 +272,35 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         
         # 2. CRITICAL: Initialize walk sampler with full graph BEFORE loading checkpoint
         # This ensures the walk sampler has the graph structure
-        model.set_graph(pipeline.train_edges, pipeline.train_times)
+        if hasattr(pipeline.neighbor_finder, 'edge_index') and hasattr(pipeline.neighbor_finder, 'edge_time'):
+            model.set_graph(pipeline.neighbor_finder.edge_index, pipeline.neighbor_finder.edge_time)
+        else:
+            # Fallback: extract from dataset
+            model.set_graph(pipeline.train_edges, pipeline.train_times)
+        
+        # Verify walk sampler is working
+        test_src = torch.tensor([0, 1], device=model.device)
+        test_dst = torch.tensor([1, 2], device=model.device)
+        test_ts = torch.tensor([0.0, 0.0], device=model.device)
+
+        test_walks = model.walk_sampler(
+            source_nodes=test_src,
+            target_nodes=test_dst,
+            current_times=test_ts,
+            memory_states=model.sam_module.raw_memory,
+            edge_index=model.edge_index,
+            edge_time=model.edge_time
+        )
+
+        for side in ['source', 'target']:
+            for wt in ['short', 'long', 'tawr']:
+                nodes = test_walks[side][wt]['nodes']
+                if nodes.max().item() == 0 and nodes.numel() > 0:
+                    logger.error(f"CRITICAL: Walk sampler returns all-zero indices for {side}/{wt}!")
+                    logger.error(f"Check edge_index shape: {model.edge_index.shape if model.edge_index is not None else 'None'}")
+                    logger.error(f"Check edge_time shape: {model.edge_time.shape if model.edge_time is not None else 'None'}")
+        
+        
         
         # 3. Now load checkpoint weights
         logger.info(f"Loading best checkpoint from {best_path}")

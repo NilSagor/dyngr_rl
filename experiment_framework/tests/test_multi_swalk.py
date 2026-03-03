@@ -136,6 +136,54 @@ def test_cooccurrence_matrix_naive_vs_sparse():
 #     # Use a slightly larger tolerance if needed, but first check the print output
 #     torch.testing.assert_close(sparse_result, naive_result, rtol=1e-3, atol=1e-3)
 
+
+def test_walk_sampler(sampler, num_nodes=100):
+    """Basic smoke test for MultiScaleWalkSampler."""
+    import torch
+    
+    # Create dummy edges
+    edge_index = torch.tensor([
+        [0, 1, 1, 2, 2, 3],
+        [1, 0, 2, 1, 3, 2]
+    ])
+    edge_time = torch.tensor([1.0, 1.5, 2.0, 2.5, 3.0, 3.5])
+    
+    # Initialize sampler
+    sampler.update_neighbors(edge_index, edge_time)
+    sampler.build_dense_neighbor_table()
+    
+    # Test inputs
+    source = torch.tensor([0, 1])
+    target = torch.tensor([2, 3])
+    times = torch.tensor([4.0, 4.5])
+    memory = torch.randn(num_nodes, 128)
+    
+    # Run forward
+    result = sampler(source, target, times, memory, edge_index, edge_time)
+    
+    # Verify structure
+    assert 'source' in result and 'target' in result
+    for side in ['source', 'target']:
+        for wt in ['short', 'long', 'tawr']:
+            assert wt in result[side]
+            assert 'nodes' in result[side][wt]
+            assert 'nodes_anon' in result[side][wt]  # Anonymized version
+            assert result[side][wt]['nodes'].shape == result[side][wt]['nodes_anon'].shape
+    
+    # Verify anonymization bounds
+    for side in ['source', 'target']:
+        for wt in ['short', 'long', 'tawr']:
+            anon = result[side][wt]['nodes_anon']
+            assert anon.min() >= 0, f"{side}/{wt} anonymized nodes have negative values"
+            # Max should be <= number of unique nodes in original walk
+            orig = result[side][wt]['nodes']
+            masks = result[side][wt]['masks']
+            for b in range(orig.shape[0]):
+                unique_count = torch.unique(orig[b][masks[b].bool()]).numel()
+                assert anon[b].max() <= unique_count + 1, f"{side}/{wt} batch {b} anonymization overflow"
+    
+    print(" Walk sampler smoke test passed!")
+
 def test_cooccurrence_matrix_edge_cases():
     mat = CooccurrenceMatrix(max_walk_length=5, sigma=2.0)
     # All masks zero -> co-occurrence should be zero

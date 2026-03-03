@@ -36,10 +36,10 @@ class SAMCell(nn.Module):
         self.layer_norm = nn.LayerNorm(memory_dim)
 
     def compute_similarity(self, query: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
-        # ✅ Fixed: Handle all similarity metrics
+        # Handle all similarity metrics
         if self.similarity_metric == "cosine":
-            query_norm = F.normalize(query, dim=-1)
-            proto_norm = F.normalize(prototypes, dim=-1)
+            query_norm = F.normalize(query, dim=-1, eps=1e-8)
+            proto_norm = F.normalize(prototypes, dim=-1, eps=1e-8)
             sim = torch.bmm(query_norm.unsqueeze(1), proto_norm.transpose(1, 2)).squeeze(1)
         elif self.similarity_metric == "dot":
             sim = torch.bmm(query.unsqueeze(1), prototypes.transpose(1, 2)).squeeze(1)
@@ -49,6 +49,8 @@ class SAMCell(nn.Module):
         else:
             raise ValueError(f"Unknown similarity metric: {self.similarity_metric}")
         
+        sim = torch.clamp(sim, min=-50.0, max=50.0)
+
         temp = self.temperature.clamp(self.temperature_min, self.temperature_max)
         return sim / (temp + 1e-6)
 
@@ -64,7 +66,7 @@ class SAMCell(nn.Module):
         # Ensure consistent batch size across inputs
         batch_size = raw_memory.size(0)
         if time_encoding.size(0) != batch_size:
-            time_encoding = time_encoding.expand(batch_size, -1)
+            time_encoding = time_encoding.repeat(batch_size, 1)
         if edge_features.size(0) != batch_size:
             edge_features = edge_features.expand(batch_size, -1)
         if node_features is not None and node_features.size(0) != batch_size:
@@ -85,7 +87,7 @@ class SAMCell(nn.Module):
         
         similarity = self.compute_similarity(query, prototypes)
         
-        # ✅ Fixed: Handle all-masked prototypes
+        # Handle all-masked prototypes
         if node_mask is not None:
             similarity = similarity.masked_fill(~node_mask, float('-inf'))
             all_masked = (similarity == float('-inf')).all(dim=-1, keepdim=True)
@@ -102,7 +104,7 @@ class SAMCell(nn.Module):
         ).squeeze(1)
         candidate_memory = torch.clamp(candidate_memory, -5.0, 5.0)
         
-        # ✅ Fixed: None-safe gate inputs
+        # None-safe gate inputs
         gate_inputs = [raw_memory, candidate_memory]
         if time_encoding is not None:
             gate_inputs.append(time_encoding)
@@ -114,7 +116,7 @@ class SAMCell(nn.Module):
         
         updated_memory = (1 - update_gate) * raw_memory + update_gate * candidate_memory
         updated_memory = self.layer_norm(updated_memory)
-        updated_memory = torch.clamp(updated_memory, min=-50, max=50)
+        updated_memory = torch.clamp(updated_memory, min=-10, max=10)
         
         return updated_memory, {
             "attention_weights": attention_weights,
@@ -192,16 +194,22 @@ class StabilityAugmentedMemory(nn.Module):
         self.all_prototypes = nn.Parameter(
             torch.empty(num_nodes, num_prototypes, memory_dim)
         )
-        # ✅ Vectorized initialization
+        # Vectorized initialization
         nn.init.xavier_uniform_(self.all_prototypes)
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
         """Get raw memory for specified nodes."""
         return self.raw_memory[node_ids]
     
-    def get_prototypes(self, node_ids: torch.Tensor) -> torch.Tensor:
-        """Get prototype vectors for specified nodes."""
+    def get_prototypes(self, node_ids):
         prototypes = self.all_prototypes[node_ids]
+        if not torch.isfinite(prototypes).all():
+            logger.warning("Prototypes contain NaN – resetting to small random values")
+            with torch.no_grad():
+                # Re-initialise only the affected prototypes
+                new_protos = torch.empty_like(prototypes).normal_(0, 0.01)
+                self.all_prototypes[node_ids] = new_protos
+                prototypes = new_protos
         return self.prototype_norm(prototypes)
     
     def update_memory_batch(
@@ -225,19 +233,25 @@ class StabilityAugmentedMemory(nn.Module):
         
         # Validate memory state
         if not torch.isfinite(self.raw_memory).all():
-            logger.warning("Memory contains NaN/Inf, resetting...")
-            self.reset_memory()
+            logger.warning("Memory contains NaN/Inf, resetting affected nodes...")
+            # Reset only corrupted nodes
+            nan_mask = ~torch.isfinite(self.raw_memory).any(dim=-1)
+            self.raw_memory[nan_mask] = 0
+            self.last_update[nan_mask] = 0
         
         # Project and normalize edge features (with None handling)
         if edge_features is not None and edge_features.numel() > 0:
             edge_proj = self.edge_proj(edge_features)
+            if not torch.isfinite(edge_proj).all():
+                edge_proj = torch.nan_to_num(edge_proj, nan=0.0, posinf=10.0, neginf=-10.0)
             # L2 normalize and scale
             edge_proj_norm = edge_proj.norm(dim=-1, keepdim=True) + 1e-8
             edge_proj = (edge_proj / edge_proj_norm) * 10.0
             edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
         else:
             # Create zero features with correct shape
-            batch_size = max(source_nodes.size(0), target_nodes.size(0))
+            batch_size = source_nodes.size(0)
+            assert target_nodes.size(0) == batch_size, f"Source/target batch mismatch: {source_nodes.size(0)} vs {target_nodes.size(0)}"
             edge_proj = torch.zeros(batch_size, self.memory_dim, 
                                   device=source_nodes.device)
         
@@ -275,14 +289,37 @@ class StabilityAugmentedMemory(nn.Module):
             prototypes=tgt_proto
         )
         
+        src_new = torch.clamp(src_new, -5.0, 5.0)
+        tgt_new = torch.clamp(tgt_new, -5.0, 5.0)
+
+        if not torch.isfinite(src_new).all() or not torch.isfinite(tgt_new).all():
+            logger.error("SAM cell produced NaN – skipping update for this batch")
+            return {
+                'source_attention': {}, 
+                'target_attention': {},
+                'source_memory': torch.zeros_like(src_mem),  # Add missing keys
+                'target_memory': torch.zeros_like(tgt_mem)
+            }
+        
         # Update memory buffers WITHOUT gradients (state evolution)
         with torch.no_grad():
+            src_new = torch.nan_to_num(src_new, nan=0.0, posinf=5.0, neginf=-5.0)
+            tgt_new = torch.nan_to_num(tgt_new, nan=0.0, posinf=5.0, neginf=-5.0)
+            
             self.raw_memory[source_nodes] = src_new
             self.raw_memory[target_nodes] = tgt_new
             self.last_update[source_nodes] = current_time
             self.last_update[target_nodes] = current_time
+
+            # Use nan_to_num + clamp for comprehensive protection
+            self.raw_memory.data = torch.nan_to_num(
+                self.raw_memory.data, 
+                nan=0.0, 
+                posinf=10.0, 
+                neginf=-10.0
+            ).clamp_(-10, 10)
             # Emergency clamp to prevent explosion
-            self.raw_memory.data.clamp_(-50.0, 50.0)
+            # self.raw_memory.data.clamp_(-50.0, 50.0)        
         
         # Return attention info for analysis (detach to prevent graph leakage)
         return {
@@ -332,6 +369,8 @@ class StabilityAugmentedMemory(nn.Module):
         # Handle edge features
         if edge_features is not None and edge_features.numel() > 0:
             edge_proj = self.edge_proj(edge_features)
+            if not torch.isfinite(edge_proj).all():
+                edge_proj = torch.nan_to_num(edge_proj, nan=0.0, posinf=10.0, neginf=-10.0)
             edge_proj = F.normalize(edge_proj, dim=-1) * 10.0
             edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
         else:

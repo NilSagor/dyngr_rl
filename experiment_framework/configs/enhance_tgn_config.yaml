@@ -18,10 +18,14 @@ model:
   use_memory: true
   n_neighbors: 20
   memory_updater_type: 'gru'  
+  #HCT
+  hct_d_model: 64  # Smaller dimension
+  hct_nhead: 2     # Fewer heads
+  # dropout: 0.0,     # No dropout during debugs  
+  use_hct: true
   # ST ODE
   mu: 0.0
-  adaptive_mu: false
-  use_hct: false
+  adaptive_mu: true
   use_st_ode: false
   ode_method: rk4
   ode_step_size: 10000   # increase step size to reduce steps
@@ -37,8 +41,9 @@ training:
   patience: 5 # 3/5/10
   val_check_interval: 1.0
   gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
   log_every_n_steps: 10
-  learning_rate: 0.001
+  learning_rate: 0.00001
   lr_scheduler: "reduce_on_plateau"
   lr_patience: 3
   lr_factor: 0.5

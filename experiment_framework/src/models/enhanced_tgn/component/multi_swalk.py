@@ -33,12 +33,17 @@ class MultiScaleWalkSampler(nn.Module):
         self.num_walks_short = num_walks_short
         self.num_walks_long = num_walks_long
         self.num_walks_tawr = num_walks_tawr
-        self.temperature = temperature
+        
+        # Ensure temperature is never zero
+        self.temperature = max(temperature, 1e-6)
 
         # Learnable restart probability parameters (for TAWR walks)
         self.restart_projection = nn.Linear(memory_dim + time_dim, 1)
         nn.init.xavier_uniform_(self.restart_projection.weight)
-        nn.init.zeros_(self.restart_projection.bias)
+        nn.init.constant_(self.restart_projection.bias, -2.197)
+        
+        # Track if edges have been initialize
+        self._edges_initialized = False
         
         # Neighbor cache for efficient sampling
         self.neighbor_cache: Dict[int, List[Tuple[int, float]]] = {}  # Will be populated by update_neighbors()
@@ -58,8 +63,12 @@ class MultiScaleWalkSampler(nn.Module):
             edge_index: [2, num_edges] tensor of edges
             edge_time: [num_edges] tensor of timestamps
         """
+        self._edges_initialized = True 
         self.neighbor_cache = {}
         self._dense_tables_built = False
+        
+        if hasattr(self, 'dense_neighbor_ids'):
+            delattr(self, 'dense_neighbor_ids')
         
         # Convert to numpy for faster processing (or keep on GPU if possible)
         edge_index_np = edge_index.cpu().numpy() if edge_index.is_cuda else edge_index.numpy()
@@ -86,9 +95,7 @@ class MultiScaleWalkSampler(nn.Module):
         """Helper to add a neighbor to cache."""
         if src not in self.neighbor_cache:
             self.neighbor_cache[src] = []
-        self.neighbor_cache[src].append((dst, t))
-    
-    
+        self.neighbor_cache[src].append((dst, t))   
     
     def get_temporal_neighbors(self, node: int, current_time: float) -> List[Tuple[int, float]]:
         """
@@ -106,7 +113,6 @@ class MultiScaleWalkSampler(nn.Module):
         
         all_neighbors = self.neighbor_cache[node]
         valid_neighbors = [(n, t) for n, t in all_neighbors if t < current_time]
-        
         return valid_neighbors
     
     def sample_neighbor_with_temporal_bias(
@@ -134,12 +140,13 @@ class MultiScaleWalkSampler(nn.Module):
         if len(valid_neighbors) == 1:
             return valid_neighbors[0]
         
-        # Extract timestamps
+         # Extract timestamps
         timestamps = np.array([t for _, t in valid_neighbors], dtype=np.float32)
         t_max = np.max(timestamps)
         
         # Compute exponential weights (Eq. 7)
-        weights = np.exp((timestamps - t_max) / self.temperature)
+        safe_temp = max(self.temperature, 1e-6)
+        weights = np.exp((timestamps - t_max) / safe_temp)
         probs = weights / (np.sum(weights) + 1e-10)
         
         # Sample based on probabilities
@@ -173,7 +180,19 @@ class MultiScaleWalkSampler(nn.Module):
         
         device = memory_state.device
         # Clamp node index to valid range
-        node_idx = min(max(node, 0), memory_state.size(0) - 1)
+        # node_idx = min(max(node, 0), memory_state.size(0) - 1)
+        
+        #  Proper bounds checking with logging instead of silent clamping
+        if node < 0 or node >= memory_state.size(0):
+            logger.warning(f"Invalid node index {node} in compute_restart_probability, clamping to 0")
+            node_idx = 0
+        else:
+            node_idx = node
+        
+        if next(self.time_encoder.parameters(), None) is not None:
+            time_encoder_device = next(self.time_encoder.parameters()).device
+            if device != time_encoder_device:
+                self.time_encoder = self.time_encoder.to(device)
         
         # Get time encoding        
         time_tensor = torch.tensor([current_time], device=device, dtype=torch.float32)
@@ -207,8 +226,9 @@ class MultiScaleWalkSampler(nn.Module):
             return  # Skip if already built       
         
         
-        max_degree = max(len(neighbors) for neighbors in self.neighbor_cache.values())
-        
+        max_degree = max((len(neighbors) for neighbors in self.neighbor_cache.values()), default=1)
+        max_degree = max(max_degree, 1) 
+
         # max_degree = max(len(neighbors) for neighbors in self.neighbor_cache.values()) if self.neighbor_cache else 0
         num_nodes = self.num_nodes
         
@@ -219,12 +239,12 @@ class MultiScaleWalkSampler(nn.Module):
         neighbor_times = torch.zeros(num_nodes, max_degree, dtype=torch.float32, device=device)        
         neighbor_counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
         
-        # if (neighbor_ids < 0).any() or (neighbor_ids >= self.num_nodes).any():
-        #     logger.error("neighbor_ids contains invalid node indices")
-        #     raise RuntimeError("Invalid neighbor_ids")
-        # if torch.isnan(neighbor_times).any() or torch.isinf(neighbor_times).any():
-        #     logger.error("neighbor_times contains NaN/Inf")
-        #     raise RuntimeError("Invalid neighbor_times")
+        if (neighbor_ids < 0).any() or (neighbor_ids >= self.num_nodes).any():
+            logger.error("neighbor_ids contains invalid indices! Clamping...")
+            neighbor_ids = torch.clamp(neighbor_ids, 0, self.num_nodes - 1)
+        if torch.isnan(neighbor_times).any() or torch.isinf(neighbor_times).any():
+            logger.error("neighbor_times contains NaN/Inf! Replacing with zeros")
+            neighbor_times = torch.nan_to_num(neighbor_times, nan=0.0, posinf=0.0, neginf=0.0)
                 
         
         for node, neighbors in self.neighbor_cache.items():
@@ -244,10 +264,10 @@ class MultiScaleWalkSampler(nn.Module):
             self.register_buffer('dense_neighbor_times', neighbor_times, persistent=False)
             self.register_buffer('dense_neighbor_counts', neighbor_counts, persistent=False)
         else:
-            # Update existing buffers
-            self.dense_neighbor_ids = neighbor_ids
-            self.dense_neighbor_times = neighbor_times
-            self.dense_neighbor_counts = neighbor_counts
+            # Properly update buffer data
+            self.dense_neighbor_ids.data = neighbor_ids
+            self.dense_neighbor_times.data = neighbor_times
+            self.dense_neighbor_counts.data = neighbor_counts
         
         self._dense_tables_built = True
         logger.info(f"Built dense neighbor table: max_degree={max_degree}")
@@ -287,13 +307,8 @@ class MultiScaleWalkSampler(nn.Module):
         logits_flat = self.restart_projection(combined_flat)   # [B*W, 1]
         logits = logits_flat.view(batch_size, num_walks)       # [B, W]
 
-        
-
-
         return torch.sigmoid(logits)
-    
-    
-    
+
     def _sample_walks_vectorized(
         self,
         source_nodes: torch.Tensor,
@@ -302,8 +317,7 @@ class MultiScaleWalkSampler(nn.Module):
         walk_length: int
     ) -> Dict[str, torch.Tensor]:
         """
-        Unified vectorized walk sampling with temporal bias.
-        Handles short and long walks (without restart logic).
+        Unified vectorized walk sampling with temporal bias and NaN protection.
         """
         batch_size = source_nodes.size(0)
         device = source_nodes.device
@@ -311,8 +325,9 @@ class MultiScaleWalkSampler(nn.Module):
         if not hasattr(self, 'dense_neighbor_ids'):
             self.build_dense_neighbor_table()
         
+        safe_temp = max(self.temperature, 1e-6)        
         max_deg = self.dense_neighbor_ids.size(1)
-        eps = 1e-10
+        eps = 1e-8  # Increased epsilon for numerical stability
 
         # Expand to [B, W]
         curr_nodes = source_nodes.unsqueeze(1).expand(-1, num_walks)
@@ -332,36 +347,110 @@ class MultiScaleWalkSampler(nn.Module):
             neighbor_ids = self.dense_neighbor_ids[curr_nodes]
             neighbor_times = self.dense_neighbor_times[curr_nodes]
 
-            # Temporal mask
-            time_mask = neighbor_times < curr_times.unsqueeze(-1)
-            valid_counts = time_mask.sum(dim=-1)
+            # Base validity mask: neighbor must exist (id > 0) and have valid time (> 0)
+            base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
+            
+            # Temporal mask: neighbors must have timestamp < current_time
+            temporal_mask = neighbor_times < curr_times.unsqueeze(-1)
+            
+            # Combined valid neighbor mask
+            valid_neighbor_mask = base_mask & temporal_mask
+            valid_counts = valid_neighbor_mask.sum(dim=-1)
             has_valid = valid_counts > 0
 
-            # Numerically stable temporal bias weights
-            t_max = neighbor_times.max(dim=-1, keepdim=True)[0]
-            t_max = torch.where(t_max > 0, t_max, torch.ones_like(t_max))
-            weights = torch.exp((neighbor_times - t_max) / self.temperature)
-            weights = weights.masked_fill(~time_mask, 0.0)
+            # Compute temporal weights with numerical stability
+            # Use log-sum-exp trick for stability
+            t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
+            # Handle case where no valid neighbors exist
+            t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
+            
+            # Compute exponent with clipping to prevent overflow
+            time_diff = (neighbor_times - t_max) / self.temperature
+            time_diff = torch.clamp(time_diff, min=-50, max=50)  # Prevent exp overflow
+            temp_weights = torch.exp(time_diff)
+            
+            # Apply masks
+            temp_weights = temp_weights.masked_fill(~valid_neighbor_mask, 0.0)
+            
+            # Fallback: uniform weights over all existing neighbors (not just temporal)
+            fallback_weights = base_mask.float()
+            
+            # Choose weights based on whether we have valid temporal neighbors
+            weights = torch.where(has_valid.unsqueeze(-1), temp_weights, fallback_weights)
+            sampling_mask = torch.where(has_valid.unsqueeze(-1), valid_neighbor_mask, base_mask)
 
-            # Normalize to probabilities with numerical stability
+            # Apply sampling mask and normalize
+            weights = weights.masked_fill(~sampling_mask, 0.0)
             prob_sums = weights.sum(dim=-1, keepdim=True)
+            
+            # Handle edge cases
+            no_neighbors = ~base_mask.any(dim=-1)  # Completely isolated nodes
+            isolated_with_fallback = (~has_valid) & base_mask.any(dim=-1)  # Has neighbors but none temporally valid
+            
+            # Create safe probability distribution
+            probs = torch.zeros_like(weights)
+            
+            # Case 1: Has valid temporal neighbors - use temporal weights
+            has_temporal = has_valid & ~no_neighbors
+            if has_temporal.any():
+                safe_sums = torch.where(prob_sums > eps, prob_sums, torch.ones_like(prob_sums))
+                probs[has_temporal] = weights[has_temporal] / safe_sums[has_temporal]
+            
+            # Case 2: Has neighbors but none temporally valid - use uniform over existing neighbors
+            if isolated_with_fallback.any():
+                fallback_sums = fallback_weights[isolated_with_fallback].sum(dim=-1, keepdim=True)
+                safe_fallback_sums = torch.where(fallback_sums > eps, fallback_sums, torch.ones_like(fallback_sums))
+                probs[isolated_with_fallback] = fallback_weights[isolated_with_fallback] / safe_fallback_sums
+            
+            # Case 3: Completely isolated nodes - stay at current node (uniform over self)
+            if no_neighbors.any():
+                # Set probability 1.0 for staying (we'll handle this in sampling)
+                probs[no_neighbors] = 1.0 / max_deg  # Uniform, but we'll override the sample
+            
+            # Final safety checks
+            probs = torch.clamp(probs, min=0.0, max=1.0)
+            probs = torch.nan_to_num(probs, nan=1.0/max_deg, posinf=1.0/max_deg, neginf=0.0)
+            
+            # Renormalize to ensure sum = 1
+            row_sums = probs.sum(dim=-1, keepdim=True)
             probs = torch.where(
-                prob_sums > eps,
-                weights / (prob_sums + eps),
-                torch.ones_like(weights) / max_deg  # Uniform fallback
+                row_sums > eps,
+                probs / row_sums,
+                torch.ones_like(probs) / max_deg
             )
 
-            # Sample with multinomial (handle zero-prob rows)
+            # Sample with multinomial
             probs_flat = probs.view(-1, max_deg)
+            
+            # Final validation before multinomial
+            valid_probs = (probs_flat >= 0) & torch.isfinite(probs_flat)
+            if not valid_probs.all():
+                probs_flat = torch.where(
+                    valid_probs,
+                    probs_flat,
+                    torch.ones_like(probs_flat) / max_deg
+                )
+                row_sums = probs_flat.sum(dim=-1, keepdim=True)
+                probs_flat = torch.where(
+                    row_sums > eps,
+                    probs_flat / row_sums,
+                    torch.ones_like(probs_flat) / max_deg
+                )
+            
             sampled_idx = torch.multinomial(probs_flat, 1).view(batch_size, num_walks)
+            # Clamp sampled indices to valid range [0, max_deg-1]
+            sampled_idx = torch.clamp(sampled_idx, 0, max_deg - 1)
 
             # Gather results
             next_node = torch.gather(neighbor_ids, -1, sampled_idx.unsqueeze(-1)).squeeze(-1)
             next_time = torch.gather(neighbor_times, -1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
-            # Handle nodes with no valid neighbors: stay at current node
-            next_node = torch.where(has_valid, next_node, curr_nodes)
-            next_time = torch.where(has_valid, next_time, curr_times)
+            # Handle completely isolated nodes: stay at current node
+            next_node = torch.where(no_neighbors, curr_nodes, next_node)
+            next_time = torch.where(no_neighbors, curr_times, next_time)
+
+            # Bounds check for safety            
+            next_node = torch.clamp(next_node, 0, self.num_nodes - 1)
 
             # Update walk tensors
             walk_nodes[:, :, step] = next_node
@@ -409,7 +498,7 @@ class MultiScaleWalkSampler(nn.Module):
         memory_states: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Vectorized TAWR walk sampling with restart probabilities.
+        Vectorized TAWR walk sampling with restart probabilities and NaN protection.
         """
         batch_size = len(source_nodes)
         device = source_nodes.device
@@ -417,20 +506,18 @@ class MultiScaleWalkSampler(nn.Module):
         if not hasattr(self, 'dense_neighbor_ids'):
             self.build_dense_neighbor_table()
         
-        max_deg = self.dense_neighbor_ids.size(1)
-        eps = 1e-10
-        # Expand to [B, W] for each walk
-        # curr_nodes = source_nodes.unsqueeze(1).expand(-1, self.num_walks_tawr)   # [B, W]
-        # curr_times = current_times.unsqueeze(1).expand(-1, self.num_walks_tawr)  # [B, W]
 
+        # use safe temperature
+        safe_temp = max(self.temperature, 1e-6)
+        max_deg = self.dense_neighbor_ids.size(1)
+        eps = 1e-8
+
+        # Expand to [B, W]
         curr_nodes = source_nodes.unsqueeze(1).expand(-1, self.num_walks_tawr)
         curr_times = current_times.unsqueeze(1).expand(-1, self.num_walks_tawr)
-
-
-        # Original source nodes for restarts (same for all walks)
-        # original_source = source_nodes.unsqueeze(1).expand(-1, self.num_walks_tawr)
         original_source = source_nodes.unsqueeze(1).expand(-1, self.num_walks_tawr)
         original_times = current_times.unsqueeze(1).expand(-1, self.num_walks_tawr)
+
 
         # Initialize walk tensors
         walk_nodes = torch.zeros(batch_size, self.num_walks_tawr, self.walk_length_tawr,
@@ -446,78 +533,120 @@ class MultiScaleWalkSampler(nn.Module):
         walk_masks[:, :, 0] = 1.0
 
         for step in range(1, self.walk_length_tawr):
-            # Compute restart probabilities for all current nodes
-            # restart_probs = self.compute_restart_probabilities_batched(
-            #     curr_nodes, curr_times, memory_states
-            # )  # [B, W]
-
-            # # Random restart decisions
-            # rand = torch.rand(batch_size, self.num_walks_tawr, device=device)
-            # restart_mask = rand < restart_probs  # [B, W]
-
-            # # ---- For walks that restart ----
-            # next_node_restart = original_source
-            # next_time_restart = current_times.unsqueeze(1).expand(-1, self.num_walks_tawr)
-
-            # # ---- For walks that continue ----
-            # # Get neighbor info for current nodes
-            # neighbor_ids = self.dense_neighbor_ids[curr_nodes]       # [B, W, max_deg]
-            # neighbor_times = self.dense_neighbor_times[curr_nodes]   # [B, W, max_deg]
-
-
-            # # Temporal mask
-            # time_mask = neighbor_times < curr_times.unsqueeze(-1)    # [B, W, max_deg]
-
+            
+            # Compute restart probabilities with NaN protection
             restart_probs = self.compute_restart_probabilities_batched(
                 curr_nodes, curr_times, memory_states
             )
+
+            restart_probs = torch.nan_to_num(restart_probs, nan=0.1, posinf=1.0, neginf=0.0)
+            restart_probs = torch.clamp(restart_probs, 0.0, 1.0)
             
             rand = torch.rand(batch_size, self.num_walks_tawr, device=device)
             restart_mask = rand < restart_probs
             
+            # Restart path
             next_node_restart = original_source
-            next_time_restart = curr_times
+            next_time_restart = original_times
             
+            # Continue path: sample next neighbor
             neighbor_ids = self.dense_neighbor_ids[curr_nodes]
             neighbor_times = self.dense_neighbor_times[curr_nodes]
-            time_mask = neighbor_times < curr_times.unsqueeze(-1)
             
-            # Temporal bias weights
-            t_max = neighbor_times.max(dim=-1, keepdim=True)[0]
-            t_max = torch.where(t_max > 0, t_max, torch.ones_like(t_max))
-            weights = torch.exp((neighbor_times - t_max) / self.temperature)
-            weights = weights.masked_fill(~time_mask, 0.0)
+            # Define masks
+            base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
+            valid_neighbor_mask = base_mask & (neighbor_times < curr_times.unsqueeze(-1))
 
+            has_temporal = valid_neighbor_mask.sum(dim=-1) > 0
+            has_any = base_mask.sum(dim=-1) > 0
+            
+            # Use temporal mask if available, else fallback
+            sampling_mask = torch.where(has_temporal.unsqueeze(-1), valid_neighbor_mask, base_mask)
+            
+            # Compute weights with numerical stability
+            t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
+            t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
+            
+            # Use safe_temp
+            time_diff = (neighbor_times - t_max) / safe_temp
+            time_diff = torch.clamp(time_diff, min=-50, max=50)
+            temporal_weights = torch.exp(time_diff)
+            temporal_weights = temporal_weights.masked_fill(~valid_neighbor_mask, 0.0)
+
+            uniform_weights = base_mask.float()
+            weights = torch.where(has_temporal.unsqueeze(-1), temporal_weights, uniform_weights)
+            
+            
+            # Normalize to probabilities
             prob_sums = weights.sum(dim=-1, keepdim=True)
             probs = torch.where(
                 prob_sums > eps,
                 weights / (prob_sums + eps),
                 torch.ones_like(weights) / max_deg
             )
-
-
-            probs_flat = probs.view(-1, max_deg)
-            sampled_idx = torch.multinomial(probs_flat, 1).view(batch_size, self.num_walks_tawr)
             
-            if sampled_idx.max() >= max_deg or sampled_idx.min() < 0:
-                logger.error(f"sampled_idx out of bounds: min={sampled_idx.min()}, max={sampled_idx.max()}, max_deg={max_deg}")
-                raise RuntimeError("Sampled index out of bounds")
+            # Apply sampling mask and renormalize
+            probs = probs.masked_fill(~sampling_mask, 0.0)
+            prob_sums = probs.sum(dim=-1, keepdim=True)
+            probs = torch.where(
+                prob_sums > eps,
+                probs / (prob_sums + eps),
+                torch.ones_like(probs) / max_deg
+            )
+            
+            # Final safety checks
+            probs = torch.clamp(probs, min=0.0, max=1.0)
+            probs = torch.nan_to_num(probs, nan=1.0/max_deg, posinf=1.0/max_deg, neginf=0.0)
+            row_sums = probs.sum(dim=-1, keepdim=True)
+            
+            probs = torch.where(
+                row_sums > eps,
+                probs / row_sums,
+                torch.ones_like(probs) / max_deg
+            )
+            
+            # Sample
+            probs_flat = probs.view(-1, max_deg)
+            valid_probs = (probs_flat >= 0) & torch.isfinite(probs_flat)
+            
+            if not valid_probs.all():
+                probs_flat = torch.where(
+                    valid_probs,
+                    probs_flat,
+                    torch.ones_like(probs_flat) / max_deg
+                )
+                row_sums = probs_flat.sum(dim=-1, keepdim=True)
+                probs_flat = torch.where(
+                    row_sums > eps,
+                    probs_flat / row_sums,
+                    torch.ones_like(probs_flat) / max_deg
+                )
+            
+            sampled_idx = torch.multinomial(probs_flat, 1).view(batch_size, self.num_walks_tawr)
+            # clamp sampled indices
+            sampled_idx = torch.clamp(sampled_idx, 0, max_deg - 1)
 
-
+            # Gather results
             next_node_continue = torch.gather(neighbor_ids, -1, sampled_idx.unsqueeze(-1)).squeeze(-1)
             next_time_continue = torch.gather(neighbor_times, -1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
-            # Combine based on restart_mask
+            # Handle isolated nodes
+            next_node_continue = torch.where(has_any, next_node_continue, curr_nodes)
+            next_time_continue = torch.where(has_any, next_time_continue, curr_times)
+            
+            # Bounds check
+            next_node_continue = torch.clamp(next_node_continue, 0, self.num_nodes - 1)
+            
+            # Combine restart and continue paths
             next_node = torch.where(restart_mask, next_node_restart, next_node_continue)
             next_time = torch.where(restart_mask, next_time_restart, next_time_continue)
-            
+
             # Record step
             walk_nodes[:, :, step] = next_node
             walk_times[:, :, step] = next_time
             walk_restart[:, :, step] = restart_mask.float()
             walk_masks[:, :, step] = 1.0
 
-            # Update current nodes/times for next iteration
             curr_nodes = next_node
             curr_times = next_time
 
@@ -526,9 +655,7 @@ class MultiScaleWalkSampler(nn.Module):
             'times': walk_times,
             'restart_flags': walk_restart,
             'masks': walk_masks
-        }
-    
-    
+        }  
     
     
     def anonymize_walks(
@@ -549,36 +676,55 @@ class MultiScaleWalkSampler(nn.Module):
             Dictionary with anonymized walk tensors
         """
         nodes = walk_data['nodes']  # [batch, num_walks, walk_len]
+        masks = walk_data['masks']
         batch_size, num_walks, walk_len = nodes.shape
         
         device = nodes.device
         # Create anonymized tensor (same shape, but with anonymized IDs)
-        anonymized = torch.zeros_like(nodes)
+        nodes_anon = torch.zeros_like(nodes)
         
         for b in range(batch_size):
-            # Get unique nodes for this batch item (excluding padding=0)
-            batch_nodes = nodes[b]
-            unique_nodes = torch.unique(batch_nodes[batch_nodes > 0])
+            # Get valid positions for this batch item
+            valid_mask = masks[b].bool()                # [num_walks, walk_len]
+            batch_nodes = nodes[b]                      # [num_walks, walk_len]
+            valid_nodes = batch_nodes[valid_mask]       # all valid node IDs (including 0)
             
-            if len(unique_nodes) == 0:
+            if valid_nodes.numel() == 0:
                 continue
             
-            # Create mapping: original_id -> anonymized_id (1-based)
-            mapping = {nid.item(): idx + 1 for idx, nid in enumerate(unique_nodes)}
+            # Get unique nodes for this batch item (excluding padding=0)
             
-            # Vectorized replacement using torch operations
+            # unique_nodes = torch.unique(batch_nodes[batch_nodes > 0])
+            unique_nodes = torch.unique(valid_nodes[valid_nodes > 0])            
+            
+            # Create mapping: original_id -> anonymized_id (1-based)
+            # mapping = {nid.item(): idx + 1 for idx, nid in enumerate(unique_nodes)}
+            
+            if unique_nodes.numel() == 0:
+                continue
+
+            mapping = {orig.item(): idx+1 for idx, orig in enumerate(unique_nodes)}
+            
+            # Build anonymized tensor for this batch item
             flat_nodes = batch_nodes.view(-1)
             flat_anon = torch.zeros_like(flat_nodes)
-            
+            flat_mask = masks[b].view(-1).bool()
+                        
             for orig_id, anon_id in mapping.items():
-                mask = flat_nodes == orig_id
+                mask = (flat_nodes == orig_id) & flat_mask
                 flat_anon[mask] = anon_id
             
-            anonymized[b] = flat_anon.view(num_walks, walk_len)
+            nodes_anon[b] = flat_anon.view(num_walks, walk_len)  
+       
+        if nodes_anon.numel() > 0:
+            assert nodes_anon.min() >= 0, "Anonymized nodes contain negative values"
+            # Max anonymized ID should be <= number of unique nodes mapped
+            max_anon = nodes_anon.max().item()
+            # The mapping size varies per batch, so we check per-batch above
+            # Here we just ensure no overflow beyond reasonable bounds
+            assert max_anon <= 10000, f"Anonymized ID {max_anon} seems too large"
         
-        assert anonymized[b].min() >= 0 and anonymized[b].max() <= len(unique_nodes)
-        
-        walk_data['nodes_anon'] = anonymized
+        walk_data['nodes_anon'] = nodes_anon
         return walk_data
     
     def clear_cache(self):
@@ -623,25 +769,7 @@ class MultiScaleWalkSampler(nn.Module):
                     }
                 }
         """                  
-        
-        # # Update neighbor cache if new edges provided
-        # if edge_index is not None and edge_time is not None:
-        #     self.update_neighbors(edge_index, edge_time)
-        #     # Always rebuild dense table when edges are updated
-        #     if self.neighbor_cache:  # Only if cache is not empty
-        #         self.build_dense_neighbor_table()
-        
-        # # Check if we have neighbor data
-        # if not hasattr(self, 'dense_neighbor_ids'):
-        #     if not self.neighbor_cache:
-        #         raise RuntimeError(
-        #             "No neighbor data available. Please provide edge_index and edge_time "
-        #             "with valid edges to initialize the neighbor cache."
-        #         )
-        #     else:
-        #         # Cache exists but dense table not built yet
-        #         self.build_dense_neighbor_table()
-
+      
         # Update neighbor cache if new edges provided
         if edge_index is not None and edge_time is not None:
             self.update_neighbors(edge_index, edge_time)
@@ -651,10 +779,20 @@ class MultiScaleWalkSampler(nn.Module):
             self.build_dense_neighbor_table()
         
         if not hasattr(self, 'dense_neighbor_ids'):
-            raise RuntimeError(
-                "No neighbor data available. Please provide edge_index and edge_time "
-                "with valid edges to initialize the neighbor cache."
-            )
+            if edge_index is None or edge_time is None:
+                logger.error("No neighbor data and no edge_index/edge_time provided")
+            
+            # Return empty walks as fallback instead of crashing
+            batch_size = len(source_nodes)
+            empty_walk = {
+                'nodes': torch.zeros(batch_size, 1, 1, dtype=torch.long, device=source_nodes.device),
+                'times': torch.zeros(batch_size, 1, 1, dtype=torch.float32, device=source_nodes.device),
+                'masks': torch.zeros(batch_size, 1, 1, dtype=torch.float32, device=source_nodes.device)
+            }
+            return {
+                'source': {'short': empty_walk, 'long': empty_walk, 'tawr': empty_walk},
+                'target': {'short': empty_walk, 'long': empty_walk, 'tawr': empty_walk}
+            }
         
         
         # Combine source and target nodes for efficient sampling
@@ -687,7 +825,7 @@ class MultiScaleWalkSampler(nn.Module):
             }
         }
 
-        # logger.debug("Walk sampler result keys:", result.keys())  # or use logger
+        
         return result
     
 

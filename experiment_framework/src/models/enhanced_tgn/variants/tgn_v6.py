@@ -54,6 +54,7 @@ class TGNv6(BaseEnhancedTGN):
         aggregator_type: str = "last",
         memory_updater_type: str = "sam",
         # SAM params
+        use_sam: bool = True,
         num_prototypes: int = 5,
         similarity_metric: str = "cosine",
         # Multi-scale walk params
@@ -116,7 +117,7 @@ class TGNv6(BaseEnhancedTGN):
         
         self.use_st_ode = use_st_ode
         self.directed = kwargs.get('directed', False)
-
+        self.edge_feat_scale = nn.Parameter(torch.ones(1))
 
         if self.use_st_ode:
             # Initialize time projection upfront (not lazily)
@@ -167,7 +168,8 @@ class TGNv6(BaseEnhancedTGN):
         )
 
         
-        
+        logger.debug(f"TGNv6 __init__: Walk Sampler Initialization = {self.walk_sampler}")
+        logger.debug(f"TGNv6 __init__: use_hct = {use_hct}")
         
         
         # Initialize HCT (replaces old WalkEncoder)
@@ -210,17 +212,17 @@ class TGNv6(BaseEnhancedTGN):
             else:
                 self.hct_to_tgn = nn.Identity()
         
-        else:
-            # Fallback to simple walk encoder (TGNv4 style)            
-            self.walk_encoder = WalkEncoder(
-                walk_length_short=walk_length_short,
-                walk_length_long=walk_length_long,
-                walk_length_tawr=walk_length_tawr,
-                memory_dim=memory_dim,
-                output_dim=hidden_dim,
-                num_heads=n_heads,
-                dropout=dropout
-            )
+        # else:
+        #     # Fallback to simple walk encoder (TGNv4 style)            
+        #     self.walk_encoder = WalkEncoder(
+        #         walk_length_short=walk_length_short,
+        #         walk_length_long=walk_length_long,
+        #         walk_length_tawr=walk_length_tawr,
+        #         memory_dim=memory_dim,
+        #         output_dim=hidden_dim,
+        #         num_heads=n_heads,
+        #         dropout=dropout
+        #     )
 
         if self.use_st_ode:
             # ST-ODE evolves full node memory [num_nodes, memory_dim]
@@ -466,22 +468,59 @@ class TGNv6(BaseEnhancedTGN):
 
         # Debug NaN
         if torch.isnan(scores).any():
-            logger.error(f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, dest_emb: {torch.isnan(dest_emb).any()}")
+            logger.error(
+                f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, dest_emb: {torch.isnan(dest_emb).any()}")
             
         return scores 
         
     
     
     def _simple_walk_embed(self, walk_data: Dict) -> torch.Tensor:
-        """Fallback: simple mean of walk node features."""
-        nodes = walk_data['nodes']  # [B, num_walks, L]
-        masks = walk_data['masks']  # [B, num_walks, L]
+        """
+        Fallback: simple mean of walk node features across all walk types.
+        walk_data: dict with keys 'short', 'long', 'tawr', each containing
+                'nodes' and 'masks'.
+        Returns: [batch_size, hidden_dim] tensor.
+        """
         
+
+        all_nodes = []
+        all_masks = []
+        max_len = 0
+
+        # First, find the maximum walk length among all types
+        for wt in ['short', 'long', 'tawr']:
+            if wt in walk_data:
+                nodes = walk_data[wt]['nodes']  # [B, num_walks, L]
+                max_len = max(max_len, nodes.size(2))
+
+        # Pad each type to max_len and collect
+        for wt in ['short', 'long', 'tawr']:
+            if wt in walk_data:
+                nodes = walk_data[wt]['nodes']
+                masks = walk_data[wt]['masks']
+                L = nodes.size(2)
+                if L < max_len:
+                    pad_size = max_len - L
+                    nodes = F.pad(nodes, (0, pad_size), mode='constant', value=0)
+                    masks = F.pad(masks, (0, pad_size), mode='constant', value=0)
+                all_nodes.append(nodes)
+                all_masks.append(masks)
+
+        if not all_nodes:
+            # No walks – return zeros (should not happen)
+            return torch.zeros(self.hidden_dim, device=self.device)
+
+        # Concatenate along walk dimension
+        nodes = torch.cat(all_nodes, dim=1)  # [B, total_walks, max_len]
+        masks = torch.cat(all_masks, dim=1)  # [B, total_walks, max_len]
+
+        # Flatten for memory lookup
         flat_nodes = nodes.reshape(-1)
         flat_feats = self.sam_module.raw_memory[flat_nodes]
         flat_feats = flat_feats.view(nodes.size(0), nodes.size(1), nodes.size(2), -1)
-        
-        # Mean over valid steps and walks
+
+        # Weighted mean over valid steps
         masks_expanded = masks.unsqueeze(-1).float()
         sum_feats = (flat_feats * masks_expanded).sum(dim=[1, 2])  # [B, memory_dim]
         count = masks.sum(dim=[1, 2]).unsqueeze(-1) + 1e-8
@@ -494,7 +533,15 @@ class TGNv6(BaseEnhancedTGN):
         edge_times: torch.Tensor,
         n_neighbors: int = 20
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Unified embedding computation with HCT.
+        """
         device = self.device
+        
+        # Check and sanitize inputs
+        if torch.isnan(edge_times).any():
+            logger.error("NaN in edge_times!")
+            edge_times = torch.nan_to_num(edge_times, nan=0.0)
         
         # Convert inputs
         src_tensor = source_nodes.to(device) if torch.is_tensor(source_nodes) \
@@ -510,17 +557,61 @@ class TGNv6(BaseEnhancedTGN):
             target_nodes=dst_tensor,
             current_times=ts_tensor,
             memory_states=self.sam_module.raw_memory,
-            edge_index=self.edge_index,  # ✅ Always pass
+            edge_index=self.edge_index,
             edge_time=self.edge_time
         )
+
+        # Validate walk data for NaN/Inf
+        for side in ['source', 'target']:
+            for walk_type in ['short', 'long', 'tawr']:
+                if walk_type in walk_data[side]:
+                    nodes = walk_data[side][walk_type]['nodes']
+                    if not torch.isfinite(nodes).all():
+                        logger.error(f"{side}/{walk_type} nodes contain NaN/Inf! Replacing with source/target nodes")
+                        # Fallback to source/target nodes
+                        if side == 'source':
+                            dummy = src_tensor.unsqueeze(1).unsqueeze(2).expand(-1, nodes.shape[1], nodes.shape[2])
+                        else:
+                            dummy = dst_tensor.unsqueeze(1).unsqueeze(2).expand(-1, nodes.shape[1], nodes.shape[2])
+                        walk_data[side][walk_type]['nodes'] = torch.clamp(dummy, 0, self.num_nodes - 1)
+                        if 'masks' in walk_data[side][walk_type]:
+                            walk_data[side][walk_type]['masks'] = torch.ones_like(walk_data[side][walk_type]['masks'])
         
-        # 2. ✅ VALIDATE WALK DATA BEFORE HCT
+        # Before HCT, ensure memory is clean
+        if not torch.isfinite(self.sam_module.raw_memory).all():
+            logger.warning("SAM memory has NaN, resetting affected nodes")
+            self.sam_module.raw_memory.data = torch.nan_to_num(
+                self.sam_module.raw_memory.data,
+                nan=0.0,
+                posinf=10.0,
+                neginf=-10.0
+            )
+        
+        # 2. VALIDATE WALK DATA BEFORE HCT
         if self.use_hct:
             for side in ['source', 'target']:
                 for walk_type in ['short', 'long', 'tawr']:
                     if walk_type in walk_data[side]:
-                        # Validate node indices
                         nodes = walk_data[side][walk_type]['nodes']
+                        masks = walk_data[side][walk_type].get('masks', None)
+                        
+                        # CRITICAL: Check for all-zero indices (walk sampler failure)
+                        if nodes.max().item() == 0 and nodes.numel() > 0:
+                            logger.error(f"Walk sampler returned all-zero indices for {side}/{walk_type}!")
+                            logger.error(f"Check walk_sampler neighbor table initialization")
+                            # Fallback: use direct node memory instead of walks
+                            batch_size = nodes.shape[0]
+                            num_walks = nodes.shape[1]
+                            walk_len = nodes.shape[2]
+                            if side == 'source':
+                                dummy_nodes = src_tensor.unsqueeze(1).unsqueeze(2).expand(-1, num_walks, walk_len)
+                            else:
+                                dummy_nodes = dst_tensor.unsqueeze(1).unsqueeze(2).expand(-1, num_walks, walk_len)
+                            walk_data[side][walk_type]['nodes'] = dummy_nodes
+                            if masks is not None:
+                                walk_data[side][walk_type]['masks'] = torch.ones_like(masks)
+                        
+                        # Validate node indices are within bounds
                         if nodes.max().item() >= self.num_nodes:
                             logger.warning(f"Clamping {side} {walk_type} walk nodes")
                             walk_data[side][walk_type]['nodes'] = torch.clamp(
@@ -528,10 +619,8 @@ class TGNv6(BaseEnhancedTGN):
                             )
                         
                         # Validate masks
-                        if 'masks' in walk_data[side][walk_type]:
-                            masks = walk_data[side][walk_type]['masks']
-                            if masks.sum() == 0:
-                                logger.warning(f"All {side} {walk_type} masks are False!")
+                        if masks is not None and masks.sum() == 0:
+                            logger.warning(f"All {side} {walk_type} masks are False!")
                         
                         # Validate NaN/Inf in nodes
                         if not torch.isfinite(nodes).all():
@@ -540,9 +629,14 @@ class TGNv6(BaseEnhancedTGN):
                                 nodes, nan=0, posinf=self.num_nodes-1, neginf=0
                             ).long()
         
+        if not torch.isfinite(self.sam_module.raw_memory).all():
+            logger.error("SAM memory NaN before HCT - RESETTING")
+            self.sam_module.reset_memory()
+        
+        
         # 3. HCT encodes walks
         if self.use_hct:
-            #TRACE: Check memory before HCT
+            # TRACE: Check memory before HCT
             if not torch.isfinite(self.sam_module.raw_memory).all():
                 logger.error(f"SAM memory NaN before HCT! Resetting...")
                 self.sam_module.reset_memory()
@@ -559,8 +653,7 @@ class TGNv6(BaseEnhancedTGN):
                 if dst_walk_nodes.max().item() >= self.num_nodes:
                     logger.error(f"Invalid walk node index! max={dst_walk_nodes.max().item()}, num_nodes={self.num_nodes}")
                     walk_data['target']['nodes'] = torch.clamp(dst_walk_nodes, 0, self.num_nodes - 1)
-
-
+            
             hct_src_output = self.hct(
                 walks_dict=walk_data['source'],
                 node_memory=self.sam_module.raw_memory,
@@ -589,8 +682,7 @@ class TGNv6(BaseEnhancedTGN):
                                 if not torch.isfinite(sub_val).all():
                                     logger.error(f"HCT src {key}.{sub_key} NaN! shape={sub_val.shape}")
             
-            
-            #  SANITIZE HCT outputs BEFORE projection
+            # SANITIZE HCT outputs BEFORE projection
             if not torch.isfinite(hct_src_emb).all():
                 logger.warning(f"HCT src NaN detected! Clamping...")
                 hct_src_emb = torch.nan_to_num(hct_src_emb, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -603,6 +695,12 @@ class TGNv6(BaseEnhancedTGN):
         else:
             walk_src_emb = self._simple_walk_embed(walk_data['source'])
             walk_dst_emb = self._simple_walk_embed(walk_data['target'])
+        
+        # AFTER HCT call
+        if 'fused' in hct_src_output:
+            if not torch.isfinite(hct_src_output['fused']).all():
+                logger.error("HCT output NaN - DISABLING HCT for this batch")
+                hct_src_emb = torch.zeros_like(hct_src_output['fused'])
         
         # SANITIZE after projection
         if not torch.isfinite(walk_src_emb).all():
@@ -668,7 +766,7 @@ class TGNv6(BaseEnhancedTGN):
         final_src = self.fusion_layer(combined_src)
         final_dst = self.fusion_layer(combined_dst)
         
-        # ✅ FINAL SANITIZE
+        # FINAL SANITIZE
         if not torch.isfinite(final_src).all():
             logger.error(f"final_src NaN after fusion! Clamping...")
             final_src = torch.nan_to_num(final_src, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -676,221 +774,10 @@ class TGNv6(BaseEnhancedTGN):
             logger.error(f"final_dst NaN after fusion! Clamping...")
             final_dst = torch.nan_to_num(final_dst, nan=0.0, posinf=10.0, neginf=-10.0)
         
-        return final_src, final_dst    
+        return final_src, final_dst   
     
-    
-    
-    
-    # def compute_temporal_embeddings(
-    #     self,
-    #     source_nodes: torch.Tensor,
-    #     destination_nodes: torch.Tensor,
-    #     edge_times: torch.Tensor,
-    #     n_neighbors: int = 20
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     """
-    #     Unified embedding computation with HCT.
-    #     """
-    #     device = self.device
-        
-        
-    #     # Convert inputs
-    #     src_tensor = source_nodes.to(device) if torch.is_tensor(source_nodes) \
-    #         else torch.from_numpy(source_nodes).long().to(device)
-    #     dst_tensor = destination_nodes.to(device) if torch.is_tensor(destination_nodes) \
-    #         else torch.from_numpy(destination_nodes).long().to(device)
-    #     ts_tensor = edge_times.to(device) if torch.is_tensor(edge_times) \
-    #         else torch.from_numpy(edge_times).float().to(device)
-        
-    #     # cache_key = (src_tensor.nbytes(), ts_tensor[0].item())  # Simple key
-        
-    #     # 1. Generate walks (indices only)
-    #     if self._cache_walks:
-    #         cache_key = self._get_cache_key(src_tensor, ts_tensor)
-    #         if cache_key in self._walk_cache:
-    #             walk_data = self._walk_cache[cache_key]
-    #         else:
-    #             walk_data = self.walk_sampler(
-    #             source_nodes=src_tensor,
-    #             target_nodes=dst_tensor,
-    #             current_times=ts_tensor,
-    #             memory_states=self.sam_module.raw_memory,  # For TAWR restart prob
-    #             edge_index=self.edge_index,
-    #             edge_time=self.edge_time
-    #         )
-    #         if self.training:  # Only cache during training
-    #             self._walk_cache[cache_key] = walk_data
-    #     else:
-    #         walk_data = self.walk_sampler(
-    #         source_nodes=src_tensor,
-    #         target_nodes=dst_tensor,
-    #         current_times=ts_tensor,
-    #         memory_states=self.sam_module.raw_memory,  # For TAWR restart prob
-    #         edge_index=None,
-    #         edge_time=None
-    #     )
-        
-        
-    #     # 1. Generate walks 
-                
-    #     # 2. HCT encodes walks by looking up SAM memory
-    #     if self.use_hct:
-            
-    #         # TRACE: Check memory before HCT
-    #         if not torch.isfinite(self.sam_module.raw_memory).all():
-    #             logger.error(f"SAM memory NaN before HCT! Resetting...")
-    #             self.sam_module.reset_memory()
-            
-    #         # TRACE: Check walk indices
-    #         src_walk_nodes = walk_data['source']['nodes']
-    #         dst_walk_nodes = walk_data['target']['nodes']
-            
-    #         if src_walk_nodes.max().item() >= self.num_nodes:
-    #             logger.error(f"Invalid walk node index! max={src_walk_nodes.max().item()}, num_nodes={self.num_nodes}")
-    #             src_walk_nodes = torch.clamp(src_walk_nodes, 0, self.num_nodes - 1)
-    #         if dst_walk_nodes.max().item() >= self.num_nodes:
-    #             logger.error(f"Invalid walk node index! max={dst_walk_nodes.max().item()}, num_nodes={self.num_nodes}")
-    #             dst_walk_nodes = torch.clamp(dst_walk_nodes, 0, self.num_nodes - 1)
-            
-    #         # TRACE: Check walk masks
-    #         if 'masks' in walk_data['source']:
-    #             src_masks = walk_data['source']['masks']
-    #             if src_masks.sum() == 0:
-    #                 logger.error(f"All walk masks are False! HCT will produce NaN")
-            
-    #         # Pass walks_dict with 'nodes' (for lookup) and 'nodes_anon' (for co-occurrence)
-    #         hct_src_output = self.hct(
-    #             walks_dict=walk_data['source'],
-    #             node_memory=self.sam_module.raw_memory,
-    #             # memory_proj=self.memory_proj,
-    #             return_all=True  # Return dict with all intermediate outputs
-    #         )
-            
-    #         hct_dst_output = self.hct(
-    #             walks_dict=walk_data['target'],
-    #             node_memory=self.sam_module.raw_memory,
-    #             # memory_proj=self.memory_proj,
-    #             return_all=True
-    #         )            
-            
-    #         # Extract fused embeddings
-    #         hct_src_emb = hct_src_output['fused']  # [B, d_model]
-    #         hct_dst_emb = hct_dst_output['fused']
-
-            
-
-    #         # TRACE: Check HCT intermediate outputs
-    #         for key in ['short', 'long', 'tawr', 'fused']:
-    #             if key in hct_src_output:
-    #                 val = hct_src_output[key]
-    #                 if not torch.isfinite(val).all():
-    #                     logger.error(f"HCT src {key} NaN! shape={val.shape}, "
-    #                             f"min={val.min().item():.4f}, max={val.max().item():.4f}")
-            
-            
-    #         # SANITIZE HCT outputs BEFORE projection
-    #         if not torch.isfinite(hct_src_emb).all():
-    #             logger.warning(f"HCT src NaN detected! Clamping...")
-    #             hct_src_emb = torch.nan_to_num(hct_src_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-    #         if not torch.isfinite(hct_dst_emb).all():
-    #             logger.warning(f"HCT dst NaN detected! Clamping...")
-    #             hct_dst_emb = torch.nan_to_num(hct_dst_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-    #         # Store for later logging (only keep source for brevity, or store both)
-    #         # self._last_hct_info = hct_src_output  # Contains 'fused', 'short', 'long', 'tawr'
-            
-           
-    #         # Project to TGN hidden dimension
-    #         walk_src_emb = self.hct_to_tgn(hct_src_emb)
-    #         walk_dst_emb = self.hct_to_tgn(hct_dst_emb)
-    #     else:
-    #         # Fallback: simple mean of walk node memories (no HCT)
-    #         walk_src_emb = self._simple_walk_embed(walk_data['source'])
-    #         walk_dst_emb = self._simple_walk_embed(walk_data['target'])
-        
-       
-    #     # SANITIZE after projection
-    #     if not torch.isfinite(walk_src_emb).all():
-    #         logger.warning(f"walk_src_emb NaN after projection! Clamping...")
-    #         walk_src_emb = torch.nan_to_num(walk_src_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-    #     if not torch.isfinite(walk_dst_emb).all():
-    #         logger.warning(f"walk_dst_emb NaN after projection! Clamping...")
-    #         walk_dst_emb = torch.nan_to_num(walk_dst_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        
-    #     # 3. Base TGN embeddings from SAM + graph attention
-    #     if self.embedding_module is not None:
-    #         base_src_emb = self.embedding_module.compute_embedding(
-    #             memory=self.sam_module.raw_memory,
-    #             source_nodes=source_nodes,
-    #             timestamps=edge_times,
-    #             n_layers=self.num_layers,
-    #             n_neighbors=n_neighbors
-    #         )
-    #         base_dst_emb = self.embedding_module.compute_embedding(
-    #             memory=self.sam_module.raw_memory,
-    #             source_nodes=destination_nodes,
-    #             timestamps=edge_times,
-    #             n_layers=self.num_layers,
-    #             n_neighbors=n_neighbors
-    #         )
-    #     else:
-    #         base_src_emb = self.sam_module.raw_memory[src_tensor]
-    #         base_dst_emb = self.sam_module.raw_memory[dst_tensor]
-        
-    #      # SANITIZE base embeddings
-    #     if not torch.isfinite(base_src_emb).all():
-    #         logger.warning(f"base_src_emb NaN! Clamping...")
-    #         base_src_emb = torch.nan_to_num(base_src_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-    #     if not torch.isfinite(base_dst_emb).all():
-    #         logger.warning(f"base_dst_emb NaN! Clamping...")
-    #         base_dst_emb = torch.nan_to_num(base_dst_emb, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-    #     # 3a. Compute stabilized memory from prototypes
-    #     stabilized_src = self.sam_module.get_stabilized_memory(
-    #         node_ids=source_nodes,
-    #         current_time=edge_times,
-    #         # node_features=self.node_raw_features
-    #     )  # [B, hidden_dim]
-    #     stabilized_dst = self.sam_module.get_stabilized_memory(
-    #         node_ids=destination_nodes,
-    #         current_time=edge_times,
-    #         # node_features=self.node_raw_features
-    #     )  # [B, hidden_dim]
-        
-        
-    #     # SANITIZE stabilized memory
-    #     if not torch.isfinite(stabilized_src).all():
-    #         logger.warning(f"stabilized_src NaN! Clamping...")
-    #         stabilized_src = torch.zeros_like(stabilized_src)
-    #     if not torch.isfinite(stabilized_dst).all():
-    #         logger.warning(f"stabilized_dst NaN! Clamping...")
-    #         stabilized_dst = torch.zeros_like(stabilized_dst)
-        
-        
-    #     # 3b. Combine with base embedding (simple addition or concatenation)
-    #     # base_src_emb = base_src_emb + 0.1 * stabilized_src.detach()   # or use a learnable gate
-    #     # base_dst_emb = base_dst_emb + 0.1 * stabilized_dst.detach()   # or use a learnable gate
-        
-    #     base_src_emb = base_src_emb + 0.01 * stabilized_src.detach()
-    #     base_dst_emb = base_dst_emb + 0.01 * stabilized_dst.detach()
-        
-    #     # 4. Fusion
-    #     combined_src = torch.cat([base_src_emb, walk_src_emb], dim=-1)
-    #     combined_dst = torch.cat([base_dst_emb, walk_dst_emb], dim=-1)
-        
-    #     final_src = self.fusion_layer(combined_src)
-    #     final_dst = self.fusion_layer(combined_dst)
-        
-    #     # FINAL SANITIZE
-    #     if not torch.isfinite(final_src).all():
-    #         logger.error(f"final_src NaN after fusion! Clamping...")
-    #         final_src = torch.nan_to_num(final_src, nan=0.0, posinf=10.0, neginf=-10.0)
-    #     if not torch.isfinite(final_dst).all():
-    #         logger.error(f"final_dst NaN after fusion! Clamping...")
-    #         final_dst = torch.nan_to_num(final_dst, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-    #     return final_src, final_dst
+      
+   
 
     def _store_sam_interactions(self, batch: Dict[str, torch.Tensor]):
         """Store interactions in buffer for deferred SAM update."""
@@ -900,6 +787,8 @@ class TGNv6(BaseEnhancedTGN):
         dst_nodes = batch['dst_nodes'].to(device)
         timestamps = batch['timestamps'].to(device)
         
+        # edge_feats = edge_feats / 100.0
+
         # Get edge features
         if 'edge_features' in batch and batch['edge_features'] is not None:
             edge_feats = batch['edge_features'].to(device)
@@ -1006,17 +895,15 @@ class TGNv6(BaseEnhancedTGN):
             logger.error(f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, "
                         f"dest_emb: {torch.isnan(dest_emb).any()}")
         
+        if torch.isnan(scores).any():
+            logger.warning(f"Batch {batch_idx} contains NaN scores, skipping")
+            return None   # Lightning will skip this batch
+        
+        
         # 3. COMPUTE LOSS
         loss = F.binary_cross_entropy_with_logits(scores, labels.float())
         
-        # 3. COMPUTE LOSS - Create loss input dict
-        # loss_input = {
-        #     'scores': scores,
-        #     'labels': batch['labels'].float()
-        # }
-        
-        # loss = self._compute_loss(loss_input)
-
+       
 
 
         # 4. DEFERRED SAM UPDATE: Store interactions for update AFTER backward
@@ -1053,7 +940,8 @@ class TGNv6(BaseEnhancedTGN):
         times = batch['timestamps']
         current_max = times.max().item()
         
-        if batch_idx == 0 and self.use_hct:
+        # if batch_idx == 0 and self.use_hct:
+        if batch_idx == 0:
             # Generate test walks
             walk_data = self.walk_sampler(
                 source_nodes=batch['src_nodes'][:2],
@@ -1122,9 +1010,7 @@ class TGNv6(BaseEnhancedTGN):
             
             # Wrap entire update in no_grad to prevent gradient pollution
             with torch.no_grad():
-                mem_before_norm = torch.norm(self.sam_module.raw_memory).item()
-                mem_before_std = self.sam_module.raw_memory.std().item()
-
+                
                 # Get node features (detach to be safe)
                 node_feats = self.node_embedding.weight.detach()
 
@@ -1136,32 +1022,56 @@ class TGNv6(BaseEnhancedTGN):
                     current_time=buffer['timestamps'],
                     node_features=node_feats
                 )
+
+                # clamp(NaN, -10, 10) returns NaN, so nan_to_num must come first
+                self.sam_module.raw_memory.data = torch.nan_to_num(
+                    self.sam_module.raw_memory.data,
+                    nan=0.0,
+                    posinf=10.0,
+                    neginf=-10.0
+                ).clamp_(-10, 10)
+
+                # Also sanitize prototypes
+                if not torch.isfinite(self.sam_module.all_prototypes).all():
+                    logger.error(f"Batch {batch_idx}: Prototypes NaN after update, resetting")
+                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
+                else:
+                    self.sam_module.all_prototypes.data = torch.nan_to_num(
+                        self.sam_module.all_prototypes.data,
+                        nan=0.0,
+                        posinf=10.0,
+                        neginf=-10.0
+                    ).clamp_(-10, 10)
+
+                if not torch.isfinite(self.sam_module.raw_memory).all():
+                    logger.error(f"Batch {batch_idx}: SAM memory NaN AFTER update! RESETTING")
+                    self.sam_module.reset_memory()
                 
-                # EMERGENCY: Hard clamp memory to prevent explosion
-                # with torch.no_grad():
-                self.sam_module.raw_memory.data.clamp_(-50, 50)
+                if not torch.isfinite(self.sam_module.all_prototypes).all():
+                    logger.error(f"Batch {batch_idx}: Prototypes NaN! RESETTING")
+                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
+                
+                # EMERGENCY: Hard clamp memory to prevent explosion                
+                self.sam_module.raw_memory.data.clamp_(-10, 10)
+                self.sam_module.all_prototypes.data.clamp_(-10, 10)
                 
                 # Verify update didn't explode
-                mem_after_norm = torch.norm(self.sam_module.raw_memory).item()
-                
-                # Check for NaN/Inf and reset if needed
-                # if not torch.isfinite(self.sam_module.raw_memory).all():
-                #     logger.error(f"Batch {batch_idx}: SAM memory NaN/Inf detected, resetting affected nodes")
-                #     # Reset only affected nodes
-                #     src_unique = buffer['src_nodes'].unique()
-                #     dst_unique = buffer['dst_nodes'].unique()
-                #     self.sam_module.raw_memory[src_unique] = 0
-                #     self.sam_module.raw_memory[dst_unique] = 0
+                       
                 
                 # Safety check: if memory exploded, reset and log
                 # After update, verify memory health
-                if not torch.isfinite(self.sam_module.raw_memory).all():
-                    logger.error(f"Batch {batch_idx}: SAM update produced NaN, resetting all memory")
-                    self.sam_module.reset_memory()
+                if not torch.isfinite(self.sam_module.all_prototypes).all():
+                    logger.error("Prototypes NaN after optimizer step – resetting")
+                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
+                else:
+                    self.sam_module.all_prototypes.data.clamp_(-10.0, 10.0)
             
             # Clean up buffer
             delattr(self, '_sam_batch_buffer')
 
+        
+        
+        
         # 2. ST-ODE CONTINUOUS EVOLUTION (only if time has advanced)
         if self.use_st_ode:
             current_time = batch['timestamps'].max()
@@ -1243,6 +1153,13 @@ class TGNv6(BaseEnhancedTGN):
             except Exception as e:
                 logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
                 self.last_update_time = current_time
+        # Check if loss is NaN and skip update if so
+        
+    def on_after_backward(self):
+        torch.nn.utils.clip_grad_norm_(self.sam_module.parameters(), max_norm=1.0)    
+        # Extra clipping for sensitive components
+        if hasattr(self, 'hct'):
+            torch.nn.utils.clip_grad_norm_(self.hct.parameters(), max_norm=0.5)
         
     def on_train_epoch_start(self):
         """Reset ST-ODE temporal state at epoch start."""

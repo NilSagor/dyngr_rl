@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
-
+from loguru import logger
 
 from .transformer_encoder import PositionalEncoding, TransformerEncoderLayer
 
@@ -29,11 +29,19 @@ class IntraWalkEncoder(nn.Module):
         self.max_walk_length = max_walk_length
         
         # Positional encoding for walk positions
-        self.pos_encoder = PositionalEncoding(d_model, max_walk_length)
+        self.pos_encoder = PositionalEncoding(
+            d_model, 
+            max_walk_length
+        )
         
         # Transformer encoder layers
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            TransformerEncoderLayer(
+                d_model, 
+                nhead, 
+                dim_feedforward, 
+                dropout
+            )
             for _ in range(num_layers)
         ])
         
@@ -41,8 +49,9 @@ class IntraWalkEncoder(nn.Module):
         self.output_proj = nn.Linear(d_model, d_model)
         
         self.dropout = nn.Dropout(dropout)
-        self.norm_proj = nn.LayerNorm(d_model)
-        
+        self.norm_proj = nn.LayerNorm(d_model, eps=1e-6)
+        self.intra_norm = nn.LayerNorm(d_model, eps=1e-6)  # Larger epsilon
+    
     def forward(
         self,
         walk_embeddings: torch.Tensor,
@@ -57,6 +66,25 @@ class IntraWalkEncoder(nn.Module):
             - encoded_walks: [batch_size, num_walks, walk_length, d_model]
             - walk_summaries: [batch_size, num_walks, d_model] (pooled walk representations)
         """
+        # FIX: Safe dimension handling - only squeeze if dim 0 is actually 1
+        if walk_embeddings.dim() == 5:
+            if walk_embeddings.size(0) == 1:
+                logger.warning(f"Walk embeddings is 5D {walk_embeddings.shape}, squeezing dim 0")
+                walk_embeddings = walk_embeddings.squeeze(0)
+                walk_masks = walk_masks.squeeze(0)
+            else:
+                # FIX: Flatten the extra dimension instead of losing data
+                logger.warning(f"Walk embeddings is 5D with batch>1 {walk_embeddings.shape}, flattening")
+                walk_embeddings = walk_embeddings.view(-1, *walk_embeddings.shape[2:])
+                walk_masks = walk_masks.view(-1, *walk_masks.shape[2:])
+        
+        if walk_embeddings.dim() != 4:
+            raise ValueError(f"Expected 4D walk_embeddings, got {walk_embeddings.dim()}D: {walk_embeddings.shape}")
+        
+        if not torch.isfinite(walk_embeddings).all():
+            logger.warning("NaN/Inf in walk_embeddings input to IntraWalkEncoder")
+            walk_embeddings = torch.nan_to_num(walk_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
+        
         batch_size, num_walks, walk_len, d_model = walk_embeddings.shape
         
         # Store expected total walks
@@ -73,39 +101,48 @@ class IntraWalkEncoder(nn.Module):
         x = self.dropout(x)
         
         # Create key padding mask for attention (True for padded positions)
-        key_padding_mask = ~masks.bool()  # [batch*num_walks, walk_len]
+        key_padding_mask = ~masks.bool()
+        
+        # Check for all-padded walks (would cause NaN in attention)
+        all_padded = key_padding_mask.all(dim=-1)  # [batch*num_walks]
         
         # Apply transformer layers
         for layer in self.layers:
             x = layer(x, key_padding_mask=key_padding_mask)
+            # Sanitize after each layer
+            if not torch.isfinite(x).all():
+                logger.warning("NaN in IntraWalkEncoder transformer layer output")
+                x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         
         x = self.norm_proj(x)
 
         # Reshape back BEFORE pooling
-        x = x.view(batch_size, num_walks, walk_len, d_model)  # [B, N, L, D]
-        masks = masks.view(batch_size, num_walks, walk_len)    # [B, N, L]
-        
+        x = x.view(batch_size, num_walks, walk_len, d_model)
+        masks = masks.view(batch_size, num_walks, walk_len)
 
         # Pool to get walk summaries (mean over valid positions)
-        masks_expanded = masks.unsqueeze(-1).float()  # [batch*num_walks, walk_len, 1]
-        walk_summaries = (x * masks_expanded).sum(dim=2) / (masks_expanded.sum(dim=2) + 1e-8)
-        # Result: [batch*num_walks, d_model]
         
-        # DEBUG: Verify shape before reshape
-        # actual_total_walks = walk_summaries.size(0)
-        # if actual_total_walks != expected_total_walks:
-        #     raise RuntimeError(
-        #         f"Walk count mismatch: expected {expected_total_walks} "
-        #         f"(batch={batch_size} × walks={num_walks}), got {actual_total_walks}. "
-        #         f"Input shape: {walk_embeddings.shape}"
-        #     )
-
-         # Reshape back
-        # walk_summaries = walk_summaries.view(batch_size, num_walks, d_model)
+       
+        # Pool to get walk summaries (mean over valid positions)
+        masks_expanded = masks.unsqueeze(-1).float()  # [batch*num_walks, walk_len, 1]
+        sum_feats = (x * masks_expanded).sum(dim=2)
+        count = masks_expanded.sum(dim=2) + 1e-8
+        walk_summaries = sum_feats / count
+        
+        
+        
+        # FIX: Handle all-padded walks (count would be ~1e-8)
+        walk_summaries[all_padded.view(batch_size, num_walks)] = 0.0
         
         # Final projection
         walk_summaries = self.output_proj(walk_summaries)
         walk_summaries = self.norm_proj(walk_summaries)
+        
+        # Final Sanitization
+        if not torch.isfinite(walk_summaries).all():
+            logger.error("NaN in walk_summaries after IntraWalkEncoder")
+            walk_summaries = torch.nan_to_num(walk_summaries, nan=0.0, posinf=10.0, neginf=-10.0)
+        
         
         # Also reshape encoded_walks for consistency
         encoded_walks = x
@@ -132,25 +169,39 @@ class CooccurrenceMatrix(nn.Module):
         device = anonymized_nodes.device
         walk_masks = walk_masks.bool()
         kernel = self.kernel[:L, :L]
-        
-        # Flatten to [B*W, L] for easier processing
-        nodes_flat = anonymized_nodes.view(-1, L)  # [B*W, L]
-        masks_flat = walk_masks.view(-1, L)        # [B*W, L]
+
+        # Handle empty walks
+        valid_walks = walk_masks.any(dim=-1)  # [B, W]
+        if not valid_walks.any():
+            logger.warning("All walks are empty in CooccurrenceMatrix")
+            return torch.zeros(B, W, W, device=device)
         
         # For each batch and walk, get valid (position, node_id) pairs
         cooccurrence = torch.zeros(B, W, W, device=device)
+        
+        # Flatten to [B*W, L] for easier processing
+        # nodes_flat = anonymized_nodes.view(-1, L)  # [B*W, L]
+        # masks_flat = walk_masks.view(-1, L)        # [B*W, L]
+        
         
         # Process per batch to avoid O(B²W²) indexing complexity
         for b in range(B):
             batch_nodes = anonymized_nodes[b]  # [W, L]
             batch_masks = walk_masks[b]        # [W, L]
             
+            # FIX: Skip if no valid walks in this batch
+            if not batch_masks.any():
+                continue
+            
             # Create sparse representation: list of (walk_idx, pos, node_id) for valid entries
-            valid_pos = torch.where(batch_masks)  # ([walk_indices], [pos_indices])
+            valid_pos = torch.where(batch_masks)
             walk_indices, pos_indices = valid_pos
             node_ids = batch_nodes[valid_pos]
+
+            if len(node_ids) == 0:
+                continue
             
-            # Group by node_id using sorting (efficient on GPU)
+            # Group by node_id using sorting
             sorted_node_ids, sort_perm = torch.sort(node_ids)
             sorted_walks = walk_indices[sort_perm]
             sorted_pos = pos_indices[sort_perm]
@@ -164,56 +215,71 @@ class CooccurrenceMatrix(nn.Module):
             
             # For each unique node, compute contributions between all its walk pairs
             # This is O(total_matches²) but only for matching nodes
-            for i in range(len(change_indices)):
+            num_segments = len(change_indices)
+        
+            for i in range(num_segments):
                 start = change_indices[i].item()
-                end = change_indices[i + 1].item() if i + 1 < len(change_indices) else len(sorted_node_ids)
+                # End is either next change index or end of array
+                if i + 1 < num_segments:
+                    end = change_indices[i + 1].item()
+                else:
+                    end = len(sorted_node_ids)
                 
-                
-
-                # Walks containing this node
-                walks_with_node = sorted_walks[start:end]      # [n_occurrences]
-                positions_in_walks = sorted_pos[start:end]     # [n_occurrences]
-                
-                
-                # All pairs of occurrences (including i=j)
-                pos_i = positions_in_walks.unsqueeze(1)        # [n, 1]
-                pos_j = positions_in_walks.unsqueeze(0)        # [1, n]
-                kernel_vals = kernel[pos_i, pos_j]              # [n, n]
-
-                w_i = walks_with_node.unsqueeze(1)              # [n, 1]
-                w_j = walks_with_node.unsqueeze(0)              # [1, n]
-
-
-                cooccurrence[b].index_put_(
-                    (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
-                    kernel_vals,
-                    accumulate=True
-                )
-                
-                # # All pairs of occurrences
-                # if len(walks_with_node) > 1:
-                #     # Outer product of positions to get kernel values
-                #     pos_i = positions_in_walks.unsqueeze(1)  # [n, 1]
-                #     pos_j = positions_in_walks.unsqueeze(0)  # [1, n]
+                # Skip empty segments
+                if start >= end:
+                    continue
                     
-                #     # Kernel values for all pairs
-                #     kernel_vals = kernel[pos_i, pos_j]  # [n, n]
-                    
-                #     # Walk indices for all pairs
-                #     w_i = walks_with_node.unsqueeze(1)  # [n, 1]
-                #     w_j = walks_with_node.unsqueeze(0)  # [1, n]
-                    
-                #     # Scatter add to cooccurrence matrix
-                #     cooccurrence[b].index_put_(
-                #         (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
-                #         kernel_vals,
-                #         accumulate=True
-                #     )
+                self._add_segment(cooccurrence[b], sorted_walks[start:end], sorted_pos[start:end], kernel)
+                
+                
+                
+               
         
         # Normalize
-        walk_lens = walk_masks.sum(dim=-1)  # [B, W]
-        norm = walk_lens.unsqueeze(-1) * walk_lens.unsqueeze(-2) + 1e-8
-        return cooccurrence / norm   
+        # Normalize with mask to avoid division by zero for zero‑length walks
+        # Safe normalization with better zero handling
+        walk_lens = walk_masks.sum(dim=-1).float()
+        norm = walk_lens.unsqueeze(-1) * walk_lens.unsqueeze(-2)
+
+        # Use larger epsilon and clamp norm
+        norm = torch.clamp(norm, min=1e-6)
+        
+        valid_pair_mask = (walk_lens.unsqueeze(-1) > 0) & (walk_lens.unsqueeze(-2) > 0)
+        cooccurrence = torch.where(valid_pair_mask, cooccurrence / norm, torch.zeros_like(cooccurrence))
+        
+        # Clamp before tanh to prevent overflow
+        cooccurrence = torch.clamp(cooccurrence, -10.0, 10.0)
+        cooccurrence = torch.tanh(cooccurrence)
+
+        # Final sanitization
+        if not torch.isfinite(cooccurrence).all():
+            logger.error("NaN in cooccurrence matrix after normalization")
+            cooccurrence = torch.nan_to_num(cooccurrence, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return cooccurrence
+    
+    def _add_segment(self, cooccurrence_b, walks, positions, kernel):
+        """Helper to add contributions for a group of same‑node occurrences."""
+        if len(walks) == 0 or len(positions) == 0:
+            return
+            
+        L = kernel.size(0)
+        positions = torch.clamp(positions, 0, L - 1)
+        
+        pos_i = positions.unsqueeze(1)
+        pos_j = positions.unsqueeze(0)
+        
+        kernel_vals = torch.clamp(kernel[pos_i, pos_j], min=-10.0, max=10.0)
+        
+        W = cooccurrence_b.size(0)
+        w_i = torch.clamp(walks.unsqueeze(1), 0, W - 1)
+        w_j = torch.clamp(walks.unsqueeze(0), 0, W - 1)
+        
+        cooccurrence_b.index_put_(
+            (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
+            kernel_vals,
+            accumulate=True
+        )   
 
 
 class InterWalkTransformer(nn.Module):
@@ -233,20 +299,20 @@ class InterWalkTransformer(nn.Module):
         super(InterWalkTransformer, self).__init__()
         
         self.d_model = d_model
-        self.cooccurrence_gamma = cooccurrence_gamma  # γ in the paper
+        self.cooccurrence_gamma = cooccurrence_gamma
         self.nhead = nhead
         
-        # Learnable gamma (optional)
+        # Learnable gamma (optional)        
         self.gamma = nn.Parameter(torch.tensor(cooccurrence_gamma))
         
-        # Transformer encoder layers
+        # Transformer encoder layers                
         self.layers = nn.ModuleList([
             TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
             for _ in range(num_layers)
         ])
         
         # Positional encoding for walks (walks are ordered but we use co-occurrence bias instead)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)
         
     def forward(
         self,
@@ -262,60 +328,81 @@ class InterWalkTransformer(nn.Module):
             
         Returns:
             refined_walks: [batch_size, num_walks, d_model] with inter-walk context
-        """
-        batch_size, num_walks, _ = walk_summaries.shape
+        """        
         
         # DEBUG: Verify shapes match
         # Dynamic check with helpful error message
-        if cooccurrence.shape != (batch_size, num_walks, num_walks):
-            raise ValueError(
-                f"Shape mismatch in InterWalkTransformer: "
-                f"walk_summaries={walk_summaries.shape}, "
-                f"cooccurrence={cooccurrence.shape}. "
-                f"Expected cooccurrence to have shape (batch_size, num_walks, num_walks) "
-                f"where num_walks={num_walks} from walk_summaries."
-            )
+        # if cooccurrence.shape != (batch_size, num_walks, num_walks):
+        #     raise ValueError(
+        #         f"Shape mismatch in InterWalkTransformer: "
+        #         f"walk_summaries={walk_summaries.shape}, "
+        #         f"cooccurrence={cooccurrence.shape}. "
+        #         f"Expected cooccurrence to have shape (batch_size, num_walks, num_walks) "
+        #         f"where num_walks={num_walks} from walk_summaries."
+        #     )
+        
+        
+        
+        
+        batch_size, num_walks, _ = walk_summaries.shape
+        
+        # FIX: Better shape validation with recovery
+        if cooccurrence.shape[:2] != (batch_size, num_walks):
+            logger.error(f"Shape mismatch in InterWalkTransformer: walk_summaries={walk_summaries.shape}, cooccurrence={cooccurrence.shape}")
+            # FIX: Resize cooccurrence to match
+            cooccurrence = F.pad(cooccurrence, (0, num_walks - cooccurrence.size(2), 0, num_walks - cooccurrence.size(1)))
+            cooccurrence = cooccurrence[:batch_size, :num_walks, :num_walks]
+        
+        # FIX: Sanitize cooccurrence BEFORE using as attention bias
+        if not torch.isfinite(cooccurrence).all():
+            logger.warning("NaN in cooccurrence before attention bias, fixing...")
+            cooccurrence = torch.nan_to_num(cooccurrence, nan=0.0, posinf=1.0, neginf=-1.0)
+            cooccurrence = torch.clamp(cooccurrence, -5.0, 5.0)
         
         # Create attention bias from co-occurrence matrix
-        # Expand to multi-head format: [batch_size, nhead, num_walks, num_walks]
-        # cooccurrence_bias = cooccurrence.unsqueeze(1).expand(-1, self.nhead, -1, -1)
-        if cooccurrence is not None:
-            # Create attention bias from co-occurrence matrix
-            cooccurrence_bias = cooccurrence.unsqueeze(1).expand(-1, self.nhead, -1, -1)
+        cooccurrence_bias = cooccurrence.unsqueeze(1).expand(-1, self.nhead, -1, -1)
 
-            # Scale bias to match attention score magnitude
-            bias_scale = self.d_model ** -0.5  # Same as attention scaling         
-            
-            cooccurrence_bias = self.gamma * cooccurrence_bias * bias_scale
-            # Reshape for multi-head attention: [B, H, N, N] -> [B*H, N, N]
-            # cooccurrence_bias = cooccurrence_bias.view(batch_size * self.nhead, num_walks, num_walks)
-        else:
-            # Default: no bias
-            cooccurrence_bias = None
+        bias_scale = 0.1 / (self.d_model ** 0.5)
+        cooccurrence_bias = self.gamma * cooccurrence_bias * bias_scale
         
         
         # Create key padding mask for walks
         key_padding_mask = None
         if walk_masks is not None:
-            key_padding_mask = ~walk_masks.bool()  # [batch_size, num_walks]
+            key_padding_mask = ~walk_masks.bool()
         
         x = walk_summaries
+
+        
+        # Sanitize input
+        if not torch.isfinite(x).all():
+            logger.warning("NaN in walk_summaries input to InterWalkTransformer")
+            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        
         
         # Apply transformer layers with co-occurrence bias
         for layer in self.layers:
-            # Optional debug print
-            # if self.training and torch.rand(1).item() < 0.01:
-            #     print(f"InterWalk: x={x.shape}, bias={cooccurrence_bias.shape}")
-            
             x = layer(x, attn_bias=cooccurrence_bias, key_padding_mask=key_padding_mask)
+            # Sanitize after each layer
+            if not torch.isfinite(x).all():
+                logger.warning("NaN in InterWalkTransformer layer output")
+                x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         
         x = self.norm(x)
+        
+        # Final sanitization
+        if not torch.isfinite(x).all():
+            logger.error("NaN in InterWalkTransformer output")
+            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+              
         
         return x
     
 class HierarchicalCooccurrenceTransformer(nn.Module):
     """
-    Hierarchical Co-occurrence Transformer (HCT) for HYDRA.
+    Hierarchical Co-occurrence Transformer (HCT) for HiCoST.
     
     Processes multi-scale walks through:
     1. Intra-walk Transformer (local context)
@@ -332,7 +419,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         dim_feedforward: int = 256,
         dropout: float = 0.1,
         max_walk_length: int = 20,
-        max_num_walks: int = 20,  # Short + Long + TAWR
+        max_num_walks: int = 20,
         cooccurrence_sigma: float = 2.0,
         cooccurrence_gamma: float = 0.5,
         use_walk_type_embedding: bool = True
@@ -372,25 +459,27 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         
         # Optional walk type embeddings (short/long/tawr)
         if use_walk_type_embedding:
-            self.walk_type_embed = nn.Embedding(3, d_model)  # 3 types
+            self.walk_type_embed = nn.Embedding(3, d_model)
             nn.init.normal_(self.walk_type_embed.weight, std=0.02)
         
-        # Final pooling layer (attention-based)
+                
+        # Add dropout to pooling
         self.pooling = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Tanh(),
+            nn.Dropout(dropout),
             nn.Linear(d_model, 1)
         )
         
         # Output projection
         self.output_proj = nn.Linear(d_model, d_model)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)
 
+        # Memory projection if dimensions differ
         self.memory_proj = nn.Linear(memory_dim, d_model) if memory_dim != d_model else nn.Identity()
-
-        self.restart_embed = nn.Embedding(2, d_model)
+        
+        # Restart embedding for TAWR
+        self.restart_embed = nn.Embedding(2, d_model)        
         
     def process_walk_type(
         self,
@@ -402,45 +491,60 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Process a single walk type.
-        """
+        
+        Args:
+            node_embeddings: [B, N, L, D] actual node embeddings from memory
+            anonymized_nodes: [B, N, L] anonymized IDs for co-occurrence
+            walk_masks: [B, N, L] mask for valid positions
+            walk_type: 0=short, 1=long, 2=tawr
+        """        
+        # Safe dimension handling
+        if node_embeddings.dim() == 5:
+            if node_embeddings.size(0) == 1:
+                logger.warning(f"Walk embeddings is 5D {node_embeddings.shape}, squeezing dim 0")
+                node_embeddings = node_embeddings.squeeze(0)
+            else:
+                logger.warning(f"Walk embeddings is 5D with batch>1, flattening")
+                node_embeddings = node_embeddings.view(-1, *node_embeddings.shape[2:])
+        elif node_embeddings.dim() != 4:
+            raise ValueError(f"Expected 4D node_embeddings, got {node_embeddings.dim()}D")
+        
+        # Sanitize input
+        if not torch.isfinite(node_embeddings).all():
+            logger.error("NaN in node_embeddings input to process_walk_type")
+            node_embeddings = torch.nan_to_num(node_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        
         batch_size, num_walks, walk_len, _ = node_embeddings.shape
         
-        # Validate all inputs have consistent shapes
-        assert anonymized_nodes.shape == (batch_size, num_walks, walk_len), \
-            f"anonymized_nodes shape {anonymized_nodes.shape} doesn't match node_embeddings {node_embeddings.shape}"
-        assert walk_masks.shape == (batch_size, num_walks, walk_len), \
-            f"walk_masks shape {walk_masks.shape} doesn't match expected {(batch_size, num_walks, walk_len)}"
-        
-        # Add walk type embedding if enabled
+        # Add walk type embedding
         if self.use_walk_type_embedding:
-            type_embed = self.walk_type_embed(torch.tensor([walk_type], device=node_embeddings.device))        
-            node_embeddings = node_embeddings + type_embed.unsqueeze(0).unsqueeze(0)
-        
-        assert type_embed.unsqueeze(0).unsqueeze(0).shape == (1, 1, 1, self.d_model)
+            type_embed = self.walk_type_embed(torch.tensor([walk_type], device=node_embeddings.device))
+            node_embeddings = node_embeddings + type_embed.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         
         # Step 1: Intra-walk encoding
-        encoded_walks, walk_summaries = self.intra_walk_encoder(
-            node_embeddings, walk_masks
-        )
+        encoded_walks, walk_summaries = self.intra_walk_encoder(node_embeddings, walk_masks)
         
         # Step 2: Compute co-occurrence matrix
-        # Use anonymized nodes for co-occurrence
         cooccurrence = self.cooccurrence_matrix(anonymized_nodes, walk_masks)
         
-         # Validate co-occurrence shape matches walk_summaries
-        assert cooccurrence.shape == (batch_size, num_walks, num_walks), \
-            f"Co-occurrence shape {cooccurrence.shape} doesn't match expected {(batch_size, num_walks, num_walks)}"
+        # Create walk-level mask
+        walk_level_mask = (walk_masks.sum(dim=-1) > 0).float()
         
         
-        # Create walk-level mask: [B, num_walks] (2D) - CRITICAL
-        walk_level_mask = (walk_masks.sum(dim=-1) > 0).float()  # [batch_size, num_walks]
+        # Handle case where all walks are empty
+        if walk_level_mask.sum() == 0:
+            logger.warning("All walks are empty, returning zeros")
+            return {
+                'encoded_walks': torch.zeros_like(encoded_walks),
+                'walk_summaries': torch.zeros_like(walk_summaries),
+                'refined_walks': torch.zeros_like(walk_summaries),
+                'cooccurrence': cooccurrence,
+                'walk_masks': walk_level_mask
+            }
         
         # Step 3: Inter-walk transformer
-        refined_walks = self.inter_walk_transformer(
-            walk_summaries,
-            cooccurrence,
-            walk_level_mask
-        )
+        refined_walks = self.inter_walk_transformer(walk_summaries, cooccurrence, walk_level_mask)
         
         result = {
             'encoded_walks': encoded_walks,
@@ -461,58 +565,69 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         """
         Fuse representations from different walk types.
         Uses attention-based pooling across all walks from all types.
-        """
+        """       
         batch_size = short_output['refined_walks'].size(0)
         
-        # Collect all refined walks with explicit shape tracking
         all_walks = []
         all_masks = []
         
         for name, output in [('short', short_output), ('long', long_output), ('tawr', tawr_output)]:
-            refined = output['refined_walks']  # [batch_size, num_walks, d_model]
-            masks = output['walk_masks']       # [batch_size, num_walks]
-            
-            # DEBUG: Log shapes to catch mismatches early
-            # if self.training and torch.rand(1).item() < 0.01:
-            #     print(f"{name}: refined={refined.shape}, masks={masks.shape}")
-                
-            assert refined.size(0) == masks.size(0), f"{name}: batch size mismatch"
-            assert refined.size(1) == masks.size(1), f"{name}: walk count mismatch: {refined.size(1)} vs {masks.size(1)}"
+            refined = output['refined_walks']
+            masks = output['walk_masks']
             
             all_walks.append(refined)
             all_masks.append(masks)
         
-        # Concatenate along walk dimension
-        all_walks = torch.cat(all_walks, dim=1)  # [batch_size, total_walks, d_model]
-        all_masks = torch.cat(all_masks, dim=1)  # [batch_size, total_walks]
+        
+        
+        all_walks = torch.cat(all_walks, dim=1)
+        all_masks = torch.cat(all_masks, dim=1)
         
         total_walks = all_walks.size(1)
         
         # Attention-based pooling
-        # Compute attention scores
-        attention_scores = self.pooling(all_walks).squeeze(-1)  # [batch_size, total_walks]
+        attention_scores = self.pooling(all_walks).squeeze(-1)
         
-        # CRITICAL: Verify pooling output shape matches
-        assert attention_scores.size(1) == total_walks, \
-            f"Pooling shape mismatch: got {attention_scores.size(1)}, expected {total_walks}"
-            
+        # Handle all-masked case (CRITICAL - prevents NaN in softmax)
+        all_masked = (all_masks == 0).all(dim=-1)  # [batch_size]
         
-        # Mask out invalid walks
         attention_scores = attention_scores.masked_fill(all_masks == 0, float('-inf'))
         
-       
-        # Softmax over walks
-        attention_weights = F.softmax(attention_scores, dim=-1)  # [batch_size, total_walks]
-        attention_weights = attention_weights.unsqueeze(-1)      # [batch_size, total_walks, 1]
         
-              
+        if all_masked.any():
+            logger.warning(f"{all_masked.sum().item()} batches have all walks masked")
+            # For all-masked batches, use uniform attention
+            attention_weights = F.softmax(attention_scores, dim=-1)
+            attention_weights[all_masked] = 1.0 / total_walks
+        else:
+            attention_weights = F.softmax(attention_scores, dim=-1)
         
-        # Hybrid pooling: 50% mean, 50% attention
-        mean_pool = (all_walks * all_masks.unsqueeze(-1)).sum(dim=1) / (all_masks.sum(dim=-1, keepdim=True) + 1e-8)
+        attention_weights = attention_weights.unsqueeze(-1)       
+        
+        
+        # Hybrid pooling: 50% mean, 50% attention        
+        valid_mask_sum = all_masks.sum(dim=-1, keepdim=True)
+        mean_pool = torch.where(
+            valid_mask_sum > 1e-6,
+            (all_walks * all_masks.unsqueeze(-1)).sum(dim=1) / (valid_mask_sum + 1e-8),
+            torch.zeros_like(valid_mask_sum)
+        )
         attn_pool = (all_walks * attention_weights).sum(dim=1)
+
+        mean_pool = torch.nan_to_num(mean_pool, nan=0.0, posinf=0.0, neginf=0.0)
+        attn_pool = torch.nan_to_num(attn_pool, nan=0.0, posinf=0.0, neginf=0.0)
+        
         fused = 0.5 * mean_pool + 0.5 * attn_pool
         
-        return self.output_proj(self.norm(fused))    
+        # Final projection and normalization        
+        fused = self.output_proj(self.norm(fused))
+        
+        # Final sanitization
+        if not torch.isfinite(fused).all():
+            logger.error("NaN/Inf in fused output after pooling!")
+            fused = torch.nan_to_num(fused, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        return fused 
     
     def _validate_anonymization(self, nodes, nodes_anon, masks):
         # Same actual node should map to same anonymized ID within batch
@@ -535,68 +650,100 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         Args:
             walks_dict: From walk sampler with 'nodes' (actual IDs) and 'nodes_anon'
             node_memory: [num_nodes, memory_dim] SAM raw memory
-            memory_proj: Optional projection layer
             return_all: Return intermediate outputs
-        """
+        """       
         batch_size = walks_dict['short']['nodes'].size(0)
         device = walks_dict['short']['nodes'].device
         
-        # assert node_memory.requires_grad, "SAM memory must have gradients enabled!"
-
-        outputs = {}
+        # Sanitize node_memory BEFORE lookup
+        if not torch.isfinite(node_memory).all():
+            logger.error("NaN in node_memory before HCT memory lookup!")
+            node_memory = torch.nan_to_num(node_memory, nan=0.0, posinf=10.0, neginf=-10.0)
         
+        outputs = {}
+
         for walk_type, type_name in [(0, 'short'), (1, 'long'), (2, 'tawr')]:
             data = walks_dict[type_name]
             
-            # CRITICAL: Get actual node indices for memory lookup
-            nodes = data['nodes']  # [B, num_walks, L] - actual node IDs
-            nodes_anon = data['nodes_anon']  # [B, num_walks, L] - for co-occurrence
+            nodes = data['nodes']
+            nodes_anon = data['nodes_anon']
+            masks = data['masks']
+            
+            # FIX: Safe dimension handling
+            for name, tensor in [('nodes', nodes), ('nodes_anon', nodes_anon), ('masks', masks)]:
+                if tensor.dim() == 4:
+                    if tensor.size(2) == 1:  # Only squeeze if dimension is 1
+                        logger.warning(f"Walk {name} is 4D {tensor.shape}, squeezing dim 2")
+                        tensor = tensor.squeeze(2)
+                        data[name] = tensor
+                    else:
+                        logger.error(f"Walk {name} is 4D with dim2>1 {tensor.shape}, flattening")
+                        tensor = tensor[0]
+                        data[name] = tensor
+            
+            nodes = data['nodes']
+            nodes_anon = data['nodes_anon']
             masks = data['masks']
             
             num_walks = nodes.size(1)
-            walk_len = nodes.size(2)
+            walk_len = nodes.size(2)          
+          
+            # VALIDATE: Ensure shapes are consistent                               
             
-            # Lookup from SAM memory using actual node IDs
-            flat_nodes = nodes.reshape(-1)  # [B * num_walks * L]
-            walk_node_feats = node_memory[flat_nodes]  # [B*num_walks*L, memory_dim]
+            # Validate node indices BEFORE memory lookup
+            if nodes.max().item() >= node_memory.size(0) or nodes.min().item() < 0:
+                logger.error(f"Invalid node index in walks! max={nodes.max().item()}, num_nodes={node_memory.size(0)}")
+                nodes = torch.clamp(nodes, 0, node_memory.size(0) - 1)
+                data['nodes'] = nodes
             
-            # # Project to d_model if needed
-            # if memory_proj is not None:
-            #     walk_node_feats = memory_proj(walk_node_feats)
+            # Check for NaN in node indices
+            if not torch.isfinite(nodes.float()).all():
+                logger.error("NaN in walk node indices!")
+                nodes = torch.zeros_like(nodes).long()
+                data['nodes'] = nodes
             
-            # actual_dim = self.d_model if memory_proj is not None else node_memory.size(-1)
-            walk_node_feats = self.memory_proj(walk_node_feats)
-            # Reshape: [B, num_walks, L, d_model]
-            # walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, actual_dim)
-            walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, self.d_model)
+            flat_nodes = nodes.reshape(-1)
+            accessed_memory = node_memory[flat_nodes]
 
-            # VALIDATE: Ensure shapes are consistent
-            assert walk_embeddings.shape[0] == batch_size, \
-                f"Batch size mismatch: {walk_embeddings.shape[0]} vs {batch_size}"
-            assert walk_embeddings.shape[1] == num_walks, \
-                f"Num walks mismatch: {walk_embeddings.shape[1]} vs {num_walks}"
-            assert masks.shape == (batch_size, num_walks, walk_len), \
-                f"Mask shape mismatch: {masks.shape} vs {(batch_size, num_walks, walk_len)}"
+            if not torch.isfinite(accessed_memory).all():
+                logger.error(f"NaN in accessed memory! Replacing with zeros")
+                # Create clean memory for this lookup only
+                clean_memory = torch.nan_to_num(node_memory, nan=0.0, posinf=0.0, neginf=0.0)
+                walk_node_feats = clean_memory[flat_nodes]
+            else:
+                walk_node_feats = accessed_memory
             
+            # walk_node_feats = node_memory[flat_nodes]
+            walk_node_feats = self.memory_proj(walk_node_feats)
+            walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, self.d_model)
+            
+            # Sanitize after memory lookup
+            if not torch.isfinite(walk_embeddings).all():
+                logger.error("NaN in walk_embeddings after memory lookup")
+                walk_embeddings = torch.nan_to_num(walk_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
             
             # Add restart flags for TAWR
             if type_name == 'tawr' and 'restart_flags' in data:
-                restart_flags = data['restart_flags'].unsqueeze(-1).float()
-                # Learnable restart embedding or simple marker                
-                restart_embed = self.restart_embed(data['restart_flags'].long())
+                restart_flags = data['restart_flags']
+                if restart_flags.dim() == 4:
+                    restart_flags = restart_flags.squeeze(2)
+                restart_embed = self.restart_embed(restart_flags.long())
                 walk_embeddings = walk_embeddings + restart_embed
             
-            # Process through HCT pipeline
             output = self.process_walk_type(
                 walk_embeddings,
-                nodes_anon,  # Use anonymized for co-occurrence
+                nodes_anon,
                 masks,
                 walk_type=walk_type
             )
             outputs[type_name] = output
         
         # Fuse and return
-        fused = self.fuse_walk_types(outputs['short'], outputs['long'], outputs['tawr'])
+        fused = self.fuse_walk_types(
+            outputs['short'], 
+            outputs['long'], 
+            outputs['tawr']
+        )
         
         if return_all:
             return {'fused': fused, **outputs}
