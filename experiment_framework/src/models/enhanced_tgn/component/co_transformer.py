@@ -1,12 +1,24 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from typing import Dict, List, Tuple, Optional, Union
-import numpy as np
 from loguru import logger
 
 from .transformer_encoder import PositionalEncoding, TransformerEncoderLayer
+
+
+
+def _sanitize_tensor(
+        x: torch.Tensor, 
+        name: str = "tensor", 
+        nan_val: float = 0.0, 
+        inf_val: float = 10.0
+    ) -> torch.Tensor:
+    """Helper: sanitize tensor for NaN/Inf with consistent logging."""
+    if not torch.isfinite(x).all():
+        logger.warning(f"NaN/Inf in {name}: {x.shape}")
+        return torch.nan_to_num(x, nan=nan_val, posinf=inf_val, neginf=-inf_val)
+    return x
 
 
 class IntraWalkEncoder(nn.Module):
@@ -47,13 +59,11 @@ class IntraWalkEncoder(nn.Module):
         
         
         # Output projection for walk-level aggregation
-        self.output_proj = nn.Linear(d_model, d_model)
-        
+        self.output_proj = nn.Linear(d_model, d_model)        
         self.dropout = nn.Dropout(dropout)
         
-        self.norm_proj = nn.LayerNorm(d_model, eps=1e-5)
-        self.intra_norm = nn.LayerNorm(d_model, eps=1e-5)  # Larger epsilon
-    
+        self.norm_proj = nn.LayerNorm(d_model, eps=1e-6)
+        
     def forward(
         self,
         walk_embeddings: torch.Tensor,
@@ -75,7 +85,6 @@ class IntraWalkEncoder(nn.Module):
                 walk_embeddings = walk_embeddings.squeeze(0)
                 walk_masks = walk_masks.squeeze(0)
             else:
-                # Flatten the extra dimension instead of losing data
                 logger.warning(f"Walk embeddings is 5D with batch>1 {walk_embeddings.shape}, flattening")
                 walk_embeddings = walk_embeddings.view(-1, *walk_embeddings.shape[2:])
                 walk_masks = walk_masks.view(-1, *walk_masks.shape[2:])
@@ -83,10 +92,8 @@ class IntraWalkEncoder(nn.Module):
         if walk_embeddings.dim() != 4:
             raise ValueError(f"Expected 4D walk_embeddings, got {walk_embeddings.dim()}D: {walk_embeddings.shape}")
         
-        if not torch.isfinite(walk_embeddings).all():
-            logger.warning("NaN/Inf in walk_embeddings input to IntraWalkEncoder")
-            walk_embeddings = torch.nan_to_num(walk_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
-
+        walk_embeddings = _sanitize_tensor(walk_embeddings, "walk_embeddings")
+        
         batch_size, num_walks, walk_len, d_model = walk_embeddings.shape
         
        
@@ -108,9 +115,10 @@ class IntraWalkEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, key_padding_mask=key_padding_mask)
             # Sanitize after each layer
-            if not torch.isfinite(x).all():
-                logger.warning("NaN in IntraWalkEncoder transformer layer output")
-                x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
+            x = _sanitize_tensor(x, "transformer_layer_output")
+            # if not torch.isfinite(x).all():
+            #     logger.warning("NaN in IntraWalkEncoder transformer layer output")
+            #     x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         
         x = self.norm_proj(x)
 
@@ -121,23 +129,22 @@ class IntraWalkEncoder(nn.Module):
         # Pool to get walk summaries (mean over valid positions)        
         masks_expanded = masks.unsqueeze(-1).float()
         sum_feats = (x * masks_expanded).sum(dim=2)
-        count = masks_expanded.sum(dim=2) + 1e-8
+        
+        count = masks_expanded.sum(dim=2) + 1e-6
         walk_summaries = sum_feats / count
      
         # Handle all-padded walks (count would be ~1e-8)
         # Check for all-padded walks in the original shape
-        all_padded = (count.squeeze(-1) < 1e-6)  # [batch, num_walks]
+        all_padded = (count.squeeze(-1) < 1e-6)
         walk_summaries[all_padded] = 0.0
         
         # Final projection
         walk_summaries = self.output_proj(walk_summaries)
         walk_summaries = self.norm_proj(walk_summaries)
         
-        # Final Sanitization
-        if not torch.isfinite(walk_summaries).all():
-            logger.error("NaN in walk_summaries after IntraWalkEncoder")
-            walk_summaries = torch.nan_to_num(walk_summaries, nan=0.0, posinf=10.0, neginf=-10.0)
         
+        # Final sanitization
+        walk_summaries = _sanitize_tensor(walk_summaries, "walk_summaries")
         
         # Also reshape encoded_walks for consistency
         encoded_walks = x
@@ -154,7 +161,7 @@ class CooccurrenceMatrix(nn.Module):
         positions = torch.arange(max_walk_length, dtype=torch.float32)
         self.register_buffer('kernel', 
             torch.exp(-((positions.unsqueeze(0) - positions.unsqueeze(1)) ** 2) / (sigma ** 2)))
-        self.register_buffer('pos_indices', torch.arange(max_walk_length))
+        
     
     def forward(self, anonymized_nodes, walk_masks):
         B, W, L = anonymized_nodes.shape
@@ -171,11 +178,7 @@ class CooccurrenceMatrix(nn.Module):
         # For each batch and walk, get valid (position, node_id) pairs
         cooccurrence = torch.zeros(B, W, W, device=device)
         
-        # Flatten to [B*W, L] for easier processing
-        # nodes_flat = anonymized_nodes.view(-1, L)  # [B*W, L]
-        # masks_flat = walk_masks.view(-1, L)        # [B*W, L]
-        
-        
+              
         # Process per batch to avoid O(B²W²) indexing complexity
         for b in range(B):
             batch_nodes = anonymized_nodes[b]  # [W, L]
@@ -212,16 +215,18 @@ class CooccurrenceMatrix(nn.Module):
             for i in range(num_segments):
                 start = change_indices[i].item()
                 # End is either next change index or end of array
-                if i + 1 < num_segments:
-                    end = change_indices[i + 1].item()
-                else:
-                    end = len(sorted_node_ids)
+                end = change_indices[i + 1].item() if i + 1 < num_segments else len(sorted_node_ids)
                 
                 # Skip empty segments
                 if start >= end:
                     continue
                     
-                self._add_segment_deterministic(cooccurrence[b], sorted_walks[start:end], sorted_pos[start:end], kernel)
+                self._add_segment_deterministic(
+                    cooccurrence[b], 
+                    sorted_walks[start:end], 
+                    sorted_pos[start:end], 
+                    kernel
+                )
            
         # Normalize with mask to avoid division by zero for zero‑length walks
         # Safe normalization with better zero handling        
@@ -233,15 +238,13 @@ class CooccurrenceMatrix(nn.Module):
         
         valid_pair_mask = (walk_lens.unsqueeze(-1) > 0) & (walk_lens.unsqueeze(-2) > 0)
         cooccurrence = torch.where(valid_pair_mask, cooccurrence / norm, torch.zeros_like(cooccurrence))
-        
+
         # Clamp before tanh to prevent overflow
         cooccurrence = torch.clamp(cooccurrence, -10.0, 10.0)
         cooccurrence = torch.tanh(cooccurrence)
-
+        
         # Final sanitization
-        if not torch.isfinite(cooccurrence).all():
-            logger.error("NaN in cooccurrence matrix after normalization")
-            cooccurrence = torch.nan_to_num(cooccurrence, nan=0.0, posinf=1.0, neginf=-1.0)
+        cooccurrence = _sanitize_tensor(cooccurrence, "cooccurrence", inf_val=1.0)
 
         return cooccurrence
     
@@ -252,35 +255,27 @@ class CooccurrenceMatrix(nn.Module):
             
         L = kernel.size(0)
         positions = torch.clamp(positions, 0, L - 1)
-        
+
         pos_i = positions.unsqueeze(1)
         pos_j = positions.unsqueeze(0)
-        
         kernel_vals = torch.clamp(kernel[pos_i, pos_j], min=-10.0, max=10.0)
         
         W = cooccurrence_b.size(0)
         w_i = torch.clamp(walks.unsqueeze(1), 0, W - 1)
         w_j = torch.clamp(walks.unsqueeze(0), 0, W - 1)
         
-        # FIX: Move to CPU for deterministic accumulation, then back to device
-        if cooccurrence_b.is_cuda:
-            cooccurrence_b_cpu = cooccurrence_b.cpu()
-            w_i_cpu = w_i.cpu()
-            w_j_cpu = w_j.cpu()
-            kernel_vals_cpu = kernel_vals.cpu()
-            
-            cooccurrence_b_cpu.index_put_(
-                (w_i_cpu.expand_as(kernel_vals_cpu), w_j_cpu.expand_as(kernel_vals_cpu)),
-                kernel_vals_cpu,
-                accumulate=True
-            )
-            cooccurrence_b.copy_(cooccurrence_b_cpu)
-        else:
-            cooccurrence_b.index_put_(
-                (w_i.expand_as(kernel_vals), w_j.expand_as(kernel_vals)),
-                kernel_vals,
-                accumulate=True
-            )   
+        
+        # Flatten to 1D indices for bincount
+        flat_indices = w_i * W + w_j  # [n, n]
+        flat_kernel = kernel_vals.view(-1)
+        flat_idx = flat_indices.view(-1)
+
+        # Use bincount for deterministic accumulation
+        accum = torch.bincount(flat_idx.long(), weights=flat_kernel, minlength=W*W)
+        accum = accum.view(W, W)
+        
+        # Add to cooccurrence matrix
+        cooccurrence_b.add_(accum)   
 
 
 class InterWalkTransformer(nn.Module):
@@ -313,7 +308,7 @@ class InterWalkTransformer(nn.Module):
         ])
         
         # Positional encoding for walks (walks are ordered but we use co-occurrence bias instead)
-        self.norm = nn.LayerNorm(d_model, eps=1e-5)
+        self.norm = nn.LayerNorm(d_model, eps=1e-6)
         
     def forward(
         self,
@@ -329,25 +324,21 @@ class InterWalkTransformer(nn.Module):
             
         Returns:
             refined_walks: [batch_size, num_walks, d_model] with inter-walk context
-        """        
+        """      
                         
         batch_size, num_walks, _ = walk_summaries.shape
-        
+                
         # Proper shape validation - raise error instead of silent truncation
         if cooccurrence.shape != (batch_size, num_walks, num_walks):
             logger.error(f"Shape mismatch: walk_summaries={walk_summaries.shape}, cooccurrence={cooccurrence.shape}")
             raise ValueError(f"Cooccurrence shape {cooccurrence.shape} doesn't match expected ({batch_size}, {num_walks}, {num_walks})")
-        
+
         # Sanitize cooccurrence BEFORE using as attention bias
-        if not torch.isfinite(cooccurrence).all():
-            logger.warning("NaN in cooccurrence before attention bias, fixing...")
-            cooccurrence = torch.nan_to_num(cooccurrence, nan=0.0, posinf=1.0, neginf=-1.0)
-            cooccurrence = torch.clamp(cooccurrence, -5.0, 5.0)
-        
+        cooccurrence = _sanitize_tensor(cooccurrence, "cooccurrence", inf_val=1.0)
+        cooccurrence = torch.clamp(cooccurrence, -5.0, 5.0)
         
         # Create attention bias from co-occurrence matrix
         cooccurrence_bias = cooccurrence.unsqueeze(1).expand(-1, self.nhead, -1, -1)
-
         bias_scale = 0.1 / (self.d_model ** 0.5)
         cooccurrence_bias = self.gamma * cooccurrence_bias * bias_scale
         
@@ -358,29 +349,20 @@ class InterWalkTransformer(nn.Module):
             key_padding_mask = ~walk_masks.bool()
         
         x = walk_summaries
-
-        
         # Sanitize input
-        if not torch.isfinite(x).all():
-            logger.warning("NaN in walk_summaries input to InterWalkTransformer")
-            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        
+        x = _sanitize_tensor(x, "walk_summaries_input")
+                
         # Apply transformer layers with co-occurrence bias
         for layer in self.layers:
             x = layer(x, attn_bias=cooccurrence_bias, key_padding_mask=key_padding_mask)
             # Sanitize after each layer
-            if not torch.isfinite(x).all():
-                logger.warning("NaN in InterWalkTransformer layer output")
-                x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+            x = _sanitize_tensor(x, "Inter_transform_layer")
+            
         x = self.norm(x)
-        
-        # Final sanitization
-        if not torch.isfinite(x).all():
-            logger.error("NaN in InterWalkTransformer output")
-            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+
+        # Final sanitization               
+        x = _sanitize_tensor(x, "Inter_transform_output")
+
         return x
     
 class HierarchicalCooccurrenceTransformer(nn.Module):
@@ -455,7 +437,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         
         # Output projection
         self.output_proj = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model, eps=1e-5)
+        self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
         # Memory projection if dimensions differ
         self.memory_proj = nn.Linear(memory_dim, d_model) if memory_dim != d_model else nn.Identity()        
@@ -492,18 +474,15 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             raise ValueError(f"Expected 4D node_embeddings, got {node_embeddings.dim()}D")
         
         # Sanitize input
-        if not torch.isfinite(node_embeddings).all():
-            logger.error("NaN in node_embeddings input to process_walk_type")
-            node_embeddings = torch.nan_to_num(node_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        
+        node_embeddings = _sanitize_tensor(node_embeddings, "node_embeddings")
+       
         batch_size, num_walks, walk_len, _ = node_embeddings.shape
-        
+                
         # Add walk type embedding
         if self.use_walk_type_embedding:
             type_embed = self.walk_type_embed(torch.tensor([walk_type], device=node_embeddings.device))
             node_embeddings = node_embeddings + type_embed.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-
+        
         # Step 1: Intra-walk encoding
         encoded_walks, walk_summaries = self.intra_walk_encoder(node_embeddings, walk_masks)
 
@@ -557,18 +536,16 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             refined = output['refined_walks']
             masks = output['walk_masks']
             all_walks.append(refined)
-            all_masks.append(masks)        
+            all_masks.append(masks)         
         
         
         all_walks = torch.cat(all_walks, dim=1)
         all_masks = torch.cat(all_masks, dim=1)
-        
         total_walks = all_walks.size(1)
-        
-       
+    
         # Attention-based pooling
         attention_scores = self.pooling(all_walks).squeeze(-1)
-        
+                
         # Handle all-masked case BEFORE softmax to prevent NaN
         all_masked = (all_masks == 0).all(dim=-1)  # [batch_size]
         
@@ -582,6 +559,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         # Apply uniform weights for all-masked batches BEFORE any NaN can form
         if all_masked.any():
             logger.warning(f"{all_masked.sum().item()} batches have all walks masked")
+            attention_weights = attention_weights.clone()  # Avoid in-place on masked tensor
             attention_weights[all_masked] = 1.0 / total_walks
         
         attention_weights = attention_weights.unsqueeze(-1)       
@@ -605,10 +583,8 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         # Final projection and normalization
         fused = self.output_proj(self.norm(fused))
         
-        # Final sanitization
-        if not torch.isfinite(fused).all():
-            logger.error("NaN/Inf in fused output after pooling!")
-            fused = torch.nan_to_num(fused, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Final sanitization        
+        fused = _sanitize_tensor(fused, "fused_output")
         
         return fused
     
@@ -637,10 +613,8 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         batch_size = walks_dict['short']['nodes'].size(0)
         device = walks_dict['short']['nodes'].device
         
-        # Sanitize node_memory BEFORE lookup
-        if not torch.isfinite(node_memory).all():
-            logger.error("NaN in node_memory before HCT memory lookup!")
-            node_memory = torch.nan_to_num(node_memory, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Sanitize node_memory BEFORE lookup        
+        node_memory = _sanitize_tensor(node_memory, "node_memory")
 
         outputs = {}
 
@@ -651,19 +625,25 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             nodes_anon = data['nodes_anon']
             masks = data['masks']
             
+            # FIX: Validate node indices BEFORE memory lookup
+            if nodes.max().item() >= node_memory.size(0) or nodes.min().item() < 0:
+                logger.error(f"Invalid node index in walks! Clamping...")
+                nodes = torch.clamp(nodes, 0, node_memory.size(0) - 1)
+                data['nodes'] = nodes
+
+            if not torch.isfinite(nodes.float()).all():
+                logger.error("NaN in walk node indices!")
+                nodes = torch.zeros_like(nodes).long()
+                data['nodes'] = nodes
+
+            
             # Safe dimension handling
+            # FIX 2: Consistent 5D handling - only squeeze leading batch dim if size==1
             for name, tensor in [('nodes', nodes), ('nodes_anon', nodes_anon), ('masks', masks)]:
-                if tensor.dim() == 4:
-                    singleton_dims = [i for i in range(tensor.dim()) if tensor.size(i) == 1]
-                    if len(singleton_dims) == 1:
-                        dim_to_squeeze = singleton_dims[0]
-                        logger.warning(f"Walk {name} is 4D {tensor.shape}, squeezing dim {dim_to_squeeze}")
-                        tensor = tensor.squeeze(dim_to_squeeze)
-                        data[name] = tensor
-                    else:
-                        logger.error(f"Walk {name} is 4D with no singleton dim {tensor.shape}, taking first batch")
-                        tensor = tensor[0]
-                        data[name] = tensor
+                if tensor.dim() == 4 and tensor.size(0) == 1:
+                    logger.warning(f"Walk {name} is 4D with leading dim=1 {tensor.shape}, squeezing dim 0")
+                    tensor = tensor.squeeze(0)
+                    data[name] = tensor
             
             nodes = data['nodes']
             nodes_anon = data['nodes_anon']
@@ -671,50 +651,30 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             
             num_walks = nodes.size(1)
             walk_len = nodes.size(2)         
-          
-            # VALIDATE: Ensure shapes are consistent                               
-            
-            # Validate node indices BEFORE any memory lookup
-            if nodes.max().item() >= node_memory.size(0) or nodes.min().item() < 0:
-                logger.error(f"Invalid node index in walks! min={nodes.min().item()}, max={nodes.max().item()}, num_nodes={node_memory.size(0)}")
-                nodes = torch.clamp(nodes, 0, node_memory.size(0) - 1)
-                data['nodes'] = nodes
-            
-            # Check for NaN in node indices
-            if not torch.isfinite(nodes.float()).all():
-                logger.error("NaN in walk node indices!")
-                nodes = torch.zeros_like(nodes).long()
-                data['nodes'] = nodes
-            
+     
             flat_nodes = nodes.reshape(-1)
-
+  
+            # FIX 3: Validate flat_nodes before indexing
             if flat_nodes.max().item() >= node_memory.size(0) or flat_nodes.min().item() < 0:
                 logger.error(f"Invalid flat node index! Clamping...")
                 flat_nodes = torch.clamp(flat_nodes, 0, node_memory.size(0) - 1)
 
             accessed_memory = node_memory[flat_nodes]
-
-            if not torch.isfinite(accessed_memory).all():
-                logger.error(f"NaN in accessed memory! Replacing with zeros")
-                clean_memory = torch.nan_to_num(node_memory, nan=0.0, posinf=0.0, neginf=0.0)
-                walk_node_feats = clean_memory[flat_nodes]
-            else:
-                walk_node_feats = accessed_memory
+            accessed_memory = _sanitize_tensor(accessed_memory, "accessed_memory")
+            
             
             # walk_node_feats = node_memory[flat_nodes]
-            walk_node_feats = self.memory_proj(walk_node_feats)
+            walk_node_feats = self.memory_proj(accessed_memory)
             walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, self.d_model)
 
             # Sanitize after memory lookup
-            if not torch.isfinite(walk_embeddings).all():
-                logger.error("NaN in walk_embeddings after memory lookup")
-                walk_embeddings = torch.nan_to_num(walk_embeddings, nan=0.0, posinf=10.0, neginf=-10.0)
-
+            walk_embeddings = _sanitize_tensor(walk_embeddings, "walk_embeddings")
+            
             # Add restart flags for TAWR
             if type_name == 'tawr' and 'restart_flags' in data:
                 restart_flags = data['restart_flags']
-                if restart_flags.dim() == 4:
-                    restart_flags = restart_flags.squeeze(2)
+                if restart_flags.dim() == 4 and restart_flags.size(0) == 1:
+                    restart_flags = restart_flags.squeeze(0)
                 # Validate restart_flags range before embedding lookup
                 if restart_flags.min().item() < 0 or restart_flags.max().item() > 1:
                     logger.warning(f"restart_flags out of range [0,1], clamping")
@@ -740,6 +700,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         
         if return_all:
             return {'fused': fused, **outputs}
+        
         return fused
     
 

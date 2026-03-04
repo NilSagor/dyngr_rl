@@ -117,9 +117,10 @@ class SAMCell(nn.Module):
         query = self.layer_norm(query)
         query = torch.tanh(query)
         
-        similarity = self.compute_similarity(query, prototypes)
+        similarity = self.compute_similarity(query, prototypes)       
+                       
         
-        # Handle all-masked prototypes BEFORE softmax to prevent NaN
+        # Handle all-masked prototypes
         if node_mask is not None:
             all_masked = (~node_mask).all(dim=-1, keepdim=True)
             if all_masked.any():
@@ -136,21 +137,9 @@ class SAMCell(nn.Module):
         else:
             attention_weights = F.softmax(similarity, dim=-1)
         
-                
         # Sanitize attention weights before bmm
         attention_weights = torch.nan_to_num(attention_weights, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Handle all-masked prototypes
-        if node_mask is not None:
-            similarity = similarity.masked_fill(~node_mask, float('-inf'))
-            all_masked = (similarity == float('-inf')).all(dim=-1, keepdim=True)
-            if all_masked.any():
-                uniform = torch.ones_like(similarity) / similarity.shape[-1]
-                attention_weights = torch.where(all_masked, uniform, F.softmax(similarity, dim=-1))
-            else:
-                attention_weights = F.softmax(similarity, dim=-1)
-        else:
-            attention_weights = F.softmax(similarity, dim=-1)
         
         candidate_memory = torch.bmm(
             attention_weights.unsqueeze(1), prototypes
@@ -329,15 +318,7 @@ class StabilityAugmentedMemory(nn.Module):
         time_enc = self.time_encoder(current_time)
         assert time_enc.shape[-1] == self.time_dim, "Time encoder dimension mismatch"
 
-        # Full shape validation for time encoding
-        # assert time_enc.shape[-1] == self.time_dim, f"Time encoder dimension mismatch: {time_enc.shape[-1]} vs {self.time_dim}"
-        # if time_enc.size(0) == 1 and batch_size > 1:
-        #     time_enc = time_enc.repeat(batch_size, 1)
-        # elif time_enc.size(0) != batch_size:
-        #     logger.warning(f"Time encoding batch mismatch: {time_enc.size(0)} vs {batch_size}")
-        #     time_enc = time_enc[:batch_size] if time_enc.size(0) > batch_size else \
-        #               F.pad(time_enc, (0, 0, 0, batch_size - time_enc.size(0)))
-
+       
 
         # Get node-specific data
         src_mem = self.raw_memory[source_nodes]
