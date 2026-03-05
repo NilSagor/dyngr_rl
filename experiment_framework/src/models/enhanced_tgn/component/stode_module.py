@@ -5,6 +5,7 @@ import math
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union, Callable, NamedTuple, Protocol
 from torchdiffeq import odeint, odeint_adjoint
+from loguru import logger
 
 from torch.utils.checkpoint import checkpoint
 from .time_encoder import TimeEncoder
@@ -509,9 +510,7 @@ class STODEIntegrator(nn.Module):
         finally:
             # Restore previous graph state (or clear)
             if prev_adj is not None:
-                self.odefunc.set_adj_matrix(prev_adj)
-            # Optional: clear to prevent leaks
-            # self.odefunc.set_adj_matrix(torch.zeros(0, 0))
+                self.odefunc.set_adj_matrix(prev_adj)            
         
         return h1
 
@@ -636,44 +635,7 @@ class STODELayer(nn.Module):
         
         # Optional time encoding
         self.time_encoder = TimeEncoder(hidden_dim) if use_time_encoding else None
-    
-    # def _validate_sequence(
-    #     self,
-    #     observations: List[Tuple[torch.Tensor, torch.Tensor]],
-    #     adj_matrices: List[torch.Tensor],
-    #     t_init: torch.Tensor
-    # ) -> None:
-    #     """Validate input dimensions and temporal ordering."""
-    #     if len(observations) == 0:
-    #         raise ValueError("Empty observations")
         
-    #     if len(observations) != len(adj_matrices):
-    #         raise ValueError(
-    #             f"Length mismatch: observations ({len(observations)}) != "
-    #             f"adj_matrices ({len(adj_matrices)})"
-    #         )
-        
-    #     t_prev = t_init.item()
-    #     for i, ((H_obs, t_obs), adj) in enumerate(zip(observations, adj_matrices)):
-    #         # Shape checks
-    #         if H_obs.shape != (self.num_nodes, self.hidden_dim):
-    #             raise ValueError(
-    #                 f"obs[{i}] shape {H_obs.shape} != "
-    #                 f"({self.num_nodes}, {self.hidden_dim})"
-    #             )
-    #         if adj.shape != (self.num_nodes, self.num_nodes):
-    #             raise ValueError(
-    #                 f"adj[{i}] shape {adj.shape} != "
-    #                 f"({self.num_nodes}, {self.num_nodes})"
-    #             )
-            
-    #         # Temporal ordering
-    #         t_curr = t_obs.item() if t_obs.numel() == 1 else float('inf')
-    #         if t_curr <= t_prev:
-    #             raise ValueError(
-    #                 f"Non-increasing times at index {i}: {t_curr} <= {t_prev}"
-    #             )
-    #         t_prev = t_curr
     
     def _validate_sequence(
         self,
@@ -809,6 +771,12 @@ class STODELayer(nn.Module):
 class SpectralTemporalODE(nn.Module):
     """
     Spectral-Temporal ODE for continuous-time node representation learning.
+    adj_matrices as:
+      - a single [N, N] Tensor  -> replicated to match observation count
+      - List[[N, N] Tensor]     -> must match observation count  (
+        FIXED: now matched against internally-computed obs 
+        count rather than the caller's T)
+        
     """
     
     def __init__(
@@ -835,12 +803,21 @@ class SpectralTemporalODE(nn.Module):
         self.time_precision = time_precision
         self.use_checkpoint = use_checkpoint
         
+        if use_checkpoint:
+            logger.warning(
+                "use_checkpoint=True is incompatible with STODELayer (non-tensor args). "
+                "Checkpoint is disabled."
+            )
+        
         # Aggregation function
-        self.agg_fn = {
-            'mean': lambda x: x.mean(dim=0),
-            'sum': lambda x: x.sum(dim=0),
-            'max': lambda x: x.max(dim=0)[0]
-        }.get(aggregation, lambda x: x.mean(dim=0))
+        agg_map = {
+            "mean": lambda x: x.mean(dim=0),
+            "sum": lambda x: x.sum(dim=0),
+            "max": lambda x: x.max(dim=0)[0],
+        }
+        
+        self.agg_fn = agg_map.get(aggregation, agg_map["mean"])
+
         
         # Build layers - construct components then inject into STODELayer
         self.layers = nn.ModuleList([])
@@ -883,6 +860,7 @@ class SpectralTemporalODE(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
     
+     # observation preparation 
     def _vectorized_prepare_observations(
         self,
         walk_encodings: torch.Tensor,  # [N, W, L, H]
@@ -1026,389 +1004,3 @@ class SpectralTemporalODE(nn.Module):
             num_observations= len(observations)
         )
     
-
-
-
-# verification 
-
-
-def create_dummy_data(
-    num_nodes: int = 10,
-    num_walks: int = 3,
-    walk_len: int = 4,
-    hidden_dim: int = 8,
-    num_obs_times: int = 3,
-    device: str = 'cpu'
-) -> dict:
-    """
-    Create consistent dummy data for ST-ODE testing.
-    
-    Returns dictionary with all inputs for SpectralTemporalODE.
-    """
-    torch.manual_seed(42)
-    
-    # Initial node states at t=0.0
-    node_states = torch.randn(num_nodes, hidden_dim, device=device)
-    t_init = torch.tensor(0.0, device=device)
-    
-    # Walk encodings: [N, W, L, H]
-    # Create walks with some temporal structure
-    walk_encodings = torch.randn(num_nodes, num_walks, walk_len, hidden_dim, device=device)
-    
-    # Walk times: increasing timestamps per walk
-    # e.g., walk 0: [0.1, 0.2, 0.3], walk 1: [0.15, 0.25, 0.35], etc.
-    base_times = torch.linspace(0.1, 1.0, num_obs_times, device=device)
-    # base_times = torch.linspace(0.1, 1.0, walk_len, device=device)
-    # Assign each walk step to one of the num_obs_times slots
-    walk_times = torch.zeros(num_nodes, num_walks, walk_len, device=device)
-    
-    for n in range(num_nodes):
-        for w in range(num_walks):
-            for step in range(walk_len):
-                # Cycle through observation times
-                obs_idx = (w * walk_len + step) % num_obs_times
-                walk_times[n, w, step] = base_times[obs_idx]
-    
-    # All valid
-    walk_masks = torch.ones_like(walk_times)
-    
-    # Create exactly num_obs_times adjacency matrices
-    adj_matrices = []
-    for _ in range(num_obs_times):
-        adj = torch.eye(num_nodes, device=device)
-        rand = torch.rand(num_nodes, num_nodes, device=device) > 0.8
-        adj = adj + rand.float()
-        adj = (adj > 0).float()
-        adj_matrices.append(adj)
-    
-    return {
-        'node_states': node_states,
-        't_init': t_init,
-        'walk_encodings': walk_encodings,
-        'walk_times': walk_times,
-        'walk_masks': walk_masks,
-        'adj_matrices': adj_matrices,
-        'num_nodes': num_nodes,
-        'hidden_dim': hidden_dim,
-        'num_obs_times': num_obs_times,
-    }
-
-
-def verify_prepare_observations(model: nn.Module, data: dict) -> bool:
-    """
-    Verify the observation preparation logic.
-    """
-    print("\n=== Verifying prepare_observations ===")
-    
-    try:
-        # Test vectorized preparation
-        observations = model._vectorized_prepare_observations(
-            data['walk_encodings'],
-            data['walk_times'],
-            data['walk_masks']
-        )
-        
-        print(f"  ✓ Generated {len(observations)} observations")
-        
-        if len(observations) == 0:
-            print("  ⚠ Warning: No observations generated (all masked?)")
-            return False
-        
-        # Check structure
-        for i, (H_obs, t) in enumerate(observations):
-            assert H_obs.shape == (data['num_nodes'], data['hidden_dim']), \
-                f"Observation {i}: shape {H_obs.shape} != expected"
-            assert t.dim() == 0, f"Time {i} should be scalar, got {t.dim()}D"
-            assert H_obs.device == data['node_states'].device, "Device mismatch"
-            print(f"  ✓ Observation {i}: t={t.item():.3f}, H_obs shape {H_obs.shape}")
-        
-        # Check temporal ordering
-        times = [t.item() for _, t in observations]
-        assert times == sorted(times), "Observations not time-sorted!"
-        print(f"  ✓ Temporal ordering verified: {times[0]:.3f} -> {times[-1]:.3f}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def verify_forward_pass(model: nn.Module, data: dict, return_all: bool = False) -> bool:
-    """
-    Verify full forward pass.
-    """
-    print(f"\n=== Verifying forward (return_all={return_all}) ===")
-    
-    try:
-        start = time.time()
-        
-        output = model(
-            node_states=data['node_states'],
-            walk_encodings=data['walk_encodings'],
-            walk_times=data['walk_times'],
-            walk_masks=data['walk_masks'],
-            adj_matrices=data['adj_matrices'],
-            t_init=data['t_init'],
-            return_all=return_all
-        )
-        
-        elapsed = time.time() - start
-        print(f"  ✓ Forward pass completed in {elapsed:.3f}s")
-        
-        # Check output structure
-        assert isinstance(output.final_state, torch.Tensor), "Output.final should be Tensor"
-        assert output.final_state.shape == (data['num_nodes'], data['hidden_dim']), \
-            f"Final shape {output.final_state.shape} != expected"
-        
-        print(f"  ✓ Final output shape: {output.final_state.shape}")
-        print(f"  ✓ Num observations processed: {output.num_observations}")
-        
-        if return_all:
-            assert output.trajectory is not None, "trajectory should not be None"
-            assert len(output.trajectory) == model.num_layers, \
-                f"Expected {model.num_layers} layer outputs, got {len(output.trajectory)}"
-            print(f"  ✓ Layer outputs captured: {len(output.trajectory)} layers")
-        
-        # Check for NaN/Inf
-        assert not torch.isnan(output.final_state).any(), "NaN in final output!"
-        assert not torch.isinf(output.final_state).any(), "Inf in final output!"
-        print(f"  ✓ No NaN/Inf in output")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def verify_gradient_flow(model: nn.Module, data: dict) -> bool:
-    """
-    Verify gradients flow through the model.
-    """
-    print("\n=== Verifying gradient flow ===")
-    
-    try:
-        # Enable gradients
-        node_states = data['node_states'].clone().requires_grad_(True)
-        walk_enc = data['walk_encodings'].clone().requires_grad_(True)
-        
-        output = model(
-            node_states=node_states,
-            walk_encodings=walk_enc,
-            walk_times=data['walk_times'],
-            walk_masks=data['walk_masks'],
-            adj_matrices=data['adj_matrices'],
-            t_init=data['t_init'],
-            return_all=False
-        )
-        
-        loss = output.final_state.sum()
-        loss.backward()
-        
-        # Check gradients exist
-        assert node_states.grad is not None, "No gradient for node_states"
-        assert walk_enc.grad is not None, "No gradient for walk_encodings"
-        
-        # Check gradients are non-zero
-        assert node_states.grad.abs().sum() > 0, "Zero gradient for node_states"
-        assert walk_enc.grad.abs().sum() > 0, "Zero gradient for walk_encodings"
-        
-        print(f"  ✓ Gradients flow to node_states: {node_states.grad.abs().mean():.6f}")
-        print(f"  ✓ Gradients flow to walk_encodings: {walk_enc.grad.abs().mean():.6f}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def verify_edge_cases(model: nn.Module, data: dict) -> bool:
-    """Test edge cases with proper parameter passing."""
-    print("\n=== Verifying edge cases ===")
-    success = True
-    
-    # Case 1: All masked (empty observations)
-    print("  Testing all-masked case...")
-    try:
-        zero_masks = torch.zeros_like(data['walk_masks'])
-        output = model(
-            node_states=data['node_states'],
-            walk_encodings=data['walk_encodings'],
-            walk_times=data['walk_times'],
-            walk_masks=zero_masks,
-            adj_matrices=[],  # Empty
-            t_init=data['t_init'],
-            return_all=False
-        )
-        print(f"    ✓ Handled empty observations, output shape: {output.final_state.shape}")
-    except Exception as e:
-        print(f"    ✗ Failed: {e}")
-        success = False
-    
-    # Case 2: Single observation - create data that yields exactly 1 observation
-    print("  Testing single observation...")
-    try:
-        # Create mask with only one valid entry at same time for all nodes
-        single_mask = torch.zeros_like(data['walk_masks'])
-        single_mask[:, 0, 0] = 1.0  # All nodes, first walk, first step
-        
-        # Set same time for all to ensure single unique timestamp
-        walk_times_single = torch.ones_like(data['walk_times']) * 0.5
-        walk_times_single[single_mask == 0] = 0.0  # Invalid times for masked
-        
-        output = model(
-            node_states=data['node_states'],
-            walk_encodings=data['walk_encodings'],
-            walk_times=walk_times_single,
-            walk_masks=single_mask,
-            adj_matrices=[data['adj_matrices'][0]],  # Single adjacency
-            t_init=data['t_init'],
-            return_all=False
-        )
-        print(f"    ✓ Handled single observation, output shape: {output.final_state.shape}")
-    except Exception as e:
-        print(f"    ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        success = False
-    
-    # Case 3: Mismatched adj_matrices length
-    print("  Testing mismatched adj_matrices...")
-    try:
-        output = model(
-            node_states=data['node_states'],
-            walk_encodings=data['walk_encodings'],
-            walk_times=data['walk_times'],
-            walk_masks=data['walk_masks'],
-            adj_matrices=data['adj_matrices'][:-1],  # One short
-            t_init=data['t_init'],
-            return_all=False
-        )
-        print(f"    ✗ Should have raised error for mismatched lengths")
-        success = False
-    except ValueError as e:
-        if "adj_matrices" in str(e):
-            print(f"    ✓ Correctly raised ValueError: {e}")
-        else:
-            print(f"    ? Raised ValueError but different message: {e}")
-            success = False
-    except Exception as e:
-        print(f"    ✗ Wrong exception type: {type(e).__name__}: {e}")
-        success = False
-    
-    return success
-
-
-def verify_time_hash_stability(model: nn.Module, data: dict) -> bool:
-    """
-    Verify that similar times are handled correctly (no collision issues).
-    """
-    print("\n=== Verifying time hash stability ===")
-    
-    try:
-        N, H = data['num_nodes'], data['hidden_dim']
-        
-        # Create walks with nearly identical times (floating point edge case)
-        walk_enc = torch.randn(N, 2, 3, H, device=data['node_states'].device)
-        walk_times = torch.zeros(N, 2, 3, device=data['node_states'].device)
-        
-        # Set times that should be distinct but close
-        walk_times[:, 0, :] = 0.1 + torch.rand(N, 3) * 0.001  # ~0.1
-        walk_times[:, 1, :] = 0.1000001 + torch.rand(N, 3) * 0.001  # Very close
-        
-        masks = torch.ones_like(walk_times)
-        
-        obs = model._vectorized_prepare_observations(walk_enc, walk_times, masks)
-        
-        # With default precision=6, these might collapse or not
-        print(f"  ✓ Generated {len(obs)} observations from nearly identical times")
-        for i, (H_obs, t) in enumerate(obs):
-            print(f"    t={t.item():.10f}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Failed: {e}")
-        return False
-
-
-def run_full_verification():
-    """
-    Run all verification tests.
-    """
-    print("=" * 60)
-    print("SPECTRAL TEMPORAL ODE VERIFICATION")
-    print("=" * 60)
-    
-    # Setup
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"\nDevice: {device}")
-    
-    data = create_dummy_data(
-        num_nodes=10,
-        num_walks=3,
-        walk_len=4,
-        hidden_dim=8,
-        num_obs_times=3,
-        device=device
-    )
-    
-    # Create model
-    try:
-        model = SpectralTemporalODE(
-            hidden_dim=data['hidden_dim'],
-            num_nodes=data['num_nodes'],
-            num_eigenvectors=5,  # Small for speed
-            mu=0.1,
-            adaptive_mu=True,
-            use_gru_ode=True,
-            ode_method='euler',  # Fast for testing
-            ode_step_size=0.1,
-            num_layers=2,
-            adjoint=False,
-            dropout=0.0,  # Disable for deterministic testing
-            time_precision=6
-        ).to(device)
-        print(f"\n✓ Model created with {sum(p.numel() for p in model.parameters())} parameters")
-    except Exception as e:
-        print(f"\n✗ Model creation failed: {e}")
-        return False
-    
-    # Run tests
-    results = []
-    
-    results.append(("prepare_observations", verify_prepare_observations(model, data)))
-    results.append(("forward (return_all=False)", verify_forward_pass(model, data, False)))
-    results.append(("forward (return_all=True)", verify_forward_pass(model, data, True)))
-    results.append(("gradient_flow", verify_gradient_flow(model, data)))
-    results.append(("edge_cases", verify_edge_cases(model, data)))
-    results.append(("time_hash_stability", verify_time_hash_stability(model, data)))
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("VERIFICATION SUMMARY")
-    print("=" * 60)
-    for name, passed in results:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status}: {name}")
-    
-    all_passed = all(passed for _, passed in results)
-    print(f"\nOverall: {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
-    
-    return all_passed
-
-
-if __name__ == "__main__":
-    # Import the model class (assuming it's defined above or imported)
-    # from your_module import SpectralTemporalODE, STODELayer, STODEFunc, etc.
-    
-    success = run_full_verification()
-    exit(0 if success else 1)

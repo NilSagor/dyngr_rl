@@ -157,7 +157,10 @@ class TGNv6(BaseEnhancedTGN):
                 similarity_metric=similarity_metric,
                 dropout=dropout
             )            
-            logger.info(f"SAM initialized: {num_prototypes} prototypes, {similarity_metric} similarity")
+            sam_info = f"SAM({num_prototypes}p) + " if self.use_sam else ""
+            logger.info(f"TGNv6 initialized: {sam_info}WalkSampler + "
+                        f"{'HCT(' + str(hct_d_model) + 'd, ' + str(hct_nhead) + 'h)' if use_hct else 'SimpleWalkEncoder'}")
+            
         else:
             self.sam_module = None
             logger.info(f"SAM disabled – using base TGN memory")
@@ -922,9 +925,7 @@ class TGNv6(BaseEnhancedTGN):
         
         if hasattr(self, 'fusion_layer'):
             torch.nn.utils.clip_grad_norm_(self.fusion_layer.parameters(), max_norm=0.5)
-        # if hasattr(self, 'embedding_module') and self.embedding_module is not None:
-        #     torch.nn.utils.clip_grad_norm_(self.embedding_module.parameters(), max_norm=0.5)
-
+       
         for name, param in self.named_parameters():
             if param.grad is not None and torch.isnan(param.grad).any():
                 logger.error(f"NaN gradient detected in {name}")

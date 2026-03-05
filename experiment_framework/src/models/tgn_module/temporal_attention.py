@@ -137,71 +137,42 @@ class TemporalAttentionLayer(nn.Module):
         attn_output = self.merger(attn_output, src_node_features)
         return attn_output, attn_output_weights
     
-    src_node_features_unrolled = torch.unsqueeze(src_node_features, dim=1)
+    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1)  # [batch_size]
+    if invalid_neighborhood_mask.any():
+        # Set the first neighbor as valid for these nodes.
+        # The neighbor features are already zero (padding), so the attention will
+        # produce zero output, which is safe and matches the original TGN behavior.
+        neighbors_padding_mask[invalid_neighborhood_mask, 0] = False
 
-    query = torch.cat([src_node_features_unrolled, src_time_features], dim=2)
-    key = torch.cat([neighbors_features, edge_features, neighbors_time_features], dim=2)
+    src_node_features_unrolled = src_node_features.unsqueeze(1)          # [batch, 1, feat]
+
+    query = torch.cat([src_node_features_unrolled, src_time_features], dim=2)  # [batch, 1, query_dim]
+    key   = torch.cat([neighbors_features, edge_features, neighbors_time_features], dim=2)  # [batch, n_neighbors, key_dim]
 
     # print(neighbors_features.shape, edge_features.shape, neighbors_time_features.shape)
     # Reshape tensors so to expected shape by multi head attention
-    query = query.permute([1, 0, 2])  # [1, batch_size, num_of_features]
-    key = key.permute([1, 0, 2])  # [n_neighbors, batch_size, num_of_features]
+    query = query.permute(1, 0, 2)   # [1, batch, query_dim]
+    key   = key.permute(1, 0, 2)     # [n_neighbors, batch, key_dim]
 
-    # Reshape for multi-head attention
-    # query = query.permute([1, 0, 2])  # [1, batch, 344]
-    # key   = key.permute([1, 0, 2])    # [n_neighbors, batch, ?]
-    
-    # Compute mask of which source nodes have no valid neighbors
-    # invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
-    # If a source node has no valid neighbor, set it's first neighbor to be valid. This will
-    # force the attention to just 'attend' on this neighbor (which has the same features as all
-    # the others since they are fake neighbors) and will produce an equivalent result to the
-    # original tgat paper which was forcing fake neighbors to all have same attention of 1e-10
-    # neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
-
-    # print(query.shape, key.shape)
-
-    # Handle zero neighbors edge case
-    # invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
-    # if invalid_neighborhood_mask.any() and neighbors_padding_mask.size(1) > 0:  
-    #     neighbors_padding_mask[invalid_neighborhood_mask.squeeze(), 0] = False
-
-    # attn_output, attn_output_weights = self.multi_head_target(query=query, key=key, value=key,
-    #                                                           key_padding_mask=neighbors_padding_mask)
-
-    
-    # Multi-head attention (output dim = embed_dim = 344)
+    # Multi-head attention
     attn_output, attn_output_weights = self.multi_head_target(
-        query=query, key=key, value=key,
+        query=query,
+        key=key,
+        value=key,
         key_padding_mask=neighbors_padding_mask
     )
+
+    # Reshape outputs
+    attn_output = attn_output.squeeze(0)          # [batch, query_dim]
+    attn_output_weights = attn_output_weights.squeeze(0)  # [batch, n_neighbors]
     
-    
-    # mask = torch.unsqueeze(neighbors_padding_mask, dim=2)  # mask [B, N, 1]
-    # mask = mask.permute([0, 2, 1])
-    # attn_output, attn_output_weights = self.multi_head_target(q=query, k=key, v=key,
-    #                                                           mask=mask)
+    # Zero out the attention output for nodes that originally had no neighbors
+    # (this is redundant but harmless; the output is already zero due to the fix)
+    attn_output = attn_output.masked_fill(invalid_neighborhood_mask.unsqueeze(-1), 0)
 
     
-
-    attn_output = attn_output.squeeze()          # [batch, 344]
-    attn_output_weights = attn_output_weights.squeeze()
-    
-    # Source nodes with no neighbors have an all zero attention output. The attention output is
-    # then added or concatenated to the original source node features and then fed into an MLP.
-    # This means that an all zero vector is not used.
-    # Mask invalid neighborhoods
-    invalid_neighborhood_mask = neighbors_padding_mask.all(dim=1, keepdim=True)
-    attn_output = attn_output.masked_fill(invalid_neighborhood_mask, 0)
-    # attn_output_weights = attn_output_weights.masked_fill(invalid_neighborhood_mask, 0)
-
-    # Skip connection with temporal attention over neighborhood and the features of the node itself    
+    # Merge with original source features
     attn_output = self.merger(attn_output, src_node_features)
-
-
-    # print(f"src_time_features shape: {src_time_features.shape}")
-    # print(f"query shape before attention: {query.shape}")
-    # print(f"attn_output shape after attention: {attn_output.shape}")
 
     return attn_output, attn_output_weights
   

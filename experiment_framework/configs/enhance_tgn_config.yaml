@@ -19,26 +19,27 @@ model:
   n_neighbors: 20
   memory_updater_type: 'gru'  
   #SAM
-  use_sam: false
-  debug_simple_walk: false
+  use_sam: True # debug false,
   #HCT
   hct_d_model: 64  # Smaller dimension
   hct_nhead: 2     # Fewer heads
   # dropout: 0.0,     # No dropout during debugs  
-  use_hct: false
+  debug_simple_walk: False # if hct True, simple_walk False 
+  use_hct: True # hct activate
   # ST ODE
   mu: 0.0
-  adaptive_mu: true
-  use_st_ode: false
+  adaptive_mu: True
+  use_st_ode: True
   ode_method: rk4
   ode_step_size: 10000   # increase step size to reduce steps
   adjoint: true
-  use_checkpoint: true
-  
+  use_checkpoint: True
+
+
 # Training parameters
 training:
   batch_size: 512 # 200 
-  learning_rate: 0.001
+  learning_rate: 0.00001
   weight_decay: 0.0001
   max_epochs: 100
   patience: 5 # 3/5/10
@@ -46,7 +47,6 @@ training:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
   log_every_n_steps: 10
-  learning_rate: 0.00001
   lr_scheduler: "reduce_on_plateau"
   lr_patience: 3
   lr_factor: 0.5
