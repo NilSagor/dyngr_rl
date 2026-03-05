@@ -82,12 +82,12 @@ class IntraWalkEncoder(nn.Module):
         if walk_embeddings.dim() == 5:
             if walk_embeddings.size(0) == 1:
                 logger.warning(f"Walk embeddings is 5D {walk_embeddings.shape}, squeezing dim 0")
-                walk_embeddings = walk_embeddings.squeeze(0)
+                walk_embeddings = walk_embeddings.reshape(*walk_embeddings.shape[1:])
                 # FIX: Also squeeze walk_masks consistently
                 if walk_masks.dim() == 5:
-                    walk_masks = walk_masks.squeeze(0)
+                    walk_masks = walk_masks.reshape(*walk_masks.shape[1:])
                 elif walk_masks.dim() == 4:
-                    walk_masks = walk_masks.squeeze(0)
+                    walk_masks = walk_masks.reshape(*walk_masks.shape[1:])
             else:
                 # FIX: Properly handle 5D with batch>1 by flattening batch dimensions
                 logger.warning(f"Walk embeddings is 5D with batch>1 {walk_embeddings.shape}, flattening")
@@ -477,7 +477,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         if node_embeddings.dim() == 5:
             if node_embeddings.size(0) == 1:
                 logger.warning(f"Walk embeddings is 5D {node_embeddings.shape}, squeezing dim 0")
-                node_embeddings = node_embeddings.squeeze(0)
+                node_embeddings = node_embeddings.reshape(*node_embeddings.shape[1:])
             else:
                 logger.warning(f"Walk embeddings is 5D with batch>1, flattening")
                 node_embeddings = node_embeddings.view(-1, *node_embeddings.shape[2:])
@@ -661,7 +661,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             for name, tensor in [('nodes', nodes), ('nodes_anon', nodes_anon), ('masks', masks)]:
                 if tensor.dim() == 4 and tensor.size(0) == 1:
                     logger.warning(f"Walk {name} is 4D with leading dim=1 {tensor.shape}, squeezing dim 0")
-                    tensor = tensor.squeeze(0)
+                    tensor = tensor.reshape(*tensor.shape[1:])
                     data[name] = tensor
             
             nodes = data['nodes']
@@ -700,7 +700,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             if type_name == 'tawr' and 'restart_flags' in data:
                 restart_flags = data['restart_flags']
                 if restart_flags.dim() == 4 and restart_flags.size(0) == 1:
-                    restart_flags = restart_flags.squeeze(0)
+                    restart_flags = restart_flags.reshape(*restart_flags.shape[1:])
                 # Validate restart_flags range before embedding lookup
                 if restart_flags.min().item() < 0 or restart_flags.max().item() > 1:
                     logger.warning(f"restart_flags out of range [0,1], clamping")

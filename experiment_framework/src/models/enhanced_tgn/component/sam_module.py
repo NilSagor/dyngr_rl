@@ -114,7 +114,7 @@ class SAMCell(nn.Module):
 
         # Use larger epsilon for temperature scaling
         temp = self.temperature.clamp(self.temperature_min, self.temperature_max)
-        return sim / (temp + 1e-2)  # FIX: Larger epsilon for stability
+        return sim / (temp + 1e-3)  # Larger epsilon for stability
         
         
     def forward(self, raw_memory, node_features, edge_features, time_encoding, prototypes, node_mask=None):
@@ -346,36 +346,18 @@ class StabilityAugmentedMemory(nn.Module):
             self.raw_memory.data = torch.nan_to_num(
                 self.raw_memory.data, nan=0.0, posinf=0.0, neginf=0.0
             )
-
-        
-        # Validate memory state
-        # if not torch.isfinite(self.raw_memory).all():
-        #     logger.warning("Memory contains NaN/Inf, resetting affected nodes...")
-        #     nan_mask = ~torch.isfinite(self.raw_memory).any(dim=-1)
-        #     self.raw_memory[nan_mask] = 0
-        #     self.last_update[nan_mask] = 0
-        
-        edge_proj = self._safe_edge_projection(edge_features, batch_size)
-        edge_proj = _align_batch_size(edge_proj, batch_size, "edge_proj")
-   
-        # if edge_features is not None and edge_features.numel() > 0:
-        #     edge_proj = self.edge_proj(edge_features)
-        #     # FIX 8: Check for NaN BEFORE normalization
-        #     edge_proj = _sanitize_tensor(edge_proj, "edge_proj")
+     
+              
+        if edge_features is not None and edge_features.numel() > 0:
+            edge_proj = self.edge_proj(edge_features)
+            edge_proj = _sanitize_tensor(edge_proj, "edge_proj")
             
-        #     edge_proj_norm = edge_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        #     # FIX 3: Check for near-zero norms before division
-        #     # near_zero_mask = edge_proj_norm < 1e-6
-        #     # edge_proj_norm = torch.where(near_zero_mask, torch.ones_like(edge_proj_norm), edge_proj_norm)
-        #     # edge_proj = (edge_proj / edge_proj_norm) * 10.0
-        #     # edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
-        #     edge_proj = (edge_proj / edge_proj_norm) * 10.0
-        #     edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
-        # else:
-        #     edge_proj = torch.zeros(batch_size, self.memory_dim, device=source_nodes.device)
-        
-        
-        
+            # Safer normalization - clamp norm before division
+            edge_proj_norm = edge_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            edge_proj = (edge_proj / edge_proj_norm) * 10.0
+            edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
+        else:
+            edge_proj = torch.zeros(batch_size, self.memory_dim, device=source_nodes.device)
         
         # Time encoding
         time_enc = self.time_encoder(current_time)
@@ -446,27 +428,30 @@ class StabilityAugmentedMemory(nn.Module):
             all_updates = torch.cat([src_new, tgt_new])
             all_times = torch.cat([current_time, current_time])     
            
-            sorted_indices = torch.argsort(all_times, stable=True)
-            sorted_nodes = all_nodes[sorted_indices]
-            sorted_updates = all_updates[sorted_indices]
+            # sorted_indices = torch.argsort(all_times, stable=True)
+            # sorted_nodes = all_nodes[sorted_indices]
+            # sorted_updates = all_updates[sorted_indices]
 
-            unique_nodes = torch.unique(sorted_nodes, return_inverse=False, return_counts=False)
+            unique_nodes = torch.unique(all_nodes)
                         
-            final_updates = torch.zeros_like(self.raw_memory[unique_nodes])
-            final_times = torch.zeros(len(unique_nodes), device=self.raw_memory.device)
+            # final_updates = torch.zeros_like(self.raw_memory[unique_nodes])
+            # final_times = torch.zeros(len(unique_nodes), device=self.raw_memory.device)
             
             for i, node in enumerate(unique_nodes):
-                mask = sorted_nodes == node
-                if mask.any():
-                    # Take last update (highest index in sorted order)
-                    last_idx = torch.where(mask)[0][-1]
-                    final_updates[i] = sorted_updates[last_idx]
-                    final_times[i] = all_times[sorted_indices][last_idx]
-            
-            self.raw_memory[unique_nodes] = final_updates
-            self.last_update[unique_nodes] = final_times
-                                  
-            
+                mask = (all_nodes == node)
+                if not mask.any():
+                    continue
+
+                node_updates = all_updates[mask]
+                node_times = all_times[mask]
+
+                time_weights = F.softmax(node_times.float(), dim=0)
+                weighted_update = (node_updates * time_weights.unsqueeze(-1)).sum(dim=0)
+
+                # Update memory
+                self.raw_memory[node] = weighted_update
+                self.last_update[node] = node_times.max()
+    
             self.raw_memory.data = torch.nan_to_num(
                 self.raw_memory.data,
                 nan=0.0,

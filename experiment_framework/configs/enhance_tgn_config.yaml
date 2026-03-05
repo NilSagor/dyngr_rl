@@ -18,11 +18,14 @@ model:
   use_memory: true
   n_neighbors: 20
   memory_updater_type: 'gru'  
+  #SAM
+  use_sam: false
+  debug_simple_walk: false
   #HCT
   hct_d_model: 64  # Smaller dimension
   hct_nhead: 2     # Fewer heads
   # dropout: 0.0,     # No dropout during debugs  
-  use_hct: true
+  use_hct: false
   # ST ODE
   mu: 0.0
   adaptive_mu: true

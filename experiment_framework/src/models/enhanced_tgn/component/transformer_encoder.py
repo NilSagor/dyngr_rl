@@ -3,15 +3,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Dict, List, Tuple, Optional, Union
-import numpy as np
-
-
-
-
+from loguru import logger
 import torch
 import torch.nn as nn
 
 # from utils.utils import MergeLayer
+
+def _sanitize_tensor(
+    x: torch.Tensor, 
+    name: str = "tensor", 
+    nan_val: float = 0.0, 
+    inf_val: float = 10.0,
+    neg_inf_val: float = -10.0
+) -> torch.Tensor:
+    """Helper: sanitize tensor for NaN/Inf with consistent logging."""
+    if not torch.isfinite(x).all():
+        has_nan = torch.isnan(x).any().item()
+        has_inf = torch.isinf(x).any().item()
+        logger.warning(f"NaN/Inf in {name}: shape={x.shape}, has_nan={has_nan}, has_inf={has_inf}")
+        return torch.nan_to_num(x, nan=nan_val, posinf=inf_val, neginf=neg_inf_val)
+    return x
+
 
 class MergeLayer(nn.Module):
     """
@@ -112,7 +124,24 @@ class PositionalEncoding(nn.Module):
         Returns:
             [batch_size, seq_len, d_model] with positional encoding added
         """
-        return x + self.pe[:, :x.size(1), :]
+        # Sanitize input before adding positional encoding
+        x = _sanitize_tensor(x, "pos_enc_input")
+
+        # Validate shape compatibility
+        if x.size(-1) != self.pe.size(-1):
+            logger.error(f"Dimension mismatch in PositionalEncoding: x={x.shape}, pe={self.pe.shape}")
+            # Project x to match pe dimension
+            projection = nn.Linear(x.size(-1), self.pe.size(-1), device=x.device)
+            x = projection(x)
+
+        # Clamp positional encoding to prevent extreme values
+        pe_slice = self.pe[:, :x.size(1), :]
+        pe_slice = torch.clamp(pe_slice, -10.0, 10.0)
+        
+        result = x + pe_slice
+        
+        # Sanitize output
+        return _sanitize_tensor(result, "pos_enc_output")
     
 
 class MultiHeadAttention(nn.Module):
@@ -135,6 +164,12 @@ class MultiHeadAttention(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         self.scale = self.head_dim ** -0.5
+
+        # Initialize with smaller weights for stability
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
         
     def forward(
         self,
@@ -159,33 +194,74 @@ class MultiHeadAttention(nn.Module):
         batch_size, tgt_len, _ = query.shape
         src_len = key.size(1)
         
-        # Project and reshape for multi-head
-        Q = self.q_proj(query).view(batch_size, tgt_len, self.nhead, self.head_dim).transpose(1, 2)
-        K = self.k_proj(key).view(batch_size, src_len, self.nhead, self.head_dim).transpose(1, 2)
-        V = self.v_proj(value).view(batch_size, src_len, self.nhead, self.head_dim).transpose(1, 2)
+         # Sanitize inputs before projection
+        query = _sanitize_tensor(query, "attn_query_input")
+        key = _sanitize_tensor(key, "attn_key_input")
+        value = _sanitize_tensor(value, "attn_value_input")
+        
+        # Reshape for multi-head
+        Q = query.view(batch_size, tgt_len, self.nhead, self.head_dim).transpose(1, 2)
+        K = key.view(batch_size, src_len, self.nhead, self.head_dim).transpose(1, 2)
+        V = value.view(batch_size, src_len, self.nhead, self.head_dim).transpose(1, 2)
+        
+        # Validate reshaped tensors
+        if not torch.isfinite(Q).all() or not torch.isfinite(K).all() or not torch.isfinite(V).all():
+            logger.error("NaN after view/transpose in attention!")
+            Q = torch.nan_to_num(Q, nan=0.0)
+            K = torch.nan_to_num(K, nan=0.0)
+            V = torch.nan_to_num(V, nan=0.0)
         
         # Compute attention scores
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [batch, nhead, tgt_len, src_len]
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        
+        # Clamp scores before adding bias to prevent explosion
+        attn_scores = torch.clamp(attn_scores, -50.0, 50.0)
         
         # Add attention bias if provided
         if attn_bias is not None:
+            # Sanitize bias before adding
+            attn_bias = _sanitize_tensor(attn_bias, "attn_bias")
+            attn_bias = torch.clamp(attn_bias, -10.0, 10.0)
             attn_scores = attn_scores + attn_bias
+        
+        # Re-clamp after bias addition
+        attn_scores = torch.clamp(attn_scores, -100.0, 100.0)
         
         # Apply key padding mask
         if key_padding_mask is not None:
+            # FIX 7: Use finite mask value instead of -inf to prevent NaN in softmax
             attn_scores = attn_scores.masked_fill(
                 key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
+                -1e4  # Large negative but not -inf
             )
         
-        # Softmax
+        # Softmax with numerical stability
+        # Subtract max for numerical stability before softmax
+        attn_scores_max = attn_scores.max(dim=-1, keepdim=True)[0]
+        attn_scores = attn_scores - attn_scores_max
+        
         attn_weights = F.softmax(attn_scores, dim=-1)
+        
+        # Validate weights (should sum to 1)
+        if not torch.isfinite(attn_weights).all():
+            logger.error("NaN in attention weights after softmax!")
+            attn_weights = torch.nan_to_num(attn_weights, nan=1.0 / attn_weights.size(-1))
+            # Renormalize
+            attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        
         attn_weights = self.dropout(attn_weights)
         
         # Apply attention to values
-        output = torch.matmul(attn_weights, V)  # [batch, nhead, tgt_len, head_dim]
+        output = torch.matmul(attn_weights, V)
+        
+        # Sanitize output of attention
+        output = _sanitize_tensor(output, "attn_output_pre_reshape")
+        
         output = output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.d_model)
         output = self.out_proj(output)
+        
+        # Final sanitization
+        output = _sanitize_tensor(output, "attn_output_final")
         
         if need_weights:
             return output, attn_weights
@@ -211,6 +287,10 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         
         self.activation = F.relu
+
+        # Initialize FFN layers with smaller weights
+        nn.init.xavier_uniform_(self.linear1.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.linear2.weight, gain=0.1)
         
     def forward(
         self,
@@ -224,18 +304,38 @@ class TransformerEncoderLayer(nn.Module):
             attn_bias: Optional attention bias
             key_padding_mask: [batch_size, seq_len] mask for padded positions
         """
+        # Sanitize input
+        x = _sanitize_tensor(x, "transformer_layer_input")
+        
         # Pre-norm architecture
         residual = x
         x = self.norm1(x)
         x, _ = self.self_attn(x, x, x, attn_bias, key_padding_mask)
         x = self.dropout1(x)
+        
+        # Sanitize before residual addition
+        x = _sanitize_tensor(x, "transformer_post_attn")
         x = residual + x
+        
+        # Sanitize after first residual
+        x = _sanitize_tensor(x, "transformer_post_residual1")
         
         # FFN
         residual = x
         x = self.norm2(x)
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        
+        # Clamp FFN activations to prevent ReLU explosion
+        x = self.linear1(x)
+        x = _sanitize_tensor(x, "transformer_ffn_hidden")
+        x = self.activation(x)
+        x = torch.clamp(x, 0.0, 20.0)  # ReLU is already >= 0, clamp upper bound
+        
+        x = self.linear2(x)
         x = self.dropout2(x)
+        
+        # Sanitize before final residual
+        x = _sanitize_tensor(x, "transformer_post_ffn")
         x = residual + x
         
-        return x
+        # Final sanitization
+        return _sanitize_tensor(x, "transformer_layer_output")
