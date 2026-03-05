@@ -11,7 +11,7 @@ from ..component.time_encoder import TimeEncoder
 from ..component.sam_module import StabilityAugmentedMemory
 from ..component.multi_swalk import MultiScaleWalkSampler
 from ..component.walk_encoder import WalkEncoder
-from ..component.co_transformer import HierarchicalCooccurrenceTransformer
+from ..component.hct_module import HierarchicalCooccurrenceTransformer
 
 
 class TGNv5(BaseEnhancedTGN):

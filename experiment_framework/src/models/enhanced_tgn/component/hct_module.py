@@ -83,22 +83,36 @@ class IntraWalkEncoder(nn.Module):
             if walk_embeddings.size(0) == 1:
                 logger.warning(f"Walk embeddings is 5D {walk_embeddings.shape}, squeezing dim 0")
                 walk_embeddings = walk_embeddings.squeeze(0)
-                walk_masks = walk_masks.squeeze(0)
+                # FIX: Also squeeze walk_masks consistently
+                if walk_masks.dim() == 5:
+                    walk_masks = walk_masks.squeeze(0)
+                elif walk_masks.dim() == 4:
+                    walk_masks = walk_masks.squeeze(0)
             else:
+                # FIX: Properly handle 5D with batch>1 by flattening batch dimensions
                 logger.warning(f"Walk embeddings is 5D with batch>1 {walk_embeddings.shape}, flattening")
-                walk_embeddings = walk_embeddings.view(-1, *walk_embeddings.shape[2:])
-                walk_masks = walk_masks.view(-1, *walk_masks.shape[2:])
+                batch_dim = walk_embeddings.size(0) * walk_embeddings.size(1)
+                walk_embeddings = walk_embeddings.view(batch_dim, *walk_embeddings.shape[2:])
+                # FIX: Handle masks consistently
+                if walk_masks.dim() == 5:
+                    walk_masks = walk_masks.view(batch_dim, *walk_masks.shape[2:])
+                elif walk_masks.dim() == 4:
+                    walk_masks = walk_masks.view(batch_dim, *walk_masks.shape[2:])
         
         if walk_embeddings.dim() != 4:
             raise ValueError(f"Expected 4D walk_embeddings, got {walk_embeddings.dim()}D: {walk_embeddings.shape}")
         
+        if walk_masks.dim() != 3:
+                logger.warning(f"walk_masks has wrong dim {walk_masks.dim()}, expected 3D")
+                # Try to reshape to match
+                if walk_masks.numel() == walk_embeddings.size(0) * walk_embeddings.size(1) * walk_embeddings.size(2):
+                    walk_masks = walk_masks.view(walk_embeddings.size(0), walk_embeddings.size(1), walk_embeddings.size(2))
+            
         walk_embeddings = _sanitize_tensor(walk_embeddings, "walk_embeddings")
-        
-        batch_size, num_walks, walk_len, d_model = walk_embeddings.shape
-        
        
-        # Combine batch and num_walks dimensions
-        # Flatten for parallel processing
+          
+        batch_size, num_walks, walk_len, d_model = walk_embeddings.shape
+               
         
         # Reshape to process all walks in parallel
         x = walk_embeddings.view(batch_size * num_walks, walk_len, d_model)
@@ -116,10 +130,7 @@ class IntraWalkEncoder(nn.Module):
             x = layer(x, key_padding_mask=key_padding_mask)
             # Sanitize after each layer
             x = _sanitize_tensor(x, "transformer_layer_output")
-            # if not torch.isfinite(x).all():
-            #     logger.warning("NaN in IntraWalkEncoder transformer layer output")
-            #     x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+            
         x = self.norm_proj(x)
 
         # Reshape back BEFORE pooling
@@ -332,7 +343,7 @@ class InterWalkTransformer(nn.Module):
         if cooccurrence.shape != (batch_size, num_walks, num_walks):
             logger.error(f"Shape mismatch: walk_summaries={walk_summaries.shape}, cooccurrence={cooccurrence.shape}")
             raise ValueError(f"Cooccurrence shape {cooccurrence.shape} doesn't match expected ({batch_size}, {num_walks}, {num_walks})")
-
+        
         # Sanitize cooccurrence BEFORE using as attention bias
         cooccurrence = _sanitize_tensor(cooccurrence, "cooccurrence", inf_val=1.0)
         cooccurrence = torch.clamp(cooccurrence, -5.0, 5.0)
@@ -505,7 +516,11 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             }
         
         # Step 3: Inter-walk transformer
-        refined_walks = self.inter_walk_transformer(walk_summaries, cooccurrence, walk_level_mask)
+        refined_walks = self.inter_walk_transformer(
+            walk_summaries, 
+            cooccurrence, 
+            walk_level_mask
+        )
         
         result = {
             'encoded_walks': encoded_walks,
@@ -532,7 +547,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
         all_walks = []
         all_masks = []
         
-        for name, output in [('short', short_output), ('long', long_output), ('tawr', tawr_output)]:
+        for _, output in [('short', short_output), ('long', long_output), ('tawr', tawr_output)]:
             refined = output['refined_walks']
             masks = output['walk_masks']
             all_walks.append(refined)
@@ -563,7 +578,6 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             attention_weights[all_masked] = 1.0 / total_walks
         
         attention_weights = attention_weights.unsqueeze(-1)       
-        
         
         # Hybrid pooling: 50% mean, 50% attention        
         valid_mask_sum = all_masks.sum(dim=-1, keepdim=True)
@@ -627,15 +641,20 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             
             # FIX: Validate node indices BEFORE memory lookup
             if nodes.max().item() >= node_memory.size(0) or nodes.min().item() < 0:
-                logger.error(f"Invalid node index in walks! Clamping...")
+                logger.error(f"Invalid node index in walks! Max: {nodes.max().item()}, Min: {nodes.min().item()}, Memory size: {node_memory.size(0)}. Clamping...")
                 nodes = torch.clamp(nodes, 0, node_memory.size(0) - 1)
                 data['nodes'] = nodes
 
             if not torch.isfinite(nodes.float()).all():
-                logger.error("NaN in walk node indices!")
+                logger.error("NaN/Inf in walk node indices! Replacing with zeros")
                 nodes = torch.zeros_like(nodes).long()
                 data['nodes'] = nodes
 
+            
+            if nodes.dtype != torch.long and nodes.dtype != torch.int64:
+                logger.warning(f"Converting nodes from {nodes.dtype} to long")
+                nodes = nodes.long()
+                data['nodes'] = nodes
             
             # Safe dimension handling
             # FIX 2: Consistent 5D handling - only squeeze leading batch dim if size==1
@@ -656,9 +675,16 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
   
             # FIX 3: Validate flat_nodes before indexing
             if flat_nodes.max().item() >= node_memory.size(0) or flat_nodes.min().item() < 0:
-                logger.error(f"Invalid flat node index! Clamping...")
+                logger.error(f"Invalid flat node index! Max: {flat_nodes.max().item()}, Min: {flat_nodes.min().item()}, Memory size: {node_memory.size(0)}. Clamping...")
                 flat_nodes = torch.clamp(flat_nodes, 0, node_memory.size(0) - 1)
-
+            
+            if not torch.isfinite(flat_nodes.float()).all():
+                logger.error("NaN in flat_nodes! Replacing with zeros")
+                flat_nodes = torch.zeros_like(flat_nodes)
+            
+            if flat_nodes.dtype != torch.long:
+                flat_nodes = flat_nodes.long()
+            
             accessed_memory = node_memory[flat_nodes]
             accessed_memory = _sanitize_tensor(accessed_memory, "accessed_memory")
             

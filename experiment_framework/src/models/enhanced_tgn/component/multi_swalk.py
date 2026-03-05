@@ -3,8 +3,6 @@ import torch.nn as nn
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
-from collections import defaultdict
-import random
 from loguru import logger
 
 from .time_encoder import TimeEncoder
