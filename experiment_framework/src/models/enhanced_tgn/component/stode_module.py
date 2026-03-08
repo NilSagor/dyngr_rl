@@ -10,13 +10,13 @@ from collections import OrderedDict
 
 _DEBUG = bool(os.environ.get("DEBUG_GRADIENTS", ""))
 
-
+# GRU-inspired ODE function: dh/dt = (1-z) * (\tilde_h - h)
+#      where z = \sigma(W_z h), r = \sigma(W_r h), \tilde_h = tanh(W_h(r⊙h) + t_mod)
 # GRU-ODE cell
 
 class GRUODECell(nn.Module):
     """
-    GRU-inspired ODE function: dh/dt = (1-z) * (\tilde_h - h)
-    where z = \sigma(W_z h), r = \sigma(W_r h), \tilde_h = tanh(W_h(r⊙h) + t_mod)
+     ODE function
     """
 
     def __init__(self, hidden_dim: int):
@@ -294,14 +294,18 @@ class STODEFuncWithSpectral(nn.Module):
         self._adj = adj
         
     
-    def forward(self, t: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    def forward(self, t: torch.Tensor, h_flat: torch.Tensor) -> torch.Tensor:
         # Reshape for batch processing (if needed)
-        # batch_mode = len(H.shape) == 3  # [B, N, H]
-        # if batch_mode:
+        # if H.dim() == 1:
+        #     # Flattened from [N, H] to [N*H]
+        #     H = H.view(self.num_nodes, self.hidden_dim)
+        # elif H.dim() == 3:
+        #     # Batch mode [B, N, H] - flatten batch into nodes
         #     B, N, H_dim = H.shape
-        #     H_flat = H.reshape(B*N, H_dim)
-        # else:
-        #     H_flat = H
+        #     H = H.view(B * N, H_dim)
+
+        H = h_flat.view(-1, self.hidden_dim)
+        N = H.size(0)
         
         # Temporal dynamics (same for all batches)
         # Path 1: Temporal evolution (no graph)
@@ -316,30 +320,16 @@ class STODEFuncWithSpectral(nn.Module):
             dh_dt_spat = dh_dt_spat + spectral_force
         
          # Fuse the two paths
-        dh_dt_fused = self.fusion(torch.cat([dh_dt_temp, dh_dt_spat], dim=-1))
+        # dh_dt_fused = self.fusion(torch.cat([dh_dt_temp, dh_dt_spat], dim=-1))
         
-        # Spectral regularization (per-interval adjacency)
-        # if self.spectral_reg is not None and self._adj_batch is not None:
-        #     # Get adj for current interval
-        #     if len(self._adj_batch.shape) == 3:  # Dynamic batch [B, N, N]
-        #         adj = self._adj_batch[self._current_interval]
-        #     else:  # Static graph [N, N]
-        #         adj = self._adj_batch
-            
-        #     # Apply spectral reg (reshape back to [N, H] for spectral reg)
-        #     if batch_mode:
-        #         H_reshaped = H_flat.reshape(B, N, H_dim)[self._current_interval]
-        #         spectral_term = self.spectral_reg(H_reshaped, adj)
-        #         spectral_term = spectral_term.unsqueeze(0).expand(B, -1, -1).reshape(B*N, H_dim)
-        #     else:
-        #         spectral_term = self.spectral_reg(H_flat, adj)
-            
-        #     dh_dt = dh_dt + spectral_term
+        # Fuse the two paths - concat on last dim
+        combined = torch.cat([dh_dt_temp, dh_dt_spat], dim=-1)  # [N, 2H]
+        dh_dt_fused = self.fusion(combined)  # [N, H]
         
-        # # Reshape back to batch format
-        # if batch_mode:
-        #     dh_dt = dh_dt.reshape(B, N, H_dim)
-        
+        # Flatten back for odeint if needed
+        if dh_dt_fused.dim() == 2:
+            dh_dt_fused = dh_dt_fused.view(-1)  # [N*H] 
+
         return dh_dt_fused
 
 
@@ -389,18 +379,22 @@ class STODEIntegrator(nn.Module):
     ) -> torch.Tensor:
         """Single integration step."""
         self.odefunc.set_adj_matrix(adj_matrix)
+
+        # Store original shape for reshaping
+        original_shape = h0.shape  # [N, H]
+        N, H = original_shape
         
-        shape = h0.shape
+        # Flatten for odeint: [N, H] -> [N*H]
         h0_flat = h0.reshape(-1)
-        
+
         # Create time tensor
         t = torch.tensor([t_span[0], t_span[1]], device=h0.device, dtype=h0.dtype)
 
         options = {}
         if self.step_size is not None:
             options['step_size'] = self.step_size
-        if self.max_steps is not None:
-            options['max_num_steps'] = self.max_steps
+        
+                
         
         traj = self.solver(
             func=self.odefunc,
@@ -412,7 +406,7 @@ class STODEIntegrator(nn.Module):
             options=options if options else None,
         )
         
-        return traj[-1].view(shape)
+        return traj[-1].view(original_shape)
 
     def batch_integrate(
         self,
@@ -452,7 +446,7 @@ class STODEIntegrator(nn.Module):
                 t_span=(t_start, t_end),
                 adj_matrix=adj_matrices[b]                
             )
-            H_current = H_ode_batch
+            H_current = H_ode_batch[b]
         
         return H_ode_batch
 
@@ -514,14 +508,26 @@ class STODELayer(nn.Module):
         H_current = H_init
 
         
+        if isinstance(adj_matrix, list):
+            # Convert list of [N,N] matrices to tensor [T, N, N]
+            if len(adj_matrix) > 0:
+                adj_matrix = torch.stack(adj_matrix, dim=0)
+            else:
+                # Fallback: create identity matrices
+                adj_matrix = torch.eye(self.num_nodes, device=H_init.device).unsqueeze(0).expand(T, -1, -1)
+        
+        # Now safe to check shape
+        is_dynamic = len(adj_matrix.shape) == 3  # [T, N, N]
+
         # Pre-validate/sort times
-        if not torch.is_sorted(obs_times):
-            sort_idx = torch.argsort(obs_times)
-            observations = observations[sort_idx]
-            obs_times = obs_times[sort_idx]
-            # Reorder dynamic adj if needed
-            if len(adj_matrix.shape) == 3:
-                adj_matrix = adj_matrix[sort_idx]
+        if T > 1:
+            sorted_times, sort_idx = torch.sort(obs_times)
+            # Check if actually needs sorting
+            if not torch.equal(obs_times, sorted_times):
+                observations = observations[sort_idx]
+                obs_times = sorted_times
+                if is_dynamic:
+                    adj_matrix = adj_matrix[sort_idx]
               
         
         # Create time spans for all intervals [t_prev, t_curr]   
@@ -537,12 +543,13 @@ class STODELayer(nn.Module):
         t_ends = obs_times
         t_spans = torch.stack([t_starts, t_ends], dim=1)  # [T, 2]
         
-        # Prepare adjacency batch (static → replicate to T intervals)
-        if len(adj_matrix.shape) == 2:  # Static graph [N,N]
+        if not is_dynamic:  # Static graph [N,N]
             adj_batch = adj_matrix.unsqueeze(0).expand(T, -1, -1)  # [T, N, N]
         else:  # Dynamic graph [T, N, N]
-            adj_batch = adj_matrix    
+            adj_batch = adj_matrix
         
+        
+             
         
         # Batch integrate all intervals (single call)
         H_ode_batch = self.integrator.batch_integrate(
