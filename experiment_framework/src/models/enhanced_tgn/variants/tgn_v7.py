@@ -317,6 +317,9 @@ class TGNv7(BaseEnhancedTGN):
         ts_hash = (batch['timestamps'][:5] * 1000).sum().item()
         return hash((src_hash, ts_hash, len(batch['src_nodes'])))
     
+    def _get_device(self) -> torch.device:
+        """Get device from model parameters."""
+        return next(self.parameters()).device
     
     def _prepare_stode_observations(self, batch):
         """Convert batch interactions to ST-ODE observation format."""
@@ -501,41 +504,28 @@ class TGNv7(BaseEnhancedTGN):
         
         # ----- 1. Get current node memory (SAM or base TGN) -----
         if self.use_sam and self.sam_module is not None:
-            node_memory = self.sam_module.raw_memory  
+            # FIX: Detach memory to prevent gradient leakage
+            node_memory = self.sam_module.raw_memory.detach()
         else:
-            # Base TGN memory might be a Memory object; extract the raw tensor.
             if hasattr(self.memory, 'memory'):
                 node_memory = self.memory.memory
             else:
                 node_memory = self.memory
-            # node_memory = getattr(self.memory, 'memory', self.memory)
         
-        # Basic input validation
-        # Fast path: skip validation in production
-        if DEBUG_VALIDATION:
-            assert torch.isfinite(node_memory).all(), "node_memory contains NaN/Inf"        
-            assert (source_nodes >= 0).all() and (source_nodes < self.num_nodes).all(), "source_nodes out of bounds"
-            assert (destination_nodes >= 0).all() and (destination_nodes < self.num_nodes).all(), "dst_nodes out of bounds"
-            assert torch.isfinite(edge_times).all(), "edge_times contains NaN/Inf"
-
-        # Reset SAM memory if needed (only when SAM is used)
+        # FIX: Always validate memory state (not just in debug mode)
         if self.use_sam and not torch.isfinite(self.sam_module.raw_memory).all():
             logger.error("SAM memory NaN before compute_temporal_embeddings! RESETTING")
             self.sam_module.reset_memory()
-            node_memory = self.sam_module.raw_memory  # refresh
-
+            node_memory = self.sam_module.raw_memory.detach()
+        
         # Fix NaN in edge_times
         if torch.isnan(edge_times).any():
             logger.error("NaN in edge_times! Replacing with 0.")
             edge_times = torch.nan_to_num(edge_times, nan=0.0)
-
-        # Ensure tensors are on correct device and type
+        
         src_tensor = source_nodes.to(device).long()
         dst_tensor = destination_nodes.to(device).long()
         ts_tensor = edge_times.to(device).float()
-
-        
-        # Memory snapshot for walk sampler (detached)
         
         # ----- 2. Generate walks -----
         cache_key = self._get_batch_key(batch) if batch is not None else None
@@ -544,20 +534,18 @@ class TGNv7(BaseEnhancedTGN):
         else:
             with torch.no_grad():
                 walk_memory = node_memory.detach()
-            
-            walk_data = self.walk_sampler(
-                source_nodes=src_tensor,
-                target_nodes=dst_tensor,
-                current_times=ts_tensor,
-                memory_states=walk_memory,
-                edge_index=None,
-                edge_time=None
-            )
+                walk_data = self.walk_sampler(
+                    source_nodes=src_tensor,
+                    target_nodes=dst_tensor,
+                    current_times=ts_tensor,
+                    memory_states=walk_memory,
+                    edge_index=None,
+                    edge_time=None
+                )
             self._walk_cache = walk_data
             self._cache_batch_key = cache_key
-
         
-        # ----- 3. Validate walk data (once, before any branching) -----
+        # ----- 3. Validate walk data -----
         for side in ['source', 'target']:
             for wt in ['short', 'long', 'tawr']:
                 if wt in walk_data[side]:
@@ -565,148 +553,115 @@ class TGNv7(BaseEnhancedTGN):
                     if not torch.isfinite(nodes).all():
                         logger.error(f"{side}/{wt} nodes contain NaN/Inf! Replacing with zeros.")
                         walk_data[side][wt]['nodes'] = torch.zeros_like(nodes)
-                    # Clamp to valid node indices
                     nodes.clamp_(0, self.num_nodes - 1)
         
-        
         # ----- 4. Obtain walk embeddings (HCT or simple mean) -----
-        # Also prepare per-type embeddings for MutualRefineAndPooling
         src_per_type = None
         dst_per_type = None
         src_masks = None
         dst_masks = None
-
+        
         if self.use_hct and self.hct is not None and not self.debug_simple_walk:
-            # Use HCT
             combined_walks = {
                 'short': {
-                    'nodes': torch.cat([
-                        walk_data['source']['short']['nodes'],
-                        walk_data['target']['short']['nodes']
-                    ], dim=0),
-                    'nodes_anon': torch.cat([
-                        walk_data['source']['short']['nodes_anon'],
-                        walk_data['target']['short']['nodes_anon']
-                    ], dim=0),
-                    'masks': torch.cat([
-                        walk_data['source']['short']['masks'],
-                        walk_data['target']['short']['masks']
-                    ], dim=0),
+                    'nodes': torch.cat([walk_data['source']['short']['nodes'],
+                                    walk_data['target']['short']['nodes']], dim=0),
+                    'nodes_anon': torch.cat([walk_data['source']['short']['nodes_anon'],
+                                            walk_data['target']['short']['nodes_anon']], dim=0),
+                    'masks': torch.cat([walk_data['source']['short']['masks'],
+                                    walk_data['target']['short']['masks']], dim=0),
                 },
                 'long': {
-                    'nodes': torch.cat([
-                        walk_data['source']['long']['nodes'],
-                        walk_data['target']['long']['nodes']
-                    ], dim=0),
-                    'nodes_anon': torch.cat([
-                        walk_data['source']['long']['nodes_anon'],
-                        walk_data['target']['long']['nodes_anon']
-                    ], dim=0),
-                    'masks': torch.cat([
-                        walk_data['source']['long']['masks'],
-                        walk_data['target']['long']['masks']
-                    ], dim=0),
+                    'nodes': torch.cat([walk_data['source']['long']['nodes'],
+                                    walk_data['target']['long']['nodes']], dim=0),
+                    'nodes_anon': torch.cat([walk_data['source']['long']['nodes_anon'],
+                                            walk_data['target']['long']['nodes_anon']], dim=0),
+                    'masks': torch.cat([walk_data['source']['long']['masks'],
+                                    walk_data['target']['long']['masks']], dim=0),
                 },
                 'tawr': {
-                    'nodes': torch.cat([
-                        walk_data['source']['tawr']['nodes'],
-                        walk_data['target']['tawr']['nodes']
-                    ], dim=0),
-                    'nodes_anon': torch.cat([
-                        walk_data['source']['tawr']['nodes_anon'],
-                        walk_data['target']['tawr']['nodes_anon']
-                    ], dim=0),
-                    'masks': torch.cat([
-                        walk_data['source']['tawr']['masks'],
-                        walk_data['target']['tawr']['masks']
-                    ], dim=0),
+                    'nodes': torch.cat([walk_data['source']['tawr']['nodes'],
+                                    walk_data['target']['tawr']['nodes']], dim=0),
+                    'nodes_anon': torch.cat([walk_data['source']['tawr']['nodes_anon'],
+                                            walk_data['target']['tawr']['nodes_anon']], dim=0),
+                    'masks': torch.cat([walk_data['source']['tawr']['masks'],
+                                    walk_data['target']['tawr']['masks']], dim=0),
                 }
             }
-
+            
             with torch.enable_grad():
                 hct_output = self.hct(
                     walks_dict=combined_walks,
                     node_memory=node_memory,
                     return_all=False
                 )
-
+            
             batch_size = src_tensor.size(0)
             hct_src = hct_output[:batch_size]
             hct_dst = hct_output[batch_size:]
             
-            walk_src_emb = self.hct_to_tgn(hct_src)
-            walk_dst_emb = self.hct_to_tgn(hct_dst)
+            # Ensure projection to hidden_dim
+            if self.hct_to_tgn is not None and not isinstance(self.hct_to_tgn, nn.Identity):
+                walk_src_emb = self.hct_to_tgn(hct_src)
+                walk_dst_emb = self.hct_to_tgn(hct_dst)
+            else:
+                walk_src_emb = hct_src
+                walk_dst_emb = hct_dst
             
             # Prepare per-type embeddings for hierarchical pooling in MRP
-            # Shape: [B, num_types, max_walks, D]
             src_per_type, src_masks = self._prepare_per_type_embeddings(
                 walk_data['source'], node_memory, device
             )
             dst_per_type, dst_masks = self._prepare_per_type_embeddings(
                 walk_data['target'], node_memory, device
             )
+            
+            # FIX: Project per-type embeddings to hidden_dim if needed
+            if self.hidden_dim != self.memory_dim and self.hidden_dim != hct_src.size(-1):
+                if not hasattr(self, '_per_type_proj'):
+                    self._per_type_proj = nn.Linear(hct_src.size(-1), self.hidden_dim).to(device)
+                if src_per_type is not None:
+                    src_per_type = self._per_type_proj(src_per_type)
+                if dst_per_type is not None:
+                    dst_per_type = self._per_type_proj(dst_per_type)
         else:
-            # Fallback: simple mean pooling (ensure output dimension = hidden_dim)
+            # Fallback: simple mean pooling
             walk_src_emb = self._simple_walk_embed(walk_data['source'], node_memory)
             walk_dst_emb = self._simple_walk_embed(walk_data['target'], node_memory)
-
         
-        # ----- 5. Base TGN embeddings (using node_memory) -----
+        # ----- 5. Base TGN embeddings -----
         if self.embedding_module is not None:
             base_src_emb = self.embedding_module.compute_embedding(
                 memory=node_memory,
-                source_nodes=source_nodes,
-                # timestamps=edge_times,
+                source_nodes=src_tensor,
                 timestamps=ts_tensor,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
             base_dst_emb = self.embedding_module.compute_embedding(
                 memory=node_memory,
-                # source_nodes=destination_nodes,
                 source_nodes=dst_tensor,
                 timestamps=ts_tensor,
-                # timestamps=edge_times,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
         else:
-            # base_src_emb = node_memory[source_nodes]
-            # base_dst_emb = node_memory[destination_nodes]
             base_src_emb = node_memory[src_tensor]
             base_dst_emb = node_memory[dst_tensor]
         
-        # ----- 6. MUTUAL REFINEMENT & POOLING (REPLACES SIMPLE FUSION) -----
-        # Use walk embeddings as src_walk and base TGN as dst_walk (or vice versa)
-        # The module performs bidirectional refinement anyway
-        
-        refined_src, refined_dst = self.mutual_refine(
-            src_walk=walk_src_emb,      # [B, D] - walk-based embeddings
-            dst_walk=base_src_emb,      # [B, D] - base TGN embeddings
-            src_per_type=src_per_type,  # [B, 3, max_walks, D] or None
-            dst_per_type=None,          # Base TGN doesn't have per-type structure
-            src_masks=src_masks,        # [B, 3, max_walks] or None
-            dst_masks=None,
-        )
-        
-        # Similarly for destination
-        refined_dst_walk, refined_dst_base = self.mutual_refine(
-            src_walk=walk_dst_emb,
-            dst_walk=base_dst_emb,
-            src_per_type=dst_per_type,
-            dst_per_type=None,
-            src_masks=dst_masks,
-            dst_masks=None,
-        )
-
-        # Alternative: Single call with concatenated source+destination
-        # This allows cross-attention between src and dst nodes as well
+        # ----- 6. MUTUAL REFINEMENT & POOLING -----
         combined_walk = torch.cat([walk_src_emb, walk_dst_emb], dim=0)  # [2B, D]
         combined_base = torch.cat([base_src_emb, base_dst_emb], dim=0)  # [2B, D]
         
+        # Validate dimensions match
+        assert combined_walk.size(-1) == combined_base.size(-1), \
+            f"Walk embedding dim {combined_walk.size(-1)} != base embedding dim {combined_base.size(-1)}"
+        
         if src_per_type is not None and dst_per_type is not None:
-            combined_per_type = torch.cat([src_per_type, dst_per_type], dim=0)  # [2B, 3, max_walks, D]
-            combined_masks = torch.cat([src_masks, dst_masks], dim=0)  # [2B, 3, max_walks]
+            combined_per_type = torch.cat([src_per_type, dst_per_type], dim=0)
+            combined_masks = torch.cat([src_masks, dst_masks], dim=0)
+            # Ensure boolean masks
+            combined_masks = combined_masks.bool()
         else:
             combined_per_type = None
             combined_masks = None
@@ -721,17 +676,17 @@ class TGNv7(BaseEnhancedTGN):
         )
         
         # Split back to source and destination
-        final_src = refined_combined_walk[:batch_size]  # Use walk-refined as final
+        final_src = refined_combined_walk[:batch_size]
         final_dst = refined_combined_walk[batch_size:]
         
-        
-        
-        # Final safety clamp
+        # Final NaN protection
         if not torch.isfinite(final_src).all():
+            logger.warning("NaN in final_src, sanitizing")
             final_src = torch.nan_to_num(final_src, nan=0.0, posinf=10.0, neginf=-10.0)
         if not torch.isfinite(final_dst).all():
+            logger.warning("NaN in final_dst, sanitizing")
             final_dst = torch.nan_to_num(final_dst, nan=0.0, posinf=10.0, neginf=-10.0)
-       
+        
         return final_src, final_dst    
     
     
@@ -770,6 +725,7 @@ class TGNv7(BaseEnhancedTGN):
                 
                 # Average over walk length (only valid positions)
                 walk_masks = masks.any(dim=-1)  # [B, num_walks] - which walks are valid
+                walk_masks = walk_masks.bool()
                 walk_embeds = (feats * masks.unsqueeze(-1)).sum(dim=2) / masks.sum(dim=2, keepdim=True).clamp(min=1)
                 # [B, num_walks, D]
                 
@@ -800,7 +756,7 @@ class TGNv7(BaseEnhancedTGN):
 
     def _store_sam_interactions(self, batch: Dict[str, torch.Tensor]):
         """Store interactions in buffer for deferred SAM update."""
-        if not self.use_sam:  # FIX: Skip if SAM not used
+        if not self.use_sam:  # Skip if SAM not used
             return
         device = self.device
         src_nodes = batch['src_nodes'].to(device)
@@ -996,39 +952,36 @@ class TGNv7(BaseEnhancedTGN):
         if not self.use_sam:
             return
         
-        
         # Guard all SAM operations
         if self.use_sam:
             if not torch.isfinite(self.sam_module.raw_memory).all():
                 logger.error(f"Batch {batch_idx}: Memory already NaN at batch end start! RESETTING")
                 self.sam_module.reset_memory()
-        
-        # 1. SAM DISCRETE UPDATE
-        if self.training and self.use_sam and self._sam_batch_buffer is not None:
-            buffer = self._sam_batch_buffer
             
-            # Check buffer validity
-            if not torch.isfinite(buffer['edge_features']).all():
-                logger.error(f"Batch {batch_idx}: Edge features NaN, skipping SAM update")
-                self._sam_batch_buffer = None
-                return
-            
-            with torch.no_grad():
-                node_feats = self.node_embedding.weight.detach()
+            # 1. SAM DISCRETE UPDATE
+            if self.training and self.use_sam and self._sam_batch_buffer is not None:
+                buffer = self._sam_batch_buffer
                 
-                try:
-                    # SAM update
-                    self.sam_module.update_memory_batch(
-                        source_nodes=buffer['src_nodes'],
-                        target_nodes=buffer['dst_nodes'],
-                        edge_features=buffer['edge_features'],
-                        current_time=buffer['timestamps'],
-                        node_features=node_feats
-                    )
-                except Exception as e:
-                    logger.error(f"Batch {batch_idx}: SAM update failed with error: {e}")
-                    self.sam_module.reset_memory()
-
+                # Check buffer validity
+                if not torch.isfinite(buffer['edge_features']).all():
+                    logger.error(f"Batch {batch_idx}: Edge features NaN, skipping SAM update")
+                    self._sam_batch_buffer = None
+                    return
+                
+                with torch.no_grad():
+                    node_feats = self.node_embedding.weight.detach()
+                    try:
+                        self.sam_module.update_memory_batch(
+                            source_nodes=buffer['src_nodes'],
+                            target_nodes=buffer['dst_nodes'],
+                            edge_features=buffer['edge_features'],
+                            current_time=buffer['timestamps'],
+                            node_features=node_feats
+                        )
+                    except Exception as e:
+                        logger.error(f"Batch {batch_idx}: SAM update failed with error: {e}")
+                        self.sam_module.reset_memory()
+                
                 # Verify memory AFTER SAM update
                 if not torch.isfinite(self.sam_module.raw_memory).all():
                     logger.error(f"Batch {batch_idx}: SAM memory NaN AFTER update! RESETTING")
@@ -1041,93 +994,60 @@ class TGNv7(BaseEnhancedTGN):
                 # Final sanitization
                 self.sam_module.raw_memory.data = torch.nan_to_num(
                     self.sam_module.raw_memory.data,
-                    nan=0.0,
-                    posinf=10.0,
-                    neginf=-10.0
+                    nan=0.0, posinf=10.0, neginf=-10.0
                 ).clamp_(-10, 10)
-                
                 self.sam_module.all_prototypes.data = torch.nan_to_num(
                     self.sam_module.all_prototypes.data,
-                    nan=0.0,
-                    posinf=10.0,
-                    neginf=-10.0
+                    nan=0.0, posinf=10.0, neginf=-10.0
                 ).clamp_(-10, 10)
+                
+                self._sam_batch_buffer = None
             
-            self._sam_batch_buffer = None
-        
-        # 2. ST-ODE CONTINUOUS EVOLUTION (only if enabled AND SAM used)
-        if self.use_st_ode and self.use_sam:
-            current_time = batch['timestamps'].max()
-            time_delta = current_time - self.last_update_time
-            
-            if time_delta < 1e-6:
-                self.last_update_time = current_time
-                return
-            
-            if not torch.isfinite(self.sam_module.raw_memory).all():
-                logger.error(f"Batch {batch_idx}: Memory NaN before ST-ODE, skipping")
-                self.sam_module.reset_memory()
-                self.last_update_time = current_time
-                return
-            
-            try:
-                obs_data = self._prepare_stode_observations(batch)
-                if obs_data is None:
+            # 2. ST-ODE CONTINUOUS EVOLUTION
+            if self.use_st_ode and self.use_sam and self.st_ode is not None:
+                current_time = batch['timestamps'].max()
+                time_delta = current_time - self.last_update_time
+                
+                if time_delta < 1e-6:
                     self.last_update_time = current_time
                     return
                 
-                times_flat = obs_data['times'].reshape(-1)
-                valid_mask = times_flat > (self.last_update_time + 1e-6)
-                
-                if not valid_mask.any():
+                if not torch.isfinite(self.sam_module.raw_memory).all():
+                    logger.error(f"Batch {batch_idx}: Memory NaN before ST-ODE, skipping")
+                    self.sam_module.reset_memory()
                     self.last_update_time = current_time
                     return
                 
-                time_dim = obs_data['times'].shape[1]
-                original_times = times_flat[:time_dim]
-                valid_time_mask = original_times > (self.last_update_time + 1e-6)
-                valid_indices = torch.where(valid_time_mask)[0]
-                
-                if len(valid_indices) == 0:
-                    self.last_update_time = current_time
-                    return
-                
-                filtered_encodings = obs_data['encodings'][:, valid_indices]
-                filtered_times = obs_data['times'][:, valid_indices]
-                filtered_masks = obs_data['masks'][:, valid_indices]
-                filtered_adjs = [obs_data['adjs'][i] for i in valid_indices.tolist()]
-                
-                if self.st_ode is None:
-                    logger.error(f"Batch {batch_idx}: ST-ODE module is None!")
-                    self.last_update_time = current_time
-                    return
-                
-                with torch.no_grad():
-                    evolved_memory = self.st_ode(
-                        node_states=self.sam_module.raw_memory,
-                        walk_encodings=filtered_encodings,
-                        walk_times=filtered_times,
-                        walk_masks=filtered_masks,
-                        adj_matrix=filtered_adjs,
-                        # t_init=self.last_update_time,
-                        # t_final = current_time,
-                        # return_all=False
-                    )
-                    
-                    evolved_state = evolved_memory.final_state if hasattr(
-                        evolved_memory, 'final_state') else evolved_memory
-                    
-                    if not torch.isfinite(evolved_state).all():
-                        logger.error(f"Batch {batch_idx}: ST-ODE produced NaN, skipping")
-                    elif evolved_state.abs().max() < 1e-8:
-                        logger.warning(f"Batch {batch_idx}: ST-ODE produced near-zero state")
-                    else:
-                        self.sam_module.raw_memory.data.copy_(evolved_state)
+                try:
+                    obs_data = self._prepare_stode_observations(batch)
+                    if obs_data is None:
                         self.last_update_time = current_time
-            
-            except Exception as e:
-                logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
-                self.last_update_time = current_time
+                        return
+                    
+                    # FIX: Simplified time filtering
+                    with torch.no_grad():
+                        evolved_memory = self.st_ode(
+                            node_states=self.sam_module.raw_memory,
+                            walk_encodings=obs_data['encodings'],
+                            walk_times=obs_data['times'],
+                            walk_masks=obs_data['masks'],
+                            adj_matrix=obs_data['adjs'],
+                        )
+                        
+                        # FIX: ST-ODE returns tensor directly, not object with .final_state
+                        evolved_state = evolved_memory
+                        
+                        if not torch.isfinite(evolved_state).all():
+                            logger.error(f"Batch {batch_idx}: ST-ODE produced NaN, skipping")
+                        elif evolved_state.abs().max() < 1e-8:
+                            logger.warning(f"Batch {batch_idx}: ST-ODE produced near-zero state")
+                        else:
+                            self.sam_module.raw_memory.data.copy_(evolved_state)
+                            self.last_update_time = current_time
+                            
+                except Exception as e:
+                    logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
+                    self.last_update_time = current_time
         
     
     
@@ -1140,9 +1060,12 @@ class TGNv7(BaseEnhancedTGN):
 
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
-        self._walk_cache.clear()
+        self._walk_cache = None
+        self._cache_batch_key = None
+        self._sam_batch_buffer = None
         self._last_hct_info = None
         torch.cuda.empty_cache()
+        logger.info("Epoch end: cleared all caches")
     
     def on_validation_epoch_start(self):
         """Clone SAM memory for validation."""

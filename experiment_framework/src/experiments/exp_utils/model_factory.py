@@ -12,6 +12,7 @@ from src.models.enhanced_tgn.variants.tgn_v3 import TGNv3
 from src.models.enhanced_tgn.variants.tgn_v4 import TGNv4
 from src.models.enhanced_tgn.variants.tgn_v5 import TGNv5
 from src.models.enhanced_tgn.variants.tgn_v6 import TGNv6
+from src.models.enhanced_tgn.variants.tgn_v7 import TGNv7
 
 
 
@@ -25,6 +26,7 @@ MODEL_REGISTRY = {
     "TGNv4": TGNv4,
     "TGNv5": TGNv5,
     "TGNv6": TGNv6,
+    "TGNv7": TGNv7,
 }
 
 

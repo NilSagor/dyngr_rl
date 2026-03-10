@@ -20,6 +20,22 @@ from ..component.transformer_encoder import MergeLayer
 
 
 
+# === CONFIG: Disable debug features for training ===
+DEBUG_VALIDATION = True  # Set True only for debugging
+DEBUG_LOGGING = True    # Disable verbose logging
+
+
+# === Helper function ==========
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 'yes')
+    return bool(value)
+
+
+
 class TGNv6(BaseEnhancedTGN):
     """
     TGN + SAM + Multi-Scale Walk Sampler + Hierarchical Co-occurrence Transformer (HCT) + ST ODE
@@ -119,12 +135,12 @@ class TGNv6(BaseEnhancedTGN):
         if os.environ.get('DEBUG_GRADIENTS'):
             torch.autograd.set_detect_anomaly(True)
         
-        self.use_st_ode = use_st_ode
-        self.use_hct = use_hct
+        self.use_st_ode = parse_bool(use_st_ode)
+        self.use_hct = parse_bool(use_hct)
         self.directed = kwargs.get('directed', False)
         
-        self.use_sam = use_sam
-        self.debug_simple_walk = debug_simple_walk
+        self.use_sam = parse_bool(use_sam)
+        self.debug_simple_walk = parse_bool(debug_simple_walk)
 
         # Initialize time projection only if ST-ODE is enabled
         if self.use_st_ode:
@@ -231,9 +247,9 @@ class TGNv6(BaseEnhancedTGN):
                     num_layers=num_layers,
                     adjoint=adjoint,
                     dropout=dropout,
-                    aggregation=aggregation,
-                    time_precision=time_precision,
-                    use_checkpoint=use_checkpoint
+                    # aggregation=aggregation,
+                    # time_precision=time_precision,
+                    
                 )
                 if self.use_hct and hct_d_model != memory_dim:
                     self.walk_to_memory = nn.Linear(hct_d_model, memory_dim)
@@ -258,6 +274,9 @@ class TGNv6(BaseEnhancedTGN):
         self.edge_time = None
         self._walk_cache = {}
         self._cache_walks = False
+        # Cache for walk data (avoid recomputation)
+        self._walk_cache = None
+        self._cache_batch_key = None
         
         self._sam_batch_buffer = None
         
@@ -282,6 +301,14 @@ class TGNv6(BaseEnhancedTGN):
         logger.info(f"TGNv6 initialized: SAM({num_prototypes}p) + WalkSampler + "
                    f"{'HCT(' + str(hct_d_model) + 'd, ' + str(hct_nhead) + 'h)' if use_hct else 'SimpleWalkEncoder'}")
 
+    def _get_batch_key(self, batch: Dict) -> int:
+        """Fast hash for batch caching without GPU sync."""
+        # Use source nodes and timestamps hash (deterministic)
+        src_hash = batch['src_nodes'][:5].sum().item()  # Sample first 5
+        ts_hash = (batch['timestamps'][:5] * 1000).sum().item()
+        return hash((src_hash, ts_hash, len(batch['src_nodes'])))
+    
+    
     def _prepare_stode_observations(self, batch):
         """Convert batch interactions to ST-ODE observation format."""
         
@@ -294,7 +321,9 @@ class TGNv6(BaseEnhancedTGN):
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']
+        batch_size = src_nodes.size(0)
         
+        # Vectorized embedding lookup
         src_emb = self.sam_module.raw_memory[src_nodes]
         dst_emb = self.sam_module.raw_memory[dst_nodes]
         time_emb = self.time_encoder(timestamps.float())
@@ -302,39 +331,110 @@ class TGNv6(BaseEnhancedTGN):
         if self._time_proj is not None and not isinstance(self._time_proj, nn.Identity):
             time_emb = self._time_proj(time_emb)
         
+        # Build adjacency for this batch only (src-dst edges)
         adj_t = self._build_temporal_adjacency(src_nodes, dst_nodes, num_nodes)
+        
+        # Vectorized time aggregation
         unique_times, inverse = torch.unique(timestamps, sorted=True, return_inverse=True)
         T = len(unique_times)
         
-        node_obs_per_time = torch.zeros(T, num_nodes, self.memory_dim, device=device)
+
         
+
+        node_obs = torch.zeros(T, num_nodes, self.memory_dim, device=device)
+
+        # For each unique time, aggregate embeddings from edges at that time
         for t_idx in range(T):
             mask = (inverse == t_idx)
-            if mask.sum() == 0:
-                continue
-            
-            src_t = src_nodes[mask]
-            dst_t = dst_nodes[mask]
-            src_emb_t = src_emb[mask]
-            dst_emb_t = dst_emb[mask]
-            time_emb_t = time_emb[mask]
-            
-            node_obs_per_time[t_idx].index_add_(0, src_t, src_emb_t)
-            node_obs_per_time[t_idx].index_add_(0, dst_t, dst_emb_t)
-            node_obs_per_time[t_idx].index_add_(0, src_t, time_emb_t)
-            node_obs_per_time[t_idx].index_add_(0, dst_t, time_emb_t)
+            if mask.any():
+                # Get src and dst for this time slot
+                src_t = src_nodes[mask]
+                dst_t = dst_nodes[mask]
+                src_emb_t = src_emb[mask]
+                dst_emb_t = dst_emb[mask]
+                time_emb_t = time_emb[mask]
+                
+                # Add source contributions: src_emb + time_emb
+                node_obs[t_idx].index_add_(0, src_t, src_emb_t + time_emb_t)
+                # Add destination contributions: dst_emb + time_emb  
+                node_obs[t_idx].index_add_(0, dst_t, dst_emb_t + time_emb_t)
         
-        masks = (node_obs_per_time.abs().sum(dim=-1) > 0)
-        walk_encodings = node_obs_per_time.permute(1, 0, 2).unsqueeze(2)
-        walk_times = unique_times.view(1, T, 1).expand(num_nodes, -1, -1)
-        walk_masks = masks.T.unsqueeze(-1)
+        # Count occurrences for normalization (per node per time)
+        counts = torch.zeros(T, num_nodes, device=device)
+        for t_idx in range(T):
+            mask = (inverse == t_idx)
+            if mask.any():
+                src_t = src_nodes[mask]
+                dst_t = dst_nodes[mask]
+                counts[t_idx].index_add_(0, src_t, torch.ones(src_t.size(0), device=device))
+                counts[t_idx].index_add_(0, dst_t, torch.ones(dst_t.size(0), device=device))
+        
+        # Normalize by counts (avoid div by zero)
+        node_obs = node_obs / counts.unsqueeze(-1).clamp(min=1)
+        
+        # Reshape for ST-ODE: [N, T, 1, D] - each node has T observations
+        walk_encodings = node_obs.permute(1, 0, 2).unsqueeze(2)  # [N, T, 1, D]
+        walk_times = unique_times.view(1, T, 1).expand(num_nodes, -1, -1)  # [N, T, 1]
+        walk_masks = (counts > 0).T.unsqueeze(-1).float()  # [N, T, 1]
         
         return {
             'encodings': walk_encodings,
             'times': walk_times,
             'masks': walk_masks,
-            'adjs': [adj_t] * T
-        }       
+            'adjs': adj_t  # One adjacency per time step
+        }
+
+
+        # # Flatten for scatter operations
+        # flat_time_idx = inverse
+        # flat_nodes = torch.cat([src_nodes, dst_nodes])
+        # flat_emb = torch.cat([src_emb + time_emb, dst_emb + time_emb], dim=0)
+        
+        
+        # for t_idx in range(T):
+        #     mask = (inverse == t_idx)
+        #     if mask.any():
+        #         node_obs[t_idx].index_add_(0, flat_nodes[mask], flat_emb[mask])
+            
+        # # Count for normalization
+        # counts = torch.zeros(T, self.num_nodes, device=device)
+        # ones = torch.ones(flat_nodes.size(0), device=device)
+
+        # for t_idx in range(T):
+        #     mask = (flat_time_idx == t_idx)
+        #     if mask.any():
+        #         counts[t_idx].index_add_(0, flat_nodes[mask], ones[mask])
+
+        # # Normalize
+        # node_obs = node_obs / counts.unsqueeze(-1).clamp(min=1)
+            
+        #     # src_t = src_nodes[mask]
+        #     # dst_t = dst_nodes[mask]
+        #     # src_emb_t = src_emb[mask]
+        #     # dst_emb_t = dst_emb[mask]
+        #     # time_emb_t = time_emb[mask]
+            
+        #     # node_obs_per_time[t_idx].index_add_(0, src_t, src_emb_t)
+        #     # node_obs_per_time[t_idx].index_add_(0, dst_t, dst_emb_t)
+        #     # node_obs_per_time[t_idx].index_add_(0, src_t, time_emb_t)
+        #     # node_obs_per_time[t_idx].index_add_(0, dst_t, time_emb_t)
+        
+        # # masks = (node_obs_per_time.abs().sum(dim=-1) > 0)
+        # # walk_encodings = node_obs_per_time.permute(1, 0, 2).unsqueeze(2)
+        # # walk_times = unique_times.view(1, T, 1).expand(num_nodes, -1, -1)
+        # # walk_masks = masks.T.unsqueeze(-1)
+
+        # # Reshape for ST-ODE: [N, T, 1, H]
+        # walk_encodings = node_obs.permute(1, 0, 2).unsqueeze(2)
+        # walk_times = unique_times.view(1, T, 1).expand(self.num_nodes, -1, -1)
+        # walk_masks = (counts > 0).T.unsqueeze(-1).float()
+        
+        # return {
+        #     'encodings': walk_encodings,
+        #     'times': walk_times,
+        #     'masks': walk_masks,
+        #     'adjs': adj_t
+        # }       
         
    
     def _build_temporal_adjacency(self, src_nodes, dst_nodes, num_nodes):
@@ -383,7 +483,8 @@ class TGNv6(BaseEnhancedTGN):
         source_emb, dest_emb = self.compute_temporal_embeddings(
             batch['src_nodes'],
             batch['dst_nodes'],
-            batch['timestamps']
+            batch['timestamps'],
+            batch = batch,
         )
         
         if self.training and self.use_memory:
@@ -434,7 +535,8 @@ class TGNv6(BaseEnhancedTGN):
         source_nodes: torch.Tensor,
         destination_nodes: torch.Tensor,
         edge_times: torch.Tensor,
-        n_neighbors: int = 20
+        n_neighbors: int = 20,
+        batch: Optional[Dict] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Unified embedding computation with HCT."""
         device = self.device
@@ -448,12 +550,15 @@ class TGNv6(BaseEnhancedTGN):
                 node_memory = self.memory.memory
             else:
                 node_memory = self.memory
-
+            # node_memory = getattr(self.memory, 'memory', self.memory)
+        
         # Basic input validation
-        assert torch.isfinite(node_memory).all(), "node_memory contains NaN/Inf"        
-        assert (source_nodes >= 0).all() and (source_nodes < self.num_nodes).all(), "source_nodes out of bounds"
-        assert (destination_nodes >= 0).all() and (destination_nodes < self.num_nodes).all(), "dst_nodes out of bounds"
-        assert torch.isfinite(edge_times).all(), "edge_times contains NaN/Inf"
+        # Fast path: skip validation in production
+        if DEBUG_VALIDATION:
+            assert torch.isfinite(node_memory).all(), "node_memory contains NaN/Inf"        
+            assert (source_nodes >= 0).all() and (source_nodes < self.num_nodes).all(), "source_nodes out of bounds"
+            assert (destination_nodes >= 0).all() and (destination_nodes < self.num_nodes).all(), "dst_nodes out of bounds"
+            assert torch.isfinite(edge_times).all(), "edge_times contains NaN/Inf"
 
         # Reset SAM memory if needed (only when SAM is used)
         if self.use_sam and not torch.isfinite(self.sam_module.raw_memory).all():
@@ -471,19 +576,34 @@ class TGNv6(BaseEnhancedTGN):
         dst_tensor = destination_nodes.to(device).long()
         ts_tensor = edge_times.to(device).float()
 
-        # Memory snapshot for walk sampler (detached)
-        with torch.no_grad():
-            walk_memory = node_memory.detach().clone()
         
-        # ----- 2. Generate walks -----
-        walk_data = self.walk_sampler(
-            source_nodes=src_tensor,
-            target_nodes=dst_tensor,
-            current_times=ts_tensor,
-            memory_states=walk_memory,
-            edge_index=self.edge_index,
-            edge_time=self.edge_time
-        )
+        # Memory snapshot for walk sampler (detached)
+        
+        cache_key = self._get_batch_key(batch) if batch is not None else None
+        if cache_key == self._cache_batch_key and self._walk_cache is not None:
+            walk_data = self._walk_cache
+        else:
+            # Generate walks once
+            with torch.no_grad():
+                walk_memory = node_memory.detach()
+        
+        # with torch.no_grad():
+        #     walk_memory = node_memory.detach().clone()
+        
+            # ----- 2. Generate walks -----
+            walk_data = self.walk_sampler(
+                source_nodes=src_tensor,
+                target_nodes=dst_tensor,
+                current_times=ts_tensor,
+                memory_states=walk_memory,
+                # edge_index=self.edge_index,
+                edge_index=None,
+                # edge_time=self.edge_time
+                edge_time=None
+            )
+            # Update cache
+            self._walk_cache = walk_data
+            self._cache_batch_key = cache_key
 
         
         # ----- 3. Validate walk data (once, before any branching) -----
@@ -502,32 +622,92 @@ class TGNv6(BaseEnhancedTGN):
         if self.use_hct and self.hct is not None and not self.debug_simple_walk:
             # Use HCT
             with torch.enable_grad():
-                hct_src_output = self.hct(
-                    walks_dict=walk_data['source'],
+                # hct_src_output = self.hct(
+                #     walks_dict=walk_data['source'],
+                #     node_memory=node_memory,
+                #     return_all=True
+                # )
+                # hct_dst_output = self.hct(
+                #     walks_dict=walk_data['target'],
+                #     node_memory=node_memory,
+                #     return_all=True
+                # )
+                
+                combined_walks = {
+                'short': {
+                    'nodes': torch.cat([
+                        walk_data['source']['short']['nodes'],
+                        walk_data['target']['short']['nodes']
+                    ], dim=0),
+                    'nodes_anon': torch.cat([
+                        walk_data['source']['short']['nodes_anon'],
+                        walk_data['target']['short']['nodes_anon']
+                    ], dim=0),
+                    'masks': torch.cat([
+                        walk_data['source']['short']['masks'],
+                        walk_data['target']['short']['masks']
+                    ], dim=0),
+                },
+                'long': {
+                    'nodes': torch.cat([
+                        walk_data['source']['long']['nodes'],
+                        walk_data['target']['long']['nodes']
+                    ], dim=0),
+                    'nodes_anon': torch.cat([
+                        walk_data['source']['long']['nodes_anon'],
+                        walk_data['target']['long']['nodes_anon']
+                    ], dim=0),
+                    'masks': torch.cat([
+                        walk_data['source']['long']['masks'],
+                        walk_data['target']['long']['masks']
+                    ], dim=0),
+                },
+                'tawr': {
+                    'nodes': torch.cat([
+                        walk_data['source']['tawr']['nodes'],
+                        walk_data['target']['tawr']['nodes']
+                    ], dim=0),
+                    'nodes_anon': torch.cat([
+                        walk_data['source']['tawr']['nodes_anon'],
+                        walk_data['target']['tawr']['nodes_anon']
+                    ], dim=0),
+                    'masks': torch.cat([
+                        walk_data['source']['tawr']['masks'],
+                        walk_data['target']['tawr']['masks']
+                    ], dim=0),
+                }
+            }
+
+                # Single HCT forward (2× speedup)
+                hct_output = self.hct(
+                    walks_dict=combined_walks,
                     node_memory=node_memory,
-                    return_all=True
-                )
-                hct_dst_output = self.hct(
-                    walks_dict=walk_data['target'],
-                    node_memory=node_memory,
-                    return_all=True
+                    return_all=False
                 )
 
             # Take fused output
-            hct_src_fused = hct_src_output['fused']
-            hct_dst_fused = hct_dst_output['fused']
+            # hct_src_fused = hct_src_output['fused']
+            # hct_dst_fused = hct_dst_output['fused']
 
-            # FIX: Actually clamp the tensors, not just a local variable
-            if not torch.isfinite(hct_src_fused).all():
-                logger.warning("HCT src output contains NaN/Inf! Clamping.")
-                hct_src_fused = torch.nan_to_num(hct_src_fused, nan=0.0, posinf=10.0, neginf=-10.0)
-            if not torch.isfinite(hct_dst_fused).all():
-                logger.warning("HCT dst output contains NaN/Inf! Clamping.")
-                hct_dst_fused = torch.nan_to_num(hct_dst_fused, nan=0.0, posinf=10.0, neginf=-10.0)
+            # Split back to source/target
+            batch_size = src_tensor.size(0)
+            hct_src = hct_output[:batch_size]
+            hct_dst = hct_output[batch_size:]
+            
+            
+            # Actually clamp the tensors, not just a local variable
+            # if not torch.isfinite(hct_src_fused).all():
+            #     logger.warning("HCT src output contains NaN/Inf! Clamping.")
+            #     hct_src_fused = torch.nan_to_num(hct_src_fused, nan=0.0, posinf=10.0, neginf=-10.0)
+            # if not torch.isfinite(hct_dst_fused).all():
+            #     logger.warning("HCT dst output contains NaN/Inf! Clamping.")
+            #     hct_dst_fused = torch.nan_to_num(hct_dst_fused, nan=0.0, posinf=10.0, neginf=-10.0)
 
             # Project to hidden_dim (if needed)
-            walk_src_emb = self.hct_to_tgn(hct_src_fused)
-            walk_dst_emb = self.hct_to_tgn(hct_dst_fused)
+            # walk_src_emb = self.hct_to_tgn(hct_src_fused)
+            # walk_dst_emb = self.hct_to_tgn(hct_dst_fused)
+            walk_src_emb = self.hct_to_tgn(hct_src)
+            walk_dst_emb = self.hct_to_tgn(hct_dst)
         else:
             # Fallback: simple mean pooling (ensure output dimension = hidden_dim)
             walk_src_emb = self._simple_walk_embed(walk_data['source'], node_memory)
@@ -539,20 +719,25 @@ class TGNv6(BaseEnhancedTGN):
             base_src_emb = self.embedding_module.compute_embedding(
                 memory=node_memory,
                 source_nodes=source_nodes,
-                timestamps=edge_times,
+                # timestamps=edge_times,
+                timestamps=ts_tensor,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
             base_dst_emb = self.embedding_module.compute_embedding(
                 memory=node_memory,
-                source_nodes=destination_nodes,
-                timestamps=edge_times,
+                # source_nodes=destination_nodes,
+                source_nodes=dst_tensor,
+                timestamps=ts_tensor,
+                # timestamps=edge_times,
                 n_layers=self.num_layers,
                 n_neighbors=n_neighbors
             )
         else:
-            base_src_emb = node_memory[source_nodes]
-            base_dst_emb = node_memory[destination_nodes]
+            # base_src_emb = node_memory[source_nodes]
+            # base_dst_emb = node_memory[destination_nodes]
+            base_src_emb = node_memory[src_tensor]
+            base_dst_emb = node_memory[dst_tensor]
         
         # ----- 6. Fusion -----
         combined_src = torch.cat([base_src_emb, walk_src_emb], dim=-1)
@@ -614,6 +799,7 @@ class TGNv6(BaseEnhancedTGN):
         self.edge_time = edge_time
         self.walk_sampler.update_neighbors(edge_index, edge_time)
         self.walk_sampler.build_dense_neighbor_table()
+        self.walk_sampler._freeze_neighbors = True
         logger.info(f"Walk sampler initialized with {edge_index.size(1)} edges")
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
@@ -686,7 +872,8 @@ class TGNv6(BaseEnhancedTGN):
             logger.error(f"Batch {batch_idx}: NaN loss!")
             return None
         
-        return loss    
+        return loss
+        
     def on_after_optimizer_step(self, optimizer):
         for name, param in self.named_parameters():
             if torch.isnan(param).any():
@@ -699,14 +886,48 @@ class TGNv6(BaseEnhancedTGN):
             self.sam_module.reset_memory()
             logger.info("SAM memory initialized for training")
 
+    def on_after_backward(self):        
+        # Collect all parameters into single list        
+        param_groups = [
+        (self.sam_module.parameters() if self.use_sam and self.sam_module else [], 1.0),
+        ([self.sam_module.all_prototypes] if self.use_sam and self.sam_module and hasattr(self.sam_module, 'all_prototypes') else [], 0.5),
+        (self.hct.parameters() if self.use_hct and self.hct else [], 0.5),
+        (self.hct_to_tgn.parameters() if self.hct_to_tgn is not None and not isinstance(self.hct_to_tgn, nn.Identity) else [], 0.5),
+        (self.fusion_layer.parameters(), 0.5),
+        (self.embedding_module.parameters() if self.embedding_module else [], 0.5),
+        (self.link_predictor.parameters() if self.link_predictor else [], 0.5),
+        (self.message_fn.parameters() if self.message_fn else [], 0.5),
+        (self._time_proj.parameters() if self._time_proj is not None and not isinstance(self._time_proj, nn.Identity) else [], 0.5),
+        (self.walk_to_memory.parameters() if self.walk_to_memory is not None and not isinstance(self.walk_to_memory, nn.Identity) else [], 0.5),
+    ]
+
+        for params, max_norm in param_groups:
+            # Filter out empty parameter lists and ensure we have actual parameters
+            params_list = list(params)
+            if len(params_list) > 0:
+                # Check if any parameter has a gradient
+                has_grad = any(p.grad is not None for p in params_list)
+                if has_grad:
+                    try:
+                        torch.nn.utils.clip_grad_norm_(params_list, max_norm=max_norm)
+                    except Exception as e:
+                        logger.warning(f"Gradient clipping failed for a parameter group: {e}")
+
+        if DEBUG_VALIDATION:
+            for name, param in self.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    logger.error(f"NaN gradient detected in {name}")
+                    # Optionally zero the gradient to prevent propagation
+                    param.grad.zero_()
+
     def on_train_batch_start(self, batch, batch_idx):
         times = batch['timestamps']
         current_max = times.max().item()
         
-        # FIX: Only check SAM memory if SAM is used
+        # check SAM memory if SAM is used
         if self.use_sam and batch_idx > 0:
             mem_finite = torch.isfinite(self.sam_module.raw_memory).all().item()
-            proto_finite = torch.isfinite(self.sam_module.all_prototypes).all().item()
+            # proto_finite = torch.isfinite(self.sam_module.all_prototypes).all().item()
             
             if not mem_finite:
                 logger.error(f"Batch {batch_idx} START: SAM memory already contains NaN!")
@@ -714,45 +935,24 @@ class TGNv6(BaseEnhancedTGN):
                 logger.error(f"NaN count in memory: {nan_count}/{self.sam_module.raw_memory.numel()}")
                 self.sam_module.reset_memory()
             
-            if not proto_finite:
-                logger.error(f"Batch {batch_idx} START: Prototypes contain NaN!")
-                with torch.no_grad():
-                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
-        
-        if batch_idx == 0 and self.use_sam:  # FIX: Only log if SAM exists
-            walk_data = self.walk_sampler(
-                source_nodes=batch['src_nodes'][:2],
-                target_nodes=batch['dst_nodes'][:2],
-                current_times=batch['timestamps'][:2],
-                memory_states=self.sam_module.raw_memory,
-                edge_index=self.edge_index,
-                edge_time=self.edge_time
-            )
-            
-            logger.info(f"Walk data keys: {walk_data.keys()}")
-            if 'source' in walk_data:
-                logger.info(f"Source keys: {walk_data['source'].keys()}")
-                for walk_type in ['short', 'long', 'tawr']:
-                    if walk_type in walk_data['source']:
-                        nodes = walk_data['source'][walk_type]['nodes']
-                        logger.info(f"{walk_type}: shape={nodes.shape}, "
-                                   f"min={nodes.min().item()}, max={nodes.max().item()}")
-            
-            edge_feats = batch.get('edge_features')
-            if edge_feats is not None:
-                logger.info(f"Batch 0 edge_features: shape={edge_feats.shape}, "
-                           f"finite={torch.isfinite(edge_feats).all().item()}")
-            
+       
             logger.info(f"Epoch start - Batch 0 time range: [{times.min():.0f}, {times.max():.0f}]")
         
-        if hasattr(self, '_prev_max_time'):
-            if current_max < self._prev_max_time - 1e-6:
-                logger.error(f"TEMPORAL VIOLATION: Batch {batch_idx} max {current_max:.0f} < prev {self._prev_max_time:.0f}")
+        if hasattr(self, '_prev_max_time') and current_max<self._prev_max_time - 1e-6:
+            # if current_max < self._prev_max_time - 1e-6:
+            logger.error(f"TEMPORAL VIOLATION: Batch {batch_idx} max {current_max:.0f} < prev {self._prev_max_time:.0f}")
         
         self._prev_max_time = current_max
+        # Clear walk cache for new batch
+        self._walk_cache = None
+        self._cache_batch_key = None
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """SAM update happens HERE after backward pass."""
+        if not self.use_sam:
+            return
+        
+        
         # Guard all SAM operations
         if self.use_sam:
             if not torch.isfinite(self.sam_module.raw_memory).all():
@@ -864,9 +1064,10 @@ class TGNv6(BaseEnhancedTGN):
                         walk_encodings=filtered_encodings,
                         walk_times=filtered_times,
                         walk_masks=filtered_masks,
-                        adj_matrices=filtered_adjs,
-                        t_init=self.last_update_time,
-                        return_all=False
+                        adj_matrix=filtered_adjs,
+                        # t_init=self.last_update_time,
+                        # t_final = current_time,
+                        # return_all=False
                     )
                     
                     evolved_state = evolved_memory.final_state if hasattr(
@@ -884,53 +1085,7 @@ class TGNv6(BaseEnhancedTGN):
                 logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
                 self.last_update_time = current_time
         
-    def on_after_backward(self):
-        # Clip ALL parameters, not just SAM and HCT
-        modules_to_clip = [
-            ('sam_module', 1.0),
-            ('hct', 0.5),
-            ('hct_to_tgn', 0.5),
-            ('fusion_layer', 0.5),
-            ('embedding_module', 0.5),
-            ('link_predictor', 0.5),
-            ('message_fn', 0.5),
-            ('node_embedding', 0.5),
-            ('time_proj', 0.5),           # if exists
-            ('walk_to_memory', 0.5),       # if exists
-        ]
-        for name, max_norm in modules_to_clip:
-            module = getattr(self, name, None)
-            if module is not None:
-                torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm=max_norm)
-        
-        
-
-        if hasattr(self, 'sam_module') and self.sam_module is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.sam_module.parameters(), max_norm=1.0
-            )
-            # Extra clipping for sensitive prototypes
-            torch.nn.utils.clip_grad_norm_(
-                self.sam_module.all_prototypes, 
-                max_norm=0.5  # Stricter for prototypes
-            )
-            
-        
-        if self.use_hct and hasattr(self, 'hct') and self.hct is not None:
-            torch.nn.utils.clip_grad_norm_(self.hct.parameters(), max_norm=0.5)
-        
-                
-        if hasattr(self, 'hct_to_tgn') and self.hct_to_tgn is not None:
-            torch.nn.utils.clip_grad_norm_(self.hct_to_tgn.parameters(), max_norm=0.5)
-        
-        if hasattr(self, 'fusion_layer'):
-            torch.nn.utils.clip_grad_norm_(self.fusion_layer.parameters(), max_norm=0.5)
-       
-        for name, param in self.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                logger.error(f"NaN gradient detected in {name}")
-                # Optionally zero the gradient to prevent propagation
-                param.grad.zero_()
+    
     
     def on_train_epoch_start(self):
         """Reset ST-ODE temporal state at epoch start."""

@@ -2,7 +2,7 @@
 
 # Model parameters
 model:
-  name: "TGNv6"
+  name: "TGNv7"
   # num_nodes: null  # Will be set based on dataset
   # node_features: 0  # Use learned embeddings
   hidden_dim: 172
@@ -30,9 +30,11 @@ model:
   mu: 0.0
   adaptive_mu: True
   use_st_ode: True
-  ode_method: rk4
-  ode_step_size: 10000   # increase step size to reduce steps
-  adjoint: true
+  ode_method: 'rk4' # 'dopri5'
+  rtol: 0.0001
+  atol: 0.0000001
+  ode_step_size: 100   # increase step size to reduce steps
+  adjoint: False
   use_checkpoint: True
 
 

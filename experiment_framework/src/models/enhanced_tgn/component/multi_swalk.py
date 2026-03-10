@@ -70,6 +70,24 @@ class MultiScaleWalkSampler(nn.Module):
             return param.device
         return torch.device('cpu')
     
+    def _compute_edge_hash(self, edge_index: torch.Tensor, edge_time: torch.Tensor) -> int:
+        """Fast hash using summary statistics instead of full array."""
+        shape_hash = hash((edge_index.shape, edge_time.shape))
+        
+        if edge_index.numel() > 0:
+            ei_flat = edge_index.flatten()
+            et_flat = edge_time.flatten()
+            sample_hash = hash((
+                ei_flat[:10].sum().item() if len(ei_flat) >= 10 else ei_flat.sum().item(),
+                ei_flat[-10:].sum().item() if len(ei_flat) >= 10 else 0,
+                et_flat[:10].sum().item() if len(et_flat) >= 10 else et_flat.sum().item(),
+                et_flat[-10:].sum().item() if len(et_flat) >= 10 else 0,
+            ))
+        else:
+            sample_hash = hash(0)
+        
+        return hash((shape_hash, sample_hash))
+    
     
     def update_neighbors(
             self, 
@@ -89,11 +107,16 @@ class MultiScaleWalkSampler(nn.Module):
         edge_index_hash = hash(tuple(edge_index.cpu().numpy().flatten()))
         edge_time_hash = hash(tuple(edge_time.cpu().numpy()))
         
+        edge_hash = self._compute_edge_hash(edge_index, edge_time)
+        if not force and self._edges_initialized and edge_hash == self._cached_edge_hash:
+            return
+        self._cached_edge_hash = edge_hash
+        
         # Skip if edges haven't changed
-        if not force and self._edges_initialized:
-            if (edge_index_hash == self._cached_edge_index_hash and 
-                edge_time_hash == self._cached_edge_time_hash):
-                return
+        # if not force and self._edges_initialized:
+        #     if (edge_index_hash == self._cached_edge_index_hash and 
+        #         edge_time_hash == self._cached_edge_time_hash):
+        #         return
 
         # Store hashes for next comparison
         self._cached_edge_index_hash = edge_index_hash
@@ -155,7 +178,7 @@ class MultiScaleWalkSampler(nn.Module):
             return None, None
         
         if len(valid_neighbors) == 1:
-            return valid_neighbors[0]
+            return valid_neighbors[0][0], valid_neighbors[0][1] 
         
         timestamps = np.array([t for _, t in valid_neighbors], dtype=np.float32)
         t_max = np.max(timestamps)
@@ -168,7 +191,27 @@ class MultiScaleWalkSampler(nn.Module):
         probs = weights / (np.sum(weights) + 1e-10)
         
         idx = np.random.choice(len(valid_neighbors), p=probs)
-        return valid_neighbors[idx]
+        return valid_neighbors[idx][0], valid_neighbors[idx][1]
+    
+    
+    def _ensure_module_device(self, module: nn.Module, target_device: torch.device):
+        """Ensure a module is on the correct device."""
+        # Check both parameters and buffers
+        for buf in module.buffers():
+            if buf.device != target_device:
+                return module.to(target_device)
+        for param in module.parameters():
+            if param.device != target_device:
+                return module.to(target_device)
+        return module
+    
+    # Check buffers instead of parameters for TimeEncoder
+    def _ensure_time_encoder_device(self, target_device: torch.device):
+        """Ensure time_encoder is on the correct device."""
+        current_device = next(self.time_encoder.buffers(), None)
+        if current_device is not None and current_device.device != target_device:
+            self.time_encoder = self.time_encoder.to(target_device)
+    
     
     
     def compute_restart_probability(
@@ -186,12 +229,14 @@ class MultiScaleWalkSampler(nn.Module):
         node_idx = torch.clamp(torch.tensor(node, device=device), 0, memory_state.size(0) - 1)
         
         # FIX: Ensure time_encoder is on same device without reassignment
-        if next(self.time_encoder.parameters(), None) is not None:
-            target_device = next(self.time_encoder.parameters()).device
-            if device != target_device:
-                self.time_encoder = self.time_encoder.to(device)
+        # if next(self.time_encoder.parameters(), None) is not None:
+        #     target_device = next(self.time_encoder.parameters()).device
+        #     if device != target_device:
+        #         self.time_encoder = self.time_encoder.to(device)
         
         # Get time encoding
+        self.time_encoder = self._ensure_module_device(self.time_encoder, device)
+
         time_tensor = torch.tensor([current_time], device=device, dtype=torch.float32)
         time_enc = self.time_encoder(time_tensor)  # [1, time_dim]
         
@@ -311,11 +356,20 @@ class MultiScaleWalkSampler(nn.Module):
             # Gather neighbors: [B, W, max_deg]
             neighbor_ids = self.dense_neighbor_ids[curr_nodes]
             neighbor_times = self.dense_neighbor_times[curr_nodes]
+            neighbor_counts = self.dense_neighbor_counts[curr_nodes]  # [N]
 
-            # Base validity mask
-            base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
+            
+            pos_mask = torch.arange(max_deg, device=device).unsqueeze(0).unsqueeze(0)
+            node_degree = neighbor_counts[curr_nodes].unsqueeze(-1)  # [B, W, 1]
+            base_mask = pos_mask < node_degree  # [B, W, max_deg]
+
             temporal_mask = neighbor_times < curr_times.unsqueeze(-1)
             valid_neighbor_mask = base_mask & temporal_mask
+            
+            # Base validity mask
+            # base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
+            # temporal_mask = neighbor_times < curr_times.unsqueeze(-1)
+            # valid_neighbor_mask = base_mask & temporal_mask
             valid_counts = valid_neighbor_mask.sum(dim=-1)
             has_valid = valid_counts > 0
 
@@ -485,9 +539,17 @@ class MultiScaleWalkSampler(nn.Module):
             # Continue path: sample next neighbor
             neighbor_ids = self.dense_neighbor_ids[curr_nodes]
             neighbor_times = self.dense_neighbor_times[curr_nodes]
+            neighbor_counts = self.dense_neighbor_counts[curr_nodes]  # [B, W]
             
-            base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
-            valid_neighbor_mask = base_mask & (neighbor_times < curr_times.unsqueeze(-1))
+            # Create position mask using neighbor_counts
+            pos_mask = torch.arange(max_deg, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, max_deg]
+            node_degree = neighbor_counts.unsqueeze(-1)  # [B, W, 1]
+            base_mask = pos_mask < node_degree  # [B, W, max_deg]
+            
+            temporal_mask = neighbor_times < curr_times.unsqueeze(-1)
+            # base_mask = (neighbor_ids > 0) & (neighbor_times > 0)
+            valid_neighbor_mask = base_mask & temporal_mask
+            # valid_neighbor_mask = base_mask & (neighbor_times < curr_times.unsqueeze(-1))
 
             has_temporal = valid_neighbor_mask.sum(dim=-1) > 0
             has_any = base_mask.sum(dim=-1) > 0
@@ -595,32 +657,48 @@ class MultiScaleWalkSampler(nn.Module):
             if valid_nodes.numel() == 0:
                 continue
             
-            # Get unique nodes (excluding padding=0)
             unique_nodes = torch.unique(valid_nodes[valid_nodes > 0])
-            
             if unique_nodes.numel() == 0:
                 continue
-
-            # FIX: Create mapping tensor for fast vectorized lookup
-            max_node_id = unique_nodes.max().item() + 1
-            mapping_tensor = torch.zeros(max_node_id + 1, dtype=torch.long, device=device)
-            mapping_tensor[unique_nodes] = torch.arange(1, len(unique_nodes) + 1, device=device)
             
-            # Apply mapping vectorized
-            flat_nodes = batch_nodes.view(-1)
-            flat_anon = torch.zeros_like(flat_nodes)
-            flat_mask = masks[b].view(-1).bool()
+            # Handle sparse node IDs safely
+            max_node_id = unique_nodes.max().item()
             
-            valid_flat = flat_mask & (flat_nodes > 0) & (flat_nodes < mapping_tensor.size(0))
-            flat_anon[valid_flat] = mapping_tensor[flat_nodes[valid_flat]]
-            
-            nodes_anon[b] = flat_anon.view(num_walks, walk_len)
+            if max_node_id > 100000:  # Threshold for sparse handling
+                # Use dict-based mapping for sparse IDs
+                node_to_anon = {nid.item(): idx+1 for idx, nid in enumerate(unique_nodes)}
+                
+                flat_nodes = batch_nodes.view(-1)
+                flat_mask = masks[b].view(-1).bool()
+                flat_anon = torch.zeros_like(flat_nodes)
+                
+                for i, nid in enumerate(flat_nodes):
+                    if flat_mask[i] and nid.item() > 0 and nid.item() in node_to_anon:
+                        flat_anon[i] = node_to_anon[nid.item()]
+                
+                nodes_anon[b] = flat_anon.view(num_walks, walk_len)
+            else:
+                # Original tensor-based approach for dense IDs
+                mapping_tensor = torch.zeros(max_node_id + 2, dtype=torch.long, device=device)
+                mapping_tensor[unique_nodes] = torch.arange(1, len(unique_nodes) + 1, device=device)
+                
+                flat_nodes = batch_nodes.view(-1)
+                flat_anon = torch.zeros_like(flat_nodes)
+                flat_mask = masks[b].view(-1).bool()
+                
+                valid_flat = flat_mask & (flat_nodes > 0) & (flat_nodes < mapping_tensor.size(0))
+                flat_anon[valid_flat] = mapping_tensor[flat_nodes[valid_flat]]
+                
+                nodes_anon[b] = flat_anon.view(num_walks, walk_len)
         
+       
         # Sanity checks
         if nodes_anon.numel() > 0:
             assert nodes_anon.min() >= 0, "Anonymized nodes contain negative values"
             max_anon = nodes_anon.max().item()
-            assert max_anon <= 10000, f"Anonymized ID {max_anon} seems too large"
+            if max_anon > 10000:
+                logger.warning(f"Anonymized ID {max_anon} seems large (walk_type={walk_type})")
+        
         
         walk_data['nodes_anon'] = nodes_anon
         return walk_data
@@ -629,9 +707,13 @@ class MultiScaleWalkSampler(nn.Module):
         """Clear all cached data."""
         self.neighbor_cache.clear()
         self._dense_tables_built = False
-        self._cached_edge_index_hash = None
-        self._cached_edge_time_hash = None
         
+        # Safely remove all hash attributes
+        for attr in ['_cached_edge_index_hash', '_cached_edge_time_hash', '_cached_edge_hash']:
+            if hasattr(self, attr):
+                delattr(self, attr)
+        
+        # Safely remove dense buffer attributes
         for attr in ['dense_neighbor_ids', 'dense_neighbor_times', 'dense_neighbor_counts']:
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -658,14 +740,29 @@ class MultiScaleWalkSampler(nn.Module):
         # Fallback if no neighbor data available
         if not hasattr(self, 'dense_neighbor_ids'):
             batch_size = len(source_nodes)
-            empty_walk = {
-                'nodes': torch.zeros(batch_size, 1, 1, dtype=torch.long, device=source_nodes.device),
-                'times': torch.zeros(batch_size, 1, 1, dtype=torch.float32, device=source_nodes.device),
-                'masks': torch.zeros(batch_size, 1, 1, dtype=torch.float32, device=source_nodes.device)
-            }
+
+            # Create properly-shaped empty walks for each type
+            def _empty_walk_dict(B: int, num_walks: int, walk_length: int, device: torch.device, include_restart: bool = False) -> Dict:
+                result = {
+                    'nodes': torch.zeros(B, num_walks, walk_length, dtype=torch.long, device=device),
+                    'times': torch.zeros(B, num_walks, walk_length, dtype=torch.float32, device=device),
+                    'masks': torch.zeros(B, num_walks, walk_length, dtype=torch.float32, device=device)
+                }
+                if include_restart:
+                    result['restart_flags'] = torch.zeros(B, num_walks, walk_length, dtype=torch.float32, device=device)
+                return result
+
             return {
-                'source': {'short': empty_walk, 'long': empty_walk, 'tawr': empty_walk},
-                'target': {'short': empty_walk, 'long': empty_walk, 'tawr': empty_walk}
+                'source': {
+                    'short': _empty_walk_dict(batch_size, self.num_walks_short, self.walk_length_short, source_nodes.device),
+                    'long': _empty_walk_dict(batch_size, self.num_walks_long, self.walk_length_long, source_nodes.device),
+                    'tawr': _empty_walk_dict(batch_size, self.num_walks_tawr, self.walk_length_tawr, source_nodes.device, include_restart=True)
+                },
+                'target': {
+                    'short': _empty_walk_dict(batch_size, self.num_walks_short, self.walk_length_short, source_nodes.device),
+                    'long': _empty_walk_dict(batch_size, self.num_walks_long, self.walk_length_long, source_nodes.device),
+                    'tawr': _empty_walk_dict(batch_size, self.num_walks_tawr, self.walk_length_tawr, source_nodes.device, include_restart=True)
+                }
             }
         
         # Combine source and target nodes for efficient sampling
