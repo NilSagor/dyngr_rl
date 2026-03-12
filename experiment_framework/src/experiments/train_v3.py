@@ -31,9 +31,9 @@ from lightning.pytorch.callbacks import EarlyStopping
 from src.utils.general_utils import set_seed, get_device
 # from src.datasets.load_dataset import load_dataset, DATA_ROOT
 
+from src.datasets.continue_temporal.data_pipeline import DataPipeline
 
-
-from src.experiments.exp_utils.data_pipeline import DataPipeline
+# from src.experiments.exp_utils.data_pipeline import DataPipeline
 from src.experiments.exp_utils.model_factory import ModelFactory
 from src.experiments.exp_utils.model_profile import ModelProfiler
 from src.experiments.exp_utils.experiment_logger import ExperimentLogger

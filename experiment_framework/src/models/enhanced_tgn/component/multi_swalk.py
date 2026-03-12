@@ -104,23 +104,18 @@ class MultiScaleWalkSampler(nn.Module):
         """
         
         # Compute hash for change detection (more robust than .equal())
-        edge_index_hash = hash(tuple(edge_index.cpu().numpy().flatten()))
-        edge_time_hash = hash(tuple(edge_time.cpu().numpy()))
+        # edge_index_hash = hash(tuple(edge_index.cpu().numpy().flatten()))
+        # edge_time_hash = hash(tuple(edge_time.cpu().numpy()))
         
         edge_hash = self._compute_edge_hash(edge_index, edge_time)
         if not force and self._edges_initialized and edge_hash == self._cached_edge_hash:
             return
-        self._cached_edge_hash = edge_hash
+        # self._cached_edge_hash = edge_hash
         
-        # Skip if edges haven't changed
-        # if not force and self._edges_initialized:
-        #     if (edge_index_hash == self._cached_edge_index_hash and 
-        #         edge_time_hash == self._cached_edge_time_hash):
-        #         return
+       
 
         # Store hashes for next comparison
-        self._cached_edge_index_hash = edge_index_hash
-        self._cached_edge_time_hash = edge_time_hash
+        self._cached_edge_hash = edge_hash
         self._edges_initialized = True
         self.neighbor_cache = {}
         self._dense_tables_built = False
@@ -137,7 +132,7 @@ class MultiScaleWalkSampler(nn.Module):
         # Build neighbor lists for each node (undirected graph)
         for i in range(edge_index_np.shape[1]):
             src, dst = edge_index_np[0, i], edge_index_np[1, i]
-            t = float(edge_time_np[i])
+            t = float(edge_time_np[i])            
             
             # Add both directions
             self._add_to_cache(src, dst, t)
@@ -360,7 +355,7 @@ class MultiScaleWalkSampler(nn.Module):
 
             
             pos_mask = torch.arange(max_deg, device=device).unsqueeze(0).unsqueeze(0)
-            node_degree = neighbor_counts[curr_nodes].unsqueeze(-1)  # [B, W, 1]
+            node_degree = neighbor_counts.unsqueeze(-1)  # [B, W, 1]
             base_mask = pos_mask < node_degree  # [B, W, max_deg]
 
             temporal_mask = neighbor_times < curr_times.unsqueeze(-1)

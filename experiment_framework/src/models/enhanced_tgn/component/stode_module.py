@@ -4,7 +4,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Dict, Union
 from torchdiffeq import odeint, odeint_adjoint
 from loguru import logger
-
+import time
 from collections import OrderedDict
 
 
@@ -358,8 +358,12 @@ class STODEIntegrator(nn.Module):
         self.adjoint = adjoint
         self.max_steps = max_steps
         
+        if isinstance(step_size, str):
+            logger.warning(f"step_size received as string '{step_size}', converting to None")
+            step_size = None
+        
         if method in self.FIXED_STEP:
-            self.step_size = step_size or 0.1
+            self.step_size = step_size if step_size is not None else 0.1
             self.rtol = self.atol = None
         elif method in self.ADAPTIVE:
             self.step_size = None
@@ -393,8 +397,8 @@ class STODEIntegrator(nn.Module):
         options = {}
         if self.step_size is not None:
             options['step_size'] = self.step_size
-        
-                
+        # options['max_num_steps'] = 100 # limit steps per integration
+        start = time.time()       
         
         traj = self.solver(
             func=self.odefunc,
@@ -406,6 +410,10 @@ class STODEIntegrator(nn.Module):
             options=options if options else None,
         )
         
+               
+        elapsed = time.time() - start
+        # logger.info(f"ODE integration took {elapsed:.2f}s, {len(traj)} steps")
+
         return traj[-1].view(original_shape)
 
     def batch_integrate(
@@ -548,9 +556,6 @@ class STODELayer(nn.Module):
         else:  # Dynamic graph [T, N, N]
             adj_batch = adj_matrix
         
-        
-             
-        
         # Batch integrate all intervals (single call)
         H_ode_batch = self.integrator.batch_integrate(
             h0=H_init,
@@ -601,10 +606,16 @@ class SpectralTemporalODE(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
         
+        if isinstance(ode_step_size, str) and ode_step_size.lower() in ("none", "null", ""):
+            logger.warning(f"ode_step_size is string '{ode_step_size}', converting to None")
+            ode_step_size = None
+        
         # Must use fixed-step methods for batching
-        if ode_method not in STODEIntegrator.FIXED_STEP:
-            logger.warning(f"Switching {ode_method} to rk4 for batching support")
-            ode_method = "rk4"
+        # if ode_method not in STODEIntegrator.FIXED_STEP:
+        #     logger.warning(f"Switching {ode_method} to rk4 for batching support")
+        #     ode_method = "rk4"
+        if ode_method not in STODEIntegrator.FIXED_STEP and ode_method not in STODEIntegrator.ADAPTIVE:
+            raise ValueError(f"Unknown ODE method: {ode_method}")
         
         # Shared spectral regularizer across all layers!
         self.spectral_reg = SpectralRegularizer(
@@ -637,6 +648,7 @@ class SpectralTemporalODE(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
+        logger.debug(f"[DEBUG] ode_step_size value: {ode_step_size!r}, type: {type(ode_step_size)}")
         # self.amp_autocast = torch.amp.autocast(enabled=True, dtype=torch.float16)
     
     def _prepare_observations(
@@ -679,6 +691,13 @@ class SpectralTemporalODE(nn.Module):
         obs_tensor = obs_tensor / counts.clamp(min=1).unsqueeze(-1)
         
         return obs_tensor, unique_times
+    
+    def reset_temporal_state(self):
+        """Reset ODE solver state for new epoch."""
+        self.last_update_time = torch.tensor(0.0)
+        # Clear any internal solver buffers
+        if hasattr(self, 'solver_state'):
+            self.solver_state = None
     
     def forward(
         self,

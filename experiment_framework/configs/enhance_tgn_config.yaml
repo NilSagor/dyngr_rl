@@ -17,7 +17,8 @@ model:
   aggregator_type: "mean"  
   use_memory: true
   n_neighbors: 20
-  memory_updater_type: 'gru'  
+  memory_updater_type: 'gru'
+  use_gru_ode: True  
   #SAM
   use_sam: True # debug false,
   #HCT
@@ -30,11 +31,11 @@ model:
   mu: 0.0
   adaptive_mu: True
   use_st_ode: True
-  ode_method: 'rk4' # 'dopri5'
-  rtol: 0.0001
-  atol: 0.0000001
-  ode_step_size: 100   # increase step size to reduce steps
-  adjoint: False
+  ode_method: 'rk4' # 'dopri5', rk4
+  rtol: 0.1
+  atol: 0.001
+  ode_step_size: 500   # if dopri5, ode_step_size: null if rk4 ode_step_size: 100 increase step size to reduce steps
+  adjoint: True
   use_checkpoint: True
 
 
@@ -45,13 +46,16 @@ training:
   weight_decay: 0.0001
   max_epochs: 100
   patience: 5 # 3/5/10
-  val_check_interval: 1.0
+  val_check_interval: 0.5
+  # check_val_every_n_epoch: 5
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
   log_every_n_steps: 10
   lr_scheduler: "reduce_on_plateau"
   lr_patience: 3
   lr_factor: 0.5
+  continuous_time: true  
+  
   
 # Data parameters
 data:

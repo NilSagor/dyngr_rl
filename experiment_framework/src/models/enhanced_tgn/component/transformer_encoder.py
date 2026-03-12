@@ -25,78 +25,131 @@ def _sanitize_tensor(
     return x
 
 
+
+# new MergeLayer with temperature scaling
 class MergeLayer(nn.Module):
     """
-    Robust tensor merging layer for temporal attention mechanisms.
-    
-    Industry standard usage (TGN ICML 2020):
-    - ONLY supports 2-input merging (x1, x2)
-    - Total input dim = dim(x1) + dim(x2)
-    - Hidden dim and output dim explicitly specified
-    
-    Why no 4-arg support?
-    - Original TGN paper ONLY uses 2-input merging
-    - 4-arg pattern causes dimension mismatches (e.g., 204 vs 208 errors)
-    - Safer to enforce strict 2-input interface
+    Link prediction layer with optional temperature scaling for calibration.
     """
-    
-    def __init__(self, input_dim1: int, input_dim2: int, hidden_dim: int, output_dim: int):
+    def __init__(self, input_dim1, input_dim2, hidden_dim, output_dim, dropout=0.1, use_temperature=True):
         super().__init__()
-        
-        # CRITICAL FIX 1: Explicit dimension validation
-        if input_dim1 <= 0 or input_dim2 <= 0:
-            raise ValueError(f"Input dimensions must be positive: {input_dim1}, {input_dim2}")
-        if hidden_dim <= 0 or output_dim <= 0:
-            raise ValueError(f"Hidden/output dimensions must be positive: {hidden_dim}, {output_dim}")
-        
-        total_input_dim = input_dim1 + input_dim2
-        
-        self.fc1 = nn.Linear(total_input_dim, hidden_dim)
+        self.fc1 = nn.Linear(input_dim1 + input_dim2, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
         
-        # Proper weight initialization (with bias handling)
-        nn.init.xavier_normal_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)  # Explicit bias initialization
-        nn.init.xavier_normal_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
+        # Temperature scaling parameter (learnable)
+        self.use_temperature = use_temperature
+        if use_temperature:
+            # Initialize near 1.0 for stable training
+            self.temperature = nn.Parameter(torch.ones(1) * 1.0)
+        else:
+            self.register_buffer('temperature', torch.ones(1))
         
-        # Store dimensions for debugging/validation
-        self.input_dim1 = input_dim1
-        self.input_dim2 = input_dim2
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-    
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        """
-        Merge two tensors via concatenation + MLP.
-        
-        Args:
-            x1: Tensor of shape [..., input_dim1]
-            x2: Tensor of shape [..., input_dim2]
-        
-        Returns:
-            Tensor of shape [..., output_dim]
-        
-        Raises:
-            ValueError: If input dimensions don't match expected sizes
-        """
-        # Runtime dimension validation
-        if x1.size(-1) != self.input_dim1:
-            raise ValueError(
-                f"x1 dimension mismatch: expected {self.input_dim1}, got {x1.size(-1)}. "
-                f"Check attention layer configuration."
-            )
-        if x2.size(-1) != self.input_dim2:
-            raise ValueError(
-                f"x2 dimension mismatch: expected {self.input_dim2}, got {x2.size(-1)}. "
-                f"This causes attention shape errors (e.g., 204 vs 208)."
-            )
-        
-        # Safe concatenation
+    def forward(self, x1, x2, return_probs=False, threshold=None):
         x = torch.cat([x1, x2], dim=-1)
-        h = self.act(self.fc1(x))
-        return self.fc2(h)
+        h = F.relu(self.fc1(x))
+        h = self.dropout(h)
+        logits = self.fc2(h)
+        
+        if return_probs:
+            # Convert to probabilities
+            probs = torch.sigmoid(logits)
+            
+            # Apply temperature scaling to probabilities for calibration
+            # This is the CORRECT way: scale probabilities, not logits
+            if self.use_temperature and not self.training:
+                temp = self.temperature.clamp(min=0.1, max=10.0)
+                # Temperature scaling on probs: p' = p^(1/T) / (p^(1/T) + (1-p)^(1/T))
+                # Simplified approximation for small temperature changes:
+                probs = torch.sigmoid(logits / temp)
+            
+            if threshold is not None:
+                return (probs > threshold).float()
+            return probs
+        
+        return logits
+    
+    def get_temperature(self):
+        """Get current temperature value."""
+        return self.temperature.item()
+    
+    def set_temperature(self, value):
+        """Manually set temperature (for post-hoc calibration)."""
+        if self.use_temperature:
+            self.temperature.data.fill_(value)
+
+# class MergeLayer(nn.Module):
+#     """
+#     Robust tensor merging layer for temporal attention mechanisms.
+    
+#     Industry standard usage (TGN ICML 2020):
+#     - ONLY supports 2-input merging (x1, x2)
+#     - Total input dim = dim(x1) + dim(x2)
+#     - Hidden dim and output dim explicitly specified
+    
+#     Why no 4-arg support?
+#     - Original TGN paper ONLY uses 2-input merging
+#     - 4-arg pattern causes dimension mismatches (e.g., 204 vs 208 errors)
+#     - Safer to enforce strict 2-input interface
+#     """
+    
+#     def __init__(self, input_dim1: int, input_dim2: int, hidden_dim: int, output_dim: int):
+#         super().__init__()
+        
+#         # CRITICAL FIX 1: Explicit dimension validation
+#         if input_dim1 <= 0 or input_dim2 <= 0:
+#             raise ValueError(f"Input dimensions must be positive: {input_dim1}, {input_dim2}")
+#         if hidden_dim <= 0 or output_dim <= 0:
+#             raise ValueError(f"Hidden/output dimensions must be positive: {hidden_dim}, {output_dim}")
+        
+#         total_input_dim = input_dim1 + input_dim2
+        
+#         self.fc1 = nn.Linear(total_input_dim, hidden_dim)
+#         self.fc2 = nn.Linear(hidden_dim, output_dim)
+#         self.act = nn.ReLU()
+        
+#         # Proper weight initialization (with bias handling)
+#         nn.init.xavier_normal_(self.fc1.weight)
+#         nn.init.zeros_(self.fc1.bias)  # Explicit bias initialization
+#         nn.init.xavier_normal_(self.fc2.weight)
+#         nn.init.zeros_(self.fc2.bias)
+        
+#         # Store dimensions for debugging/validation
+#         self.input_dim1 = input_dim1
+#         self.input_dim2 = input_dim2
+#         self.hidden_dim = hidden_dim
+#         self.output_dim = output_dim
+    
+#     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Merge two tensors via concatenation + MLP.
+        
+#         Args:
+#             x1: Tensor of shape [..., input_dim1]
+#             x2: Tensor of shape [..., input_dim2]
+        
+#         Returns:
+#             Tensor of shape [..., output_dim]
+        
+#         Raises:
+#             ValueError: If input dimensions don't match expected sizes
+#         """
+#         # Runtime dimension validation
+#         if x1.size(-1) != self.input_dim1:
+#             raise ValueError(
+#                 f"x1 dimension mismatch: expected {self.input_dim1}, got {x1.size(-1)}. "
+#                 f"Check attention layer configuration."
+#             )
+#         if x2.size(-1) != self.input_dim2:
+#             raise ValueError(
+#                 f"x2 dimension mismatch: expected {self.input_dim2}, got {x2.size(-1)}. "
+#                 f"This causes attention shape errors (e.g., 204 vs 208)."
+#             )
+        
+#         # Safe concatenation
+#         x = torch.cat([x1, x2], dim=-1)
+#         h = self.act(self.fc1(x))
+#         return self.fc2(h)
 
 
 

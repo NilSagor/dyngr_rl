@@ -7,7 +7,10 @@ from typing import Dict, Optional, Tuple
 from loguru import logger
 
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score
 
+from src.datasets.sam_dataloading.neighbor_finder import NeighborFinder
 
 from ..base_enhance_tgn import BaseEnhancedTGN
 from ..component.time_encoder import TimeEncoder
@@ -97,8 +100,10 @@ class TGNv7(BaseEnhancedTGN):
         mu: float = 0.0,
         adaptive_mu: bool = False,
         use_gru_ode: bool = True,
-        ode_method: str = 'rk4',
+        ode_method: str = 'dopri5',
         ode_step_size: Optional[float] = 1000,
+        rtol: float = 1e-6,  # Add this
+        atol: float = 1e-8,
         adjoint: bool = True,
         aggregation: str = 'mean',
         time_precision: int = 6,
@@ -141,6 +146,9 @@ class TGNv7(BaseEnhancedTGN):
         
         self.use_sam = parse_bool(use_sam)
         self.debug_simple_walk = parse_bool(debug_simple_walk)
+
+        self.st_ode_update_interval = 10  # batches
+        self._st_ode_batch_counter = 0
 
         # Initialize time projection only if ST-ODE is enabled
         if self.use_st_ode:
@@ -286,7 +294,7 @@ class TGNv7(BaseEnhancedTGN):
         # Cache for walk data (avoid recomputation)
         self._walk_cache = None
         self._cache_batch_key = None
-        
+        self._prev_max_time = -float('inf')
         self._sam_batch_buffer = None
         
         # Simple walk projection (if needed)
@@ -295,11 +303,19 @@ class TGNv7(BaseEnhancedTGN):
         else:
             self.simple_walk_proj = nn.Identity()
 
+        # self.link_predictor = MergeLayer(
+        #     input_dim1=hidden_dim,
+        #     input_dim2=hidden_dim,
+        #     hidden_dim=hidden_dim,
+        #     output_dim=1
+        # )
         self.link_predictor = MergeLayer(
             input_dim1=hidden_dim,
             input_dim2=hidden_dim,
             hidden_dim=hidden_dim,
-            output_dim=1
+            output_dim=1,
+            dropout=dropout,
+            use_temperature=True  # Enable temperature scaling
         )
         
         if edge_features_dim == 0:
@@ -310,12 +326,20 @@ class TGNv7(BaseEnhancedTGN):
         logger.info(f"TGNv6 initialized: SAM({num_prototypes}p) + WalkSampler + "
                    f"{'HCT(' + str(hct_d_model) + 'd, ' + str(hct_nhead) + 'h)' if use_hct else 'SimpleWalkEncoder'}")
 
-    def _get_batch_key(self, batch: Dict) -> int:
-        """Fast hash for batch caching without GPU sync."""
-        # Use source nodes and timestamps hash (deterministic)
-        src_hash = batch['src_nodes'][:5].sum().item()  # Sample first 5
-        ts_hash = (batch['timestamps'][:5] * 1000).sum().item()
-        return hash((src_hash, ts_hash, len(batch['src_nodes'])))
+    def _get_batch_key(self, batch):
+        """Generate cache key from batch data."""
+        src_nodes = batch['src_nodes']
+        timestamps = batch['timestamps'] if 'timestamps' in batch else batch.get('ts', torch.tensor([]))
+        
+        # Sample first 5 elements for key (or all if smaller)
+        src_sample = src_nodes[:min(5, len(src_nodes))]
+        ts_sample = timestamps[:min(5, len(timestamps))] if len(timestamps) > 0 else torch.tensor([0.0])
+        
+        # Convert to numpy for hashing (cpu().numpy().tobytes())
+        src_bytes = src_sample.cpu().numpy().tobytes()
+        ts_bytes = ts_sample.cpu().numpy().tobytes()
+        
+        return (src_bytes, ts_bytes, len(src_nodes))
     
     def _get_device(self) -> torch.device:
         """Get device from model parameters."""
@@ -324,7 +348,7 @@ class TGNv7(BaseEnhancedTGN):
     def _prepare_stode_observations(self, batch):
         """Convert batch interactions to ST-ODE observation format."""
         
-        # Only run if ST-ODE is enabled AND SAM is used
+        """Fully vectorized ST-ODE observation preparation."""
         if not self.use_st_ode or not self.use_sam:
             return None
         
@@ -333,9 +357,8 @@ class TGNv7(BaseEnhancedTGN):
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']
-        batch_size = src_nodes.size(0)
         
-        # Vectorized embedding lookup
+        # Get embeddings
         src_emb = self.sam_module.raw_memory[src_nodes]
         dst_emb = self.sam_module.raw_memory[dst_nodes]
         time_emb = self.time_encoder(timestamps.float())
@@ -343,57 +366,58 @@ class TGNv7(BaseEnhancedTGN):
         if self._time_proj is not None and not isinstance(self._time_proj, nn.Identity):
             time_emb = self._time_proj(time_emb)
         
-        # Build adjacency for this batch only (src-dst edges)
+        # Build sparse adjacency once
         adj_t = self._build_temporal_adjacency(src_nodes, dst_nodes, num_nodes)
         
-        # Vectorized time aggregation
-        unique_times, inverse = torch.unique(timestamps, sorted=True, return_inverse=True)
-        T = len(unique_times)
+        # === VECTORIZED TIME AGGREGATION ===
+        # Sort by time for efficient grouping
+        sorted_ts, sort_idx = torch.sort(timestamps)
+        sorted_src = src_nodes[sort_idx]
+        sorted_dst = dst_nodes[sort_idx]
+        sorted_src_emb = src_emb[sort_idx] + time_emb[sort_idx]
+        sorted_dst_emb = dst_emb[sort_idx] + time_emb[sort_idx]
         
-
+        # Find time boundaries using diff
+        time_diff = torch.diff(sorted_ts, prepend=sorted_ts[:1])
+        time_boundaries = torch.where(time_diff > 0)[0]
+        T = len(time_boundaries) + 1
         
-
+        # Use scatter_add for vectorized aggregation
         node_obs = torch.zeros(T, num_nodes, self.memory_dim, device=device)
-
-        # For each unique time, aggregate embeddings from edges at that time
-        for t_idx in range(T):
-            mask = (inverse == t_idx)
-            if mask.any():
-                # Get src and dst for this time slot
-                src_t = src_nodes[mask]
-                dst_t = dst_nodes[mask]
-                src_emb_t = src_emb[mask]
-                dst_emb_t = dst_emb[mask]
-                time_emb_t = time_emb[mask]
-                
-                # Add source contributions: src_emb + time_emb
-                node_obs[t_idx].index_add_(0, src_t, src_emb_t + time_emb_t)
-                # Add destination contributions: dst_emb + time_emb  
-                node_obs[t_idx].index_add_(0, dst_t, dst_emb_t + time_emb_t)
-        
-        # Count occurrences for normalization (per node per time)
         counts = torch.zeros(T, num_nodes, device=device)
-        for t_idx in range(T):
-            mask = (inverse == t_idx)
-            if mask.any():
-                src_t = src_nodes[mask]
-                dst_t = dst_nodes[mask]
-                counts[t_idx].index_add_(0, src_t, torch.ones(src_t.size(0), device=device))
-                counts[t_idx].index_add_(0, dst_t, torch.ones(dst_t.size(0), device=device))
         
-        # Normalize by counts (avoid div by zero)
+        # Create segment IDs for each edge
+        segment_ids = torch.searchsorted(time_boundaries, torch.arange(len(sorted_ts), device=device))
+        
+        # Flatten for scatter_add: [T*N, D] indexing
+        flat_idx_src = segment_ids * num_nodes + sorted_src
+        flat_idx_dst = segment_ids * num_nodes + sorted_dst
+        
+        # Scatter add (much faster than loop)
+        node_obs_flat = node_obs.view(-1, self.memory_dim)
+        counts_flat = counts.view(-1)
+        
+        node_obs_flat.scatter_add_(0, flat_idx_src.unsqueeze(-1).expand(-1, self.memory_dim), sorted_src_emb)
+        node_obs_flat.scatter_add_(0, flat_idx_dst.unsqueeze(-1).expand(-1, self.memory_dim), sorted_dst_emb)
+        counts_flat.scatter_add_(0, flat_idx_src, torch.ones_like(sorted_src, dtype=torch.float))
+        counts_flat.scatter_add_(0, flat_idx_dst, torch.ones_like(sorted_dst, dtype=torch.float))
+        
+        # Reshape and normalize
         node_obs = node_obs / counts.unsqueeze(-1).clamp(min=1)
         
-        # Reshape for ST-ODE: [N, T, 1, D] - each node has T observations
-        walk_encodings = node_obs.permute(1, 0, 2).unsqueeze(2)  # [N, T, 1, D]
-        walk_times = unique_times.view(1, T, 1).expand(num_nodes, -1, -1)  # [N, T, 1]
-        walk_masks = (counts > 0).T.unsqueeze(-1).float()  # [N, T, 1]
+        # Reshape for ST-ODE: [N, T, 1, D]
+        walk_encodings = node_obs.permute(1, 0, 2).unsqueeze(2)
+        
+        # Use actual unique times
+        unique_times = torch.cat([sorted_ts[:1], sorted_ts[time_boundaries]])
+        walk_times = unique_times.view(1, T, 1).expand(num_nodes, -1, -1)
+        walk_masks = (counts > 0).T.unsqueeze(-1).float()
         
         return {
             'encodings': walk_encodings,
             'times': walk_times,
             'masks': walk_masks,
-            'adjs': adj_t  # One adjacency per time step
+            'adjs': adj_t
         }
             
         
@@ -439,7 +463,7 @@ class TGNv7(BaseEnhancedTGN):
         return obs
     
     
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, torch.Tensor], return_probs: bool = False) -> torch.Tensor:
         """Forward pass with proper SAM update sequencing."""
         source_emb, dest_emb = self.compute_temporal_embeddings(
             batch['src_nodes'],
@@ -451,13 +475,24 @@ class TGNv7(BaseEnhancedTGN):
         if self.training and self.use_memory:
             self._store_sam_interactions(batch)
         
-        scores = self.link_predictor(source_emb, dest_emb).squeeze(-1)
+        # Get raw logits
+        logits = self.link_predictor(source_emb, dest_emb).squeeze(-1) # [B]
         
-        if torch.isnan(scores).any():
+        if return_probs:
+            # Apply temperature if enabled
+            if hasattr(self.link_predictor, 'temperature') and self.link_predictor.use_temperature:
+                temp = self.link_predictor.temperature.clamp(min=0.1, max=10.0)
+                scaled_logits = logits / temp
+            else:
+                scaled_logits = logits
+            probs = torch.sigmoid(scaled_logits)
+            return logits, probs
+        
+        if torch.isnan(logits).any():
             logger.error(f"NaN in scores! source_emb: {torch.isnan(source_emb).any()}, "
                         f"dest_emb: {torch.isnan(dest_emb).any()}")
         
-        return scores
+        return logits
         
     
     
@@ -823,24 +858,95 @@ class TGNv7(BaseEnhancedTGN):
     def on_load_checkpoint(self, checkpoint):
         """Called when loading a checkpoint."""
         if hasattr(self, 'neighbor_finder') and self.neighbor_finder is not None:
-            self._initialize_walk_sampler_from_neighbor_finder()
-
-    
-    def _initialize_walk_sampler_from_neighbor_finder(self):
-        """Extract edge_index and edge_time from neighbor_finder."""
-        nf = self.neighbor_finder
+            self._initialize_walk_sampler_from_neighbor_finder(self.neighbor_finder)
+        else:
+            logger.warning("neighbor_finder not available when loading checkpoint - walk sampler may not be initialized")
         
-        if hasattr(nf, '_edges') and hasattr(nf, '_timestamps'):
-            edge_index = torch.tensor(nf._edges, dtype=torch.long).t()
-            edge_time = torch.tensor(nf._timestamps, dtype=torch.float)
+    def _initialize_walk_sampler_from_neighbor_finder(self, neighbor_finder):
+        """
+        Initialize walk sampler from NeighborFinder by reconstructing edge_index/edge_time.
+        
+        NeighborFinder stores edges in edge_id_adj_list: {node: [(neighbor, ts, edge_id), ...]}
+        We reconstruct the original [2, E] edge_index and [E] edge_time tensors.
+        """
+        edge_index = None
+        edge_time = None
+        
+        # === Strategy 1: Standard tensor attributes (for compatibility) ===
+        if hasattr(neighbor_finder, 'edge_index') and hasattr(neighbor_finder, 'edge_time'):
+            edge_index = neighbor_finder.edge_index
+            edge_time = neighbor_finder.edge_time
+            logger.info(f"Found edge_index {edge_index.shape} and edge_time {edge_time.shape} in neighbor_finder")
+        
+        # === Strategy 2: Legacy numpy attributes ===
+        elif hasattr(neighbor_finder, '_edges') and hasattr(neighbor_finder, '_timestamps'):
+            edges_np = neighbor_finder._edges
+            timestamps_np = neighbor_finder._timestamps
+            edge_index = torch.from_numpy(edges_np).T  # [E, 2] -> [2, E]
+            edge_time = torch.from_numpy(timestamps_np)
+            logger.info(f"Converted _edges/_timestamps to tensors: {edge_index.shape}, {edge_time.shape}")
+        
+        # === Strategy 3: Reconstruct from edge_id_adj_list (ACTUAL NeighborFinder format) ===
+        elif hasattr(neighbor_finder, 'edge_id_adj_list'):
+            logger.info("Reconstructing edge_index from edge_id_adj_list")
+            
+            # Collect unique edges by edge_id to avoid duplicates from undirected graph
+            # edge_id_adj_list: {src: [(dst, timestamp, edge_id), ...]}
+            edge_map: Dict[int, Tuple[int, int, float]] = {}
+            
+            for src_node, neighbors in neighbor_finder.edge_id_adj_list.items():
+                for dst_node, timestamp, edge_id in neighbors:
+                    if edge_id not in edge_map:
+                        # Store first occurrence of this edge_id (avoids undirected duplicates)
+                        edge_map[edge_id] = (src_node, dst_node, timestamp)
+            
+            if not edge_map:
+                logger.error("edge_id_adj_list is empty - cannot initialize walk sampler")
+                raise ValueError("NeighborFinder has no edges to initialize walk sampler")
+            
+            num_edges = len(edge_map)
+            logger.info(f"Reconstructed {num_edges} unique edges from edge_id_adj_list")
+            
+            # Build edge_index [2, E] and edge_time [E]
+            edge_index = torch.zeros((2, num_edges), dtype=torch.long)
+            edge_time = torch.zeros(num_edges, dtype=torch.float32)
+            
+            for edge_id, (src, dst, ts) in edge_map.items():
+                edge_index[0, edge_id] = src
+                edge_index[1, edge_id] = dst
+                edge_time[edge_id] = ts
+            
+            logger.info(f"Built edge_index shape {edge_index.shape}, edge_time shape {edge_time.shape}")
+        
+        # === Strategy 4: Fallback error with available attributes ===
+        else:
+            available = [attr for attr in dir(neighbor_finder) if not attr.startswith('__') and not callable(getattr(neighbor_finder, attr))]
+            logger.error(f"Cannot find edge data in neighbor_finder. Available attrs: {available}")
+            raise ValueError(
+                "neighbor_finder missing required edge data. Expected one of: "
+                "edge_index/edge_time, _edges/_timestamps, or edge_id_adj_list"
+            )
+        
+        # === Verify and normalize shapes ===
+        if edge_index.dim() == 2 and edge_index.shape[0] != 2:
+            logger.warning(f"Transposing edge_index from {edge_index.shape} to [2, E]")
+            edge_index = edge_index.T
+        
+        if edge_index.shape[0] != 2:
+            raise ValueError(f"edge_index must be [2, E], got {edge_index.shape}")
+        
+        if edge_time.shape[0] != edge_index.shape[1]:
+            raise ValueError(f"Shape mismatch: edge_index[1]={edge_index.shape[1]} != edge_time[0]={edge_time.shape[0]}")
+        
+        # === Initialize walk sampler ===
+        # Note: MultiScaleWalkSampler uses update_neighbors(), NOT initialize_from_edges()
+        try:
             self.walk_sampler.update_neighbors(edge_index, edge_time)
             self.walk_sampler.build_dense_neighbor_table()
-            logger.info(f"Walk sampler reinitialized with {edge_index.shape[1]} edges")
-        elif hasattr(nf, 'edge_index') and hasattr(nf, 'edge_time'):
-            self.walk_sampler.update_neighbors(nf.edge_index, nf.edge_time)
-            self.walk_sampler.build_dense_neighbor_table()
-        else:
-            logger.error("Cannot find edge data in neighbor_finder")
+            logger.info(f"✓ Walk sampler initialized with {edge_index.shape[1]} edges")
+        except Exception as e:
+            logger.error(f"Failed to initialize walk sampler: {e}")
+            raise
     
     def training_step(self, batch, batch_idx):
         src = batch['src_nodes']
@@ -872,6 +978,34 @@ class TGNv7(BaseEnhancedTGN):
             return None
         
         return loss
+    
+    # def validation_step(self, batch, batch_idx):
+    #     """Store predictions for threshold optimization."""
+    #     logits = self(batch)
+    #     probs = torch.sigmoid(logits)
+    #     labels = batch['labels'].float()
+        
+    #     loss = F.binary_cross_entropy_with_logits(logits, labels)
+        
+    #     # Store for threshold optimization
+    #     if not hasattr(self, '_val_predictions'):
+    #         self._val_predictions = []
+        
+    #     self._val_predictions.append({
+    #         'probs': probs.detach().cpu(),
+    #         'labels': labels.detach().cpu()
+    #     })
+        
+    #     # Standard metrics
+    #     self.log('val_loss', loss, prog_bar=True)
+        
+    #     # Use current optimal threshold if available
+    #     thresh = getattr(self, '_optimal_threshold', 0.5)
+    #     preds = (probs > thresh).float()
+    #     acc = (preds == labels).float().mean()
+    #     self.log('val_acc', acc, prog_bar=True)
+        
+    #     return loss
         
     def on_after_optimizer_step(self, optimizer):
         for name, param in self.named_parameters():
@@ -886,177 +1020,171 @@ class TGNv7(BaseEnhancedTGN):
             logger.info("SAM memory initialized for training")
 
     def on_after_backward(self):        
-        # Collect all parameters into single list        
-        param_groups = [
-        (self.sam_module.parameters() if self.use_sam and self.sam_module else [], 1.0),
-        ([self.sam_module.all_prototypes] if self.use_sam and self.sam_module and hasattr(self.sam_module, 'all_prototypes') else [], 0.5),
-        (self.hct.parameters() if self.use_hct and self.hct else [], 0.5),
-        (self.hct_to_tgn.parameters() if self.hct_to_tgn is not None and not isinstance(self.hct_to_tgn, nn.Identity) else [], 0.5),
-        (self.fusion_layer.parameters(), 0.5),
-        (self.embedding_module.parameters() if self.embedding_module else [], 0.5),
-        (self.link_predictor.parameters() if self.link_predictor else [], 0.5),
-        (self.message_fn.parameters() if self.message_fn else [], 0.5),
-        (self._time_proj.parameters() if self._time_proj is not None and not isinstance(self._time_proj, nn.Identity) else [], 0.5),
-        (self.walk_to_memory.parameters() if self.walk_to_memory is not None and not isinstance(self.walk_to_memory, nn.Identity) else [], 0.5),
-    ]
-
-        for params, max_norm in param_groups:
-            # Filter out empty parameter lists and ensure we have actual parameters
-            params_list = list(params)
-            if len(params_list) > 0:
-                # Check if any parameter has a gradient
-                has_grad = any(p.grad is not None for p in params_list)
-                if has_grad:
-                    try:
-                        torch.nn.utils.clip_grad_norm_(params_list, max_norm=max_norm)
-                    except Exception as e:
-                        logger.warning(f"Gradient clipping failed for a parameter group: {e}")
-
+        # Collect all parameters into single list
+        # Single global clip (faster)
+        all_params = [p for p in self.parameters() if p.grad is not None]
+        if all_params:
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        
+        # Or: Use gradient scaling instead of clipping for stability
+        # self.trainer.strategy.precision_plugin.scaler.unscale_(optimizer)
+        
         if DEBUG_VALIDATION:
             for name, param in self.named_parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
-                    logger.error(f"NaN gradient detected in {name}")
-                    # Optionally zero the gradient to prevent propagation
-                    param.grad.zero_()
+                    logger.error(f"NaN gradient in {name}")
+                    param.grad.zero_()        
+        #     param_groups = [
+        #     (self.sam_module.parameters() if self.use_sam and self.sam_module else [], 1.0),
+        #     ([self.sam_module.all_prototypes] if self.use_sam and self.sam_module and hasattr(self.sam_module, 'all_prototypes') else [], 0.5),
+        #     (self.hct.parameters() if self.use_hct and self.hct else [], 0.5),
+        #     (self.hct_to_tgn.parameters() if self.hct_to_tgn is not None and not isinstance(self.hct_to_tgn, nn.Identity) else [], 0.5),
+        #     (self.fusion_layer.parameters(), 0.5),
+        #     (self.embedding_module.parameters() if self.embedding_module else [], 0.5),
+        #     (self.link_predictor.parameters() if self.link_predictor else [], 0.5),
+        #     (self.message_fn.parameters() if self.message_fn else [], 0.5),
+        #     (self._time_proj.parameters() if self._time_proj is not None and not isinstance(self._time_proj, nn.Identity) else [], 0.5),
+        #     (self.walk_to_memory.parameters() if self.walk_to_memory is not None and not isinstance(self.walk_to_memory, nn.Identity) else [], 0.5),
+        # ]
+
+        #     for params, max_norm in param_groups:
+        #         # Filter out empty parameter lists and ensure we have actual parameters
+        #         params_list = list(params)
+        #         if len(params_list) > 0:
+        #             # Check if any parameter has a gradient
+        #             has_grad = any(p.grad is not None for p in params_list)
+        #             if has_grad:
+        #                 try:
+        #                     torch.nn.utils.clip_grad_norm_(params_list, max_norm=max_norm)
+        #                 except Exception as e:
+        #                     logger.warning(f"Gradient clipping failed for a parameter group: {e}")
+
+        #     if DEBUG_VALIDATION:
+        #         for name, param in self.named_parameters():
+        #             if param.grad is not None and torch.isnan(param.grad).any():
+        #                 logger.error(f"NaN gradient detected in {name}")
+        #                 # Optionally zero the gradient to prevent propagation
+        #                 param.grad.zero_()
 
     def on_train_batch_start(self, batch, batch_idx):
-        times = batch['timestamps']
-        current_max = times.max().item()
+        batch_times = batch.get('timestamps', batch.get('ts', torch.tensor([0])))
+        batch_min = float(batch_times.min())
+        batch_max = float(batch_times.max())
         
-        # check SAM memory if SAM is used
+        # Check SAM memory if SAM is used
         if self.use_sam and batch_idx > 0:
             mem_finite = torch.isfinite(self.sam_module.raw_memory).all().item()
-            # proto_finite = torch.isfinite(self.sam_module.all_prototypes).all().item()
             
             if not mem_finite:
                 logger.error(f"Batch {batch_idx} START: SAM memory already contains NaN!")
                 nan_count = (~torch.isfinite(self.sam_module.raw_memory)).sum().item()
                 logger.error(f"NaN count in memory: {nan_count}/{self.sam_module.raw_memory.numel()}")
                 self.sam_module.reset_memory()
-            
-       
-            logger.info(f"Epoch start - Batch 0 time range: [{times.min():.0f}, {times.max():.0f}]")
         
-        if hasattr(self, '_prev_max_time') and current_max<self._prev_max_time - 1e-6:
-            # if current_max < self._prev_max_time - 1e-6:
-            logger.error(f"TEMPORAL VIOLATION: Batch {batch_idx} max {current_max:.0f} < prev {self._prev_max_time:.0f}")
+        # Log epoch start info (only for batch 0)
+        if batch_idx == 0:
+            logger.info(f"Epoch start - Batch 0 time range: [{batch_min:.0f}, {batch_max:.0f}]")
         
-        self._prev_max_time = current_max
+        # Check temporal continuity
+        if hasattr(self, 'prev_batch_time') and self.prev_batch_time is not None:
+            if batch_max < self.prev_batch_time:
+                logger.warning(f"Temporal reset detected: {batch_max} < {self.prev_batch_time}")
+                # Reset ST-ODE state for new epoch
+                if hasattr(self, 'st_ode') and self.st_ode is not None:
+                    self.st_ode.reset_temporal_state()
+        
+        self.prev_batch_time = batch_max
+        # Initialize _prev_max_time if it doesn't exist
+        # if not hasattr(self, '_prev_max_time'):
+        #     self._prev_max_time = -float('inf')
+        
+        # # Check for temporal violation (only after initialization)
+        # if current_max < self._prev_max_time - 1e-6:
+        #     logger.error(f"TEMPORAL VIOLATION: Batch {batch_idx} max {current_max:.0f} < prev {self._prev_max_time:.0f}")
+        
+        # # Handle epoch reset or continuous tracking
+        # if batch_idx == 0 and self.current_epoch > 0:
+        #     # Expected reset at epoch start - don't treat as violation
+        #     self._prev_max_time = current_max  # Reset tracking
+        # else:
+        #     self._prev_max_time = max(self._prev_max_time, current_max)
         
         # Clear walk cache for new batch
         self._walk_cache = None
         self._cache_batch_key = None
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """SAM update happens HERE after backward pass."""
+        """Optimized batch end with throttled ST-ODE."""
         if not self.use_sam:
             return
         
-        # Guard all SAM operations
-        if self.use_sam:
-            if not torch.isfinite(self.sam_module.raw_memory).all():
-                logger.error(f"Batch {batch_idx}: Memory already NaN at batch end start! RESETTING")
-                self.sam_module.reset_memory()
+        # Periodic memory check (every 50 batches)
+        if batch_idx % 50 == 0 and torch.isnan(self.sam_module.raw_memory).any():
+            logger.error(f"Batch {batch_idx}: Memory NaN, resetting")
+            self.sam_module.reset_memory()
+        
+        # 1. SAM DISCRETE UPDATE (always)
+        if self.training and self._sam_batch_buffer is not None:
+            buffer = self._sam_batch_buffer
             
-            # 1. SAM DISCRETE UPDATE
-            if self.training and self.use_sam and self._sam_batch_buffer is not None:
-                buffer = self._sam_batch_buffer
-                
-                # Check buffer validity
-                if not torch.isfinite(buffer['edge_features']).all():
-                    logger.error(f"Batch {batch_idx}: Edge features NaN, skipping SAM update")
-                    self._sam_batch_buffer = None
-                    return
-                
-                with torch.no_grad():
-                    node_feats = self.node_embedding.weight.detach()
-                    try:
-                        self.sam_module.update_memory_batch(
-                            source_nodes=buffer['src_nodes'],
-                            target_nodes=buffer['dst_nodes'],
-                            edge_features=buffer['edge_features'],
-                            current_time=buffer['timestamps'],
-                            node_features=node_feats
-                        )
-                    except Exception as e:
-                        logger.error(f"Batch {batch_idx}: SAM update failed with error: {e}")
-                        self.sam_module.reset_memory()
-                
-                # Verify memory AFTER SAM update
-                if not torch.isfinite(self.sam_module.raw_memory).all():
-                    logger.error(f"Batch {batch_idx}: SAM memory NaN AFTER update! RESETTING")
-                    self.sam_module.reset_memory()
-                
-                if not torch.isfinite(self.sam_module.all_prototypes).all():
-                    logger.error(f"Batch {batch_idx}: Prototypes NaN! RESETTING")
-                    self.sam_module.all_prototypes.data.normal_(0, 0.01)
-                
-                # Final sanitization
-                self.sam_module.raw_memory.data = torch.nan_to_num(
-                    self.sam_module.raw_memory.data,
-                    nan=0.0, posinf=10.0, neginf=-10.0
-                ).clamp_(-10, 10)
-                self.sam_module.all_prototypes.data = torch.nan_to_num(
-                    self.sam_module.all_prototypes.data,
-                    nan=0.0, posinf=10.0, neginf=-10.0
-                ).clamp_(-10, 10)
-                
-                self._sam_batch_buffer = None
-            
-            # 2. ST-ODE CONTINUOUS EVOLUTION
-            if self.use_st_ode and self.use_sam and self.st_ode is not None:
-                current_time = batch['timestamps'].max()
-                time_delta = current_time - self.last_update_time
-                
-                if time_delta < 1e-6:
-                    self.last_update_time = current_time
-                    return
-                
-                if not torch.isfinite(self.sam_module.raw_memory).all():
-                    logger.error(f"Batch {batch_idx}: Memory NaN before ST-ODE, skipping")
-                    self.sam_module.reset_memory()
-                    self.last_update_time = current_time
-                    return
-                
+            with torch.no_grad():
                 try:
-                    obs_data = self._prepare_stode_observations(batch)
-                    if obs_data is None:
-                        self.last_update_time = current_time
-                        return
-                    
-                    # FIX: Simplified time filtering
-                    with torch.no_grad():
-                        evolved_memory = self.st_ode(
-                            node_states=self.sam_module.raw_memory,
-                            walk_encodings=obs_data['encodings'],
-                            walk_times=obs_data['times'],
-                            walk_masks=obs_data['masks'],
-                            adj_matrix=obs_data['adjs'],
-                        )
-                        
-                        # FIX: ST-ODE returns tensor directly, not object with .final_state
-                        evolved_state = evolved_memory
-                        
-                        if not torch.isfinite(evolved_state).all():
-                            logger.error(f"Batch {batch_idx}: ST-ODE produced NaN, skipping")
-                        elif evolved_state.abs().max() < 1e-8:
-                            logger.warning(f"Batch {batch_idx}: ST-ODE produced near-zero state")
-                        else:
-                            self.sam_module.raw_memory.data.copy_(evolved_state)
-                            self.last_update_time = current_time
-                            
+                    self.sam_module.update_memory_batch(
+                        source_nodes=buffer['src_nodes'],
+                        target_nodes=buffer['dst_nodes'],
+                        edge_features=buffer['edge_features'],
+                        current_time=buffer['timestamps'],
+                        node_features=self.node_embedding.weight.detach()
+                    )
                 except Exception as e:
-                    logger.error(f"Batch {batch_idx}: ST-ODE failed ({e})")
-                    self.last_update_time = current_time
+                    logger.error(f"SAM update failed: {e}")
+                    self.sam_module.reset_memory()
+            
+            self._sam_batch_buffer = None
+        
+        # 2. ST-ODE CONTINUOUS EVOLUTION (throttled)
+        if self.use_st_ode and self.st_ode is not None:
+            self._st_ode_batch_counter += 1
+            current_time = batch['timestamps'].max()
+            time_delta = current_time - self.last_update_time
+            
+            # Run every 10 batches OR when time gap > 1000
+            if self._st_ode_batch_counter >= 10 or time_delta > 1000:
+                self._st_ode_batch_counter = 0
+                
+                if time_delta > 1e-6 and torch.isfinite(self.sam_module.raw_memory).all():
+                    try:
+                        obs_data = self._prepare_stode_observations(batch)
+                        if obs_data is not None:
+                            with torch.no_grad():
+                                evolved = self.st_ode(
+                                    node_states=self.sam_module.raw_memory,
+                                    walk_encodings=obs_data['encodings'],
+                                    walk_times=obs_data['times'],
+                                    walk_masks=obs_data['masks'],
+                                    adj_matrix=obs_data['adjs'],
+                                )
+                                
+                                if torch.isfinite(evolved).all():
+                                    self.sam_module.raw_memory.data.copy_(evolved)
+                                    self.last_update_time = current_time
+                    except Exception as e:
+                        logger.warning(f"ST-ODE skipped: {e}")
+                        self.last_update_time = current_time
         
     
     
     def on_train_epoch_start(self):
         """Reset ST-ODE temporal state at epoch start."""
         super().on_train_epoch_start()
-        if self.use_st_ode:
-            self.last_update_time = torch.tensor(0.0, device=self.device)
-            logger.info("ST-ODE last_update_time reset for new epoch")
+        # if self.use_st_ode:
+        #     self.last_update_time = torch.tensor(0.0, device=self.device)
+        #     logger.info("ST-ODE last_update_time reset for new epoch")
+        # Reset ST-ODE temporal state for new epoch
+        self.prev_batch_time = 0
+        if hasattr(self, 'st_ode') and self.st_ode is not None:
+            self.st_ode.reset_temporal_state()
+        logger.info(f"Epoch {self.current_epoch} start - Temporal state reset")
 
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
@@ -1075,30 +1203,218 @@ class TGNv7(BaseEnhancedTGN):
             self._sam_validation_last_update = self.sam_module.last_update.clone().detach()
             logger.info("Cloned SAM memory for validation")
     
+    # def on_validation_epoch_end(self):
+    #     """Restore SAM memory after validation."""
+    #     super().on_validation_epoch_end()
+    #     if self.use_sam and self.use_memory:
+    #         self.sam_module.raw_memory.data.copy_(self._sam_validation_memory)
+    #         self.sam_module.last_update.data.copy_(self._sam_validation_last_update)
+    #         logger.info("Restored SAM memory after validation")
+        
+    #     if hasattr(self, '_last_hct_info') and self._last_hct_info is not None:
+    #         try:
+    #             for walk_type in ['short', 'long', 'tawr']:
+    #                 if walk_type in self._last_hct_info:
+    #                     cooc = self._last_hct_info[walk_type]['cooccurrence']
+    #                     logger.info(f"HCT {walk_type}: cooc_mean={cooc.mean():.3f}")
+    #         except (KeyError, TypeError, AttributeError) as e:
+    #             logger.debug(f"Could not log HCT co-occurrence: {e}")
+            
+    #         self._last_hct_info = None
+    
     def on_validation_epoch_end(self):
-        """Restore SAM memory after validation."""
+        """
+        Find optimal temperature for calibration using validation set.
+        """
         super().on_validation_epoch_end()
+        
+        # Restore SAM memory after validation (existing logic)
         if self.use_sam and self.use_memory:
             self.sam_module.raw_memory.data.copy_(self._sam_validation_memory)
             self.sam_module.last_update.data.copy_(self._sam_validation_last_update)
-            logger.info("Restored SAM memory after validation")
         
-        if hasattr(self, '_last_hct_info') and self._last_hct_info is not None:
-            try:
-                for walk_type in ['short', 'long', 'tawr']:
-                    if walk_type in self._last_hct_info:
-                        cooc = self._last_hct_info[walk_type]['cooccurrence']
-                        logger.info(f"HCT {walk_type}: cooc_mean={cooc.mean():.3f}")
-            except (KeyError, TypeError, AttributeError) as e:
-                logger.debug(f"Could not log HCT co-occurrence: {e}")
+        # Temperature calibration (if using temperature scaling)
+        if hasattr(self, '_val_logits_labels') and len(self._val_logits_labels) > 0:
+            all_logits = torch.cat([x['logits'] for x in self._val_logits_labels])
+            all_labels = torch.cat([x['labels'] for x in self._val_logits_labels])
             
-            self._last_hct_info = None
+            # Find temperature that minimizes BCE loss
+            best_temp = 1.0
+            best_loss = float('inf')
+            
+            for temp in [0.5, 0.7, 1.0, 1.5, 2.0, 3.0]:
+                scaled_logits = all_logits / temp
+                loss = F.binary_cross_entropy_with_logits(scaled_logits, all_labels)
+                if loss < best_loss:
+                    best_loss = loss
+                    best_temp = temp
+            
+            # Update model temperature
+            if hasattr(self.link_predictor, 'temperature'):
+                self.link_predictor.temperature.data.fill_(best_temp)
+                logger.info(f"Validation: Optimal temperature = {best_temp:.2f} (loss={best_loss:.4f})")
+            
+            self._val_logits_labels = []
+
+    def validation_step(self, batch, batch_idx):
+        """Enhanced validation step with storage for calibration."""
+        logits = self(batch)
+        labels = batch['labels'].float()
+        
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        probs = torch.sigmoid(logits)
+        
+        # Standard metrics
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_ap', self._compute_ap(probs, labels), prog_bar=True)
+        self.log('val_auc', self._compute_auc(probs, labels), prog_bar=True)
+        
+        # Store for temperature calibration
+        if not hasattr(self, '_val_logits_labels'):
+            self._val_logits_labels = []
+        
+        self._val_logits_labels.append({
+            'logits': logits.detach().cpu(),
+            'labels': labels.detach().cpu()
+        })
+        
+        # Check accuracy with current temperature
+        preds = (probs > 0.5).float()
+        acc = (preds == labels).float().mean()
+        self.log('val_acc', acc, prog_bar=True)
+        
+        return loss
     
-    
+    def test_step(self, batch, batch_idx):
+        """
+        Clean test step - only standard metrics for CSV export.
+        """
+        logits, probs = self(batch, return_probs=True)
+        labels = batch['labels'].float()
+        
+        # Compute probabilities
+        # probs = torch.sigmoid(logits)
+        
+        
+        # Standard metrics
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        threshold = getattr(self, '_optimal_threshold', 0.5)
+        preds = (probs > threshold).float()
+        # preds = (probs > 0.5).float()
+        accuracy = (preds == labels).float().mean()
+        
+        # Log standard metrics (aggregated by Lightning at epoch level)
+        self.log('test_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log('test_accuracy', accuracy, prog_bar=True, on_step=False, on_epoch=True)
+        
+        # Store predictions for AP/AUC calculation at epoch end
+        if not hasattr(self, '_test_predictions'):
+            self._test_predictions = []
+        
+        self._test_predictions.append({
+            'probs': probs.detach().cpu(),
+            'labels': labels.detach().cpu()
+        })
+        
+        # Silent diagnostics - only log once at start of testing
+        if batch_idx == 0 and not hasattr(self, '_test_diagnostics_logged'):
+            self._log_test_diagnostics(probs, logits, labels)
+            self._test_diagnostics_logged = True
+        
+        return loss
+
     def on_test_epoch_start(self):
-        """Reset SAM memory for cold-start test evaluation."""
+        """
+        FIXED: Warm-start test evaluation to preserve learned temporal patterns.
+        
+        Cold-start (reset memory) causes catastrophic performance drop because
+        the model loses all learned node representations.
+        """
         super().on_test_epoch_start()
+        
         if self.use_sam and self.use_memory:
-            self.sam_module.reset_memory()
-            logger.info("SAM memory reset for TEST")
+            # CRITICAL FIX: Use warm-start instead of cold-start
+            # Keep training memory state - do NOT reset
+            logger.info("TEST: Warm-start evaluation (training memory preserved)")
+            
+            # # Verify memory is in good state
+            # mem_finite = torch.isfinite(self.sam_module.raw_memory).all().item()
+            # mem_mean = self.sam_module.raw_memory.mean().item()
+            # mem_std = self.sam_module.raw_memory.std().item()
+            
+            # logger.info(f"TEST: Memory stats finite={mem_finite}, mean={mem_mean:.3f}, std={mem_std:.3f}")
+            
+            # if not mem_finite:
+            #     logger.error("TEST: Memory contains NaN! Attempting recovery...")
+            #     # Only reset if corrupted, otherwise keep training state
+            #     # self.sam_module.reset_memory()
+            #     # Try to warm-start with node features if available
+            #     if hasattr(self, 'node_embedding'):
+            #         self.sam_module.initialize_from_features(self.node_embedding.weight)
+
+    def _log_test_diagnostics(self, probs, logits, labels):
+        """Internal diagnostics - not metrics, just logs."""
+        # Find best threshold for reference
+        acc_05 = ((probs > 0.5).float() == labels).float().mean().item()
+        
+        # Try adaptive
+        adaptive_thresh = probs.mean().item()
+        acc_adaptive = ((probs > adaptive_thresh).float() == labels).float().mean().item()
+        
+        # Try balanced
+        pos_ratio = labels.mean().item()
+        balanced_thresh = probs.quantile(1 - pos_ratio).item() if pos_ratio > 0 else 0.5
+        acc_balanced = ((probs > balanced_thresh).float() == labels).float().mean().item()
+        
+        best_acc = max(acc_05, acc_adaptive, acc_balanced)
+        best_method = 'standard' if best_acc == acc_05 else ('adaptive' if best_acc == acc_adaptive else 'balanced')
+        
+        logger.info(f"Test calibration check - Best: {best_method}={best_acc:.3f} "
+                    f"(std={acc_05:.3f}, adapt={acc_adaptive:.3f}, bal={acc_balanced:.3f})")
+    
+    def on_test_epoch_end(self):
+        """
+        Compute and log AP/AUC - the final two standard metrics.
+        """
+        from sklearn.metrics import average_precision_score, roc_auc_score
+        
+        if hasattr(self, '_test_predictions') and len(self._test_predictions) > 0:
+            # Aggregate all predictions
+            all_probs = torch.cat([p['probs'] for p in self._test_predictions])
+            all_labels = torch.cat([p['labels'] for p in self._test_predictions])
+            
+            # Convert to numpy for sklearn
+            probs_np = all_probs.numpy()
+            labels_np = all_labels.numpy()
+            
+            # Compute final metrics
+            ap = average_precision_score(labels_np, probs_np)
+            auc = roc_auc_score(labels_np, probs_np)
+
+            adaptive_thresh = all_probs.mean().item()  # or use validation-optimal
+            preds_adaptive = (all_probs > adaptive_thresh).float()
+            acc_adaptive = (preds_adaptive == all_labels).float().mean()
+            
+            # Log final metrics (completes the 4 standard metrics)
+            self.log('test_ap', ap, prog_bar=True)
+            self.log('test_auc', auc, prog_bar=True)
+            
+            # Clean summary
+            logger.info(f"Test: AP={ap:.4f}, AUC={auc:.4f}, " 
+                        f"Acc@0.5={(all_probs>0.5).float().eq(all_labels).float().mean():.3f}, "
+                        f"Acc@adaptive={acc_adaptive:.3f}")
+            
+            # Cleanup
+            self._test_predictions = []
+            if hasattr(self, '_test_diagnostics_logged'):
+                delattr(self, '_test_diagnostics_logged')
+
+
+    def _compute_ap(self, probs, labels):
+        """Compute Average Precision."""        
+        return average_precision_score(labels.cpu().numpy(), probs.cpu().numpy())
+
+    def _compute_auc(self, probs, labels):
+        """Compute AUC."""        
+        return roc_auc_score(labels.cpu().numpy(), probs.cpu().numpy())
 

@@ -191,7 +191,7 @@ class IntraWalkEncoder(nn.Module):
         x = x.view(batch_size, num_walks, walk_len, d_model)
         
         # Reshape back BEFORE pooling        
-        masks = masks.view(batch_size, num_walks, walk_len)
+        # masks = masks.view(batch_size, num_walks, walk_len)
 
         # Pool to get walk summaries (mean over valid positions)        
         # Pool using ORIGINAL masks (not flattened)
