@@ -172,12 +172,8 @@ class TemporalDataset(Dataset):
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
-        Collate function that PRESERVES temporal ordering from the sampler.
-        
-        CRITICAL: The batch list is already in the order yielded by the sampler,
-        which is temporally ordered. We must NOT sort or reorder here.
+        Collate function that preserves temporal ordering and handles wrapped batches.
         """
-        # Stack tensors preserving input order (which is temporal order)
         batch_dict = {
             'src_nodes': torch.stack([item['src_node'] for item in batch]),
             'dst_nodes': torch.stack([item['dst_node'] for item in batch]),
@@ -186,15 +182,27 @@ class TemporalDataset(Dataset):
             'edge_features': torch.stack([item['edge_feature'] for item in batch]),
         }
         
-        # Verify temporal monotonicity (debugging check)
+        # Verify temporal monotonicity
         times = batch_dict['timestamps']
         if len(times) > 1:
+            # Check for decreasing timestamps
             is_monotonic = torch.all(times[1:] >= times[:-1] - 1e-5)
+            
             if not is_monotonic:
-                # Find violations for debugging
+                # Find violations
                 violations = (times[1:] < times[:-1] - 1e-5).nonzero(as_tuple=True)[0]
-                violation_times = [(times[i].item(), times[i+1].item()) for i in violations[:3]]
-                logger.warning(f"Temporal non-monotonicity detected in batch at positions: {violations.tolist()[:5]}, "
-                              f"time_pairs={violation_times}")
+                
+                # Log detailed info for debugging
+                for v in violations[:3]:  # Show first 3 violations
+                    i = v.item()
+                    logger.error(f"Temporal violation at position {i}: "
+                            f"time[{i}]={times[i]:.1f} > time[{i+1}]={times[i+1]:.1f}")
+                
+                # CRITICAL: Raise error to prevent training with bad batches
+                raise RuntimeError(
+                    f"Temporal non-monotonicity detected at positions: {violations.tolist()}. "
+                    f"Time range: [{times.min():.1f}, {times.max():.1f}]. "
+                    f"This violates temporal GNN assumptions."
+                )
         
         return batch_dict
