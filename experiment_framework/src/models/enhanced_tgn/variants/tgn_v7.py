@@ -303,12 +303,7 @@ class TGNv7(BaseEnhancedTGN):
         else:
             self.simple_walk_proj = nn.Identity()
 
-        # self.link_predictor = MergeLayer(
-        #     input_dim1=hidden_dim,
-        #     input_dim2=hidden_dim,
-        #     hidden_dim=hidden_dim,
-        #     output_dim=1
-        # )
+        
         self.link_predictor = MergeLayer(
             input_dim1=hidden_dim,
             input_dim2=hidden_dim,

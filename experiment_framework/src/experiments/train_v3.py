@@ -240,8 +240,9 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     if hasattr(model, 'embedding_module'):
         logger.debug(f"Embedding module initialized: {model.embedding_module is not None}")
 
-    logger.debug(f"1. embedding_module exists: {model.embedding_module is not None}")
-    logger.debug(f"2. memory_updater exists: {model.memory_updater is not None}")
+    logger.debug(f"1. embedding_module exists: {hasattr(model, 'embedding_module') and model.embedding_module is not None}")
+    logger.debug(f"2. memory_updater exists: {hasattr(model, 'memory_updater') and model.memory_updater is not None}")
+    # logger.debug(f"2. memory_updater exists: {model.memory_updater is not None}")
     logger.debug(f"3. neighbor_finder exists: {pipeline.neighbor_finder is not None}")
     logger.debug(f"4. node_raw_features shape: {model.node_raw_features.shape if model.node_raw_features is not None else 'None'}")
     logger.debug(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")

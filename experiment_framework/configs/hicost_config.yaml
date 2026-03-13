@@ -1,0 +1,103 @@
+# HiCoST Model Configuration
+
+# Model parameters
+model:
+  name: "HiCoST"
+  # num_nodes: null  # Will be set based on dataset
+  # node_features: 0  # Use learned embeddings
+  hidden_dim: 172
+  time_encoding_dim: 172
+  memory_dim: 172
+  message_dim: 172
+  # edge_features_dim: 172
+  num_layers: 2
+  n_heads: 2
+  dropout: 0.5
+  embedding_module_type: "graph_attention"
+  aggregator_type: "mean"  
+  use_memory: true
+  n_neighbors: 20
+  memory_updater_type: 'gru'
+  use_gru_ode: True  
+  #SAM
+  use_sam: True # debug false,
+  #HCT
+  hct_d_model: 64  # Smaller dimension
+  hct_nhead: 2     # Fewer heads
+  # dropout: 0.0,     # No dropout during debugs  
+  debug_simple_walk: False # if hct True, simple_walk False 
+  use_hct: True # hct activate
+  # ST ODE
+  mu: 0.0
+  adaptive_mu: True
+  use_st_ode: True
+  ode_method: 'rk4' # 'dopri5', rk4
+  rtol: 0.1
+  atol: 0.001
+  ode_step_size: 500   # if dopri5, ode_step_size: null if rk4 ode_step_size: 100 increase step size to reduce steps
+  adjoint: True
+  use_checkpoint: True
+
+
+# Training parameters
+training:
+  batch_size: 512 # 200 
+  learning_rate: 0.00001
+  weight_decay: 0.0001
+  max_epochs: 100
+  patience: 5 # 3/5/10
+  val_check_interval: 0.5
+  # check_val_every_n_epoch: 5
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  log_every_n_steps: 10
+  lr_scheduler: "reduce_on_plateau"
+  lr_patience: 3
+  lr_factor: 0.5
+  continuous_time: true  
+  
+  
+# Data parameters
+data:
+  dataset: "wikipedia"
+  shuffle: false
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  max_neighbors: 10
+  evaluation_type: "transductive"
+  negative_sampling_strategy: "random"
+  unseen_ratio: 0.1
+  validate_batches: true
+  
+# Experiment parameters
+experiment:
+  # name: "${model.name}_${data.evaluation_type}_${data.negative_sampling_strategy}"
+  # description: "${model.name} on ${data.dataset} |${data.evaluation_type}|${data.negative_sampling_strategy}"
+  seed: 42  
+  device: "auto"  # auto, cpu, cuda
+  precision: 32
+  debug: False
+  
+# Logging
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  save_top_k: 3
+  monitor: "val_ap"
+  mode: "max"
+  
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "ap", "auc"]
+  test_batch_size: 1000
+
+profiling:
+  enabled: true
+  profile_type: 'pytorch'
+
+# Hardware
+hardware:
+  gpus: 1  # null for CPU, number for GPU count
+  num_workers: 4
+  pin_memory: false
