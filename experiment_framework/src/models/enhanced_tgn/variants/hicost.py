@@ -36,8 +36,7 @@ def parse_bool(value):
 
 class HiCoST(L.LightningModule):
     """
-     HiCoST: Hierarchical Co-occurrence Spatio-Temporal Network
-     hierarchical co‑occurrence + spectral‑temporal ODE
+     HiCoST: Hierarchical Co-occurrence Spatio-Temporal Network     
      SAM + Multi-Scale Walk Sampler + Hierarchical Co-occurrence Transformer (HCT) + ST ODE + MutulRefinementPooling
     
     Architecture:
@@ -98,6 +97,7 @@ class HiCoST(L.LightningModule):
         adjoint: bool = True,
         use_st_ode: bool = True,
         directed: bool = False,
+        st_ode_residual_weight: float = 0.1,
         **kwargs
     ):        
         super().__init__()
@@ -105,9 +105,7 @@ class HiCoST(L.LightningModule):
         if os.environ.get('DEBUG_GRADIENTS'):
             torch.autograd.set_detect_anomaly(True)
         
-        
-        # self.directed = kwargs.get('directed', False)
-
+      
         # Core dimensions
         self.num_nodes = num_nodes
         self.hidden_dim = hidden_dim
@@ -116,15 +114,12 @@ class HiCoST(L.LightningModule):
         self.edge_features_dim = edge_features_dim
         self.dropout = dropout
         self.directed = directed
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        
-        # Feature flags (cleaned up)
+        # Feature flags
         self.use_sam = parse_bool(use_sam)
         self.use_hct = parse_bool(use_hct)
         self.use_st_ode = parse_bool(use_st_ode)
         self.debug_simple_walk = parse_bool(debug_simple_walk)
-        
         
         # Training config
         self.learning_rate = learning_rate
@@ -135,6 +130,9 @@ class HiCoST(L.LightningModule):
         self._st_ode_batch_counter = 0
         self.register_buffer('last_update_time', torch.tensor(0.0))
         
+        # ST-ODE residual weight for stable updates
+        self.st_ode_residual_weight = st_ode_residual_weight
+        
         self.save_hyperparameters()
         
         # === Time Encoder ===
@@ -143,6 +141,7 @@ class HiCoST(L.LightningModule):
         
         
         # === SAM Memory (primary memory - no TGN fallback) ===
+         # === SAM Memory ===
         if self.use_sam:
             self.sam_module = StabilityAugmentedMemory(
                 num_nodes=num_nodes,
@@ -154,10 +153,9 @@ class HiCoST(L.LightningModule):
                 similarity_metric=similarity_metric,
                 dropout=dropout
             )
-            logger.info(f"HiCoST initialized: SAM({num_prototypes}p) + WalkSampler + "
-                        f"{'HCT(' + str(hct_d_model) + 'd, ' + str(hct_nhead) + 'h)' if use_hct else 'SimpleWalkEncoder'}")
+            logger.info(f"HiCoST initialized: SAM({num_prototypes}p)" )
         else:
-            raise ValueError("SAM must be enabled (no TGN fallback available)")
+            raise ValueError("SAM must be enabled")
         
 
         # === Multi-Scale Walk Sampler ===
@@ -174,7 +172,7 @@ class HiCoST(L.LightningModule):
             time_dim=time_encoding_dim
         )        
         
-        # === Walk Processor (HCT or Simple Mean Pooling) ===
+        # === Walk Processor (HCT) ===
         if self.use_hct and not self.debug_simple_walk:
             self.hct = HierarchicalCooccurrenceTransformer(
                 d_model=hct_d_model,
@@ -190,7 +188,6 @@ class HiCoST(L.LightningModule):
                 cooccurrence_gamma=hct_cooccurrence_gamma,
                 use_walk_type_embedding=True
             )
-            # Project HCT output to hidden_dim if needed
             if hct_d_model != hidden_dim:
                 self.hct_to_hidden = nn.Sequential(
                     nn.Linear(hct_d_model, hidden_dim),
@@ -204,16 +201,21 @@ class HiCoST(L.LightningModule):
         else:
             self.hct = None
             self.hct_to_hidden = None
-            # Simple walk projection (if needed)
             if memory_dim != hidden_dim:
                 self.simple_walk_proj = nn.Linear(memory_dim, hidden_dim)
             else:
                 self.simple_walk_proj = nn.Identity()
-            logger.info("Using simple walk mean pooling (HCT disabled)")
+            logger.info("Using simple walk mean pooling")
         
-        # === ST-ODE (only if SAM is enabled) ===
+        if self.use_hct and hct_d_model != hidden_dim:
+            self._per_type_proj = nn.Linear(hct_d_model, hidden_dim)
+        else:
+            self._per_type_proj = None
+        
+        
+      
+        # === ST-ODE ===
         if self.use_st_ode:
-            # Time projection for ST-ODE (match memory dim)
             if time_encoding_dim != memory_dim:
                 self._time_proj = nn.Linear(time_encoding_dim, memory_dim)
                 nn.init.xavier_uniform_(self._time_proj.weight)
@@ -234,7 +236,13 @@ class HiCoST(L.LightningModule):
                 adjoint=adjoint,
                 dropout=dropout,
             )
-            # Project walk embeddings to memory dim for ST-ODE if needed
+            
+            # NEW: Learnable gate for ST-ODE residual fusion
+            self.st_ode_gate = nn.Sequential(
+                nn.Linear(memory_dim * 2, memory_dim),
+                nn.Sigmoid()
+            )
+            
             if self.use_hct and hct_d_model != memory_dim:
                 self.walk_to_memory = nn.Linear(hct_d_model, memory_dim)
             else:
@@ -243,24 +251,19 @@ class HiCoST(L.LightningModule):
             self.st_ode = None
             self._time_proj = None
             self.walk_to_memory = None
+            self.st_ode_gate = None
 
         
-        # === Mutual Refinement and Pooling ===
+        # === Mutual Refinement ===
         self.mutual_refine = MutualRefineAndPooling(
             d_model=hidden_dim,
             nhead=n_heads,
-        )
-        
-        
-        # self.edge_index = None
-        # self.edge_time = None
-
-        # self._time_proj = None
-
-        # self._walk_cache = {}
-        # self._cache_walks = False  # Toggle        
-        
-        # === Link Predictor (with temperature scaling) ===
+            dropout=dropout,
+            num_walk_types=3,  # short, long, tawr
+            max_walks_per_type=num_walks_short,  # 5 - the maximum walks per type
+        )    
+     
+        # === Link Predictor ===
         self.link_predictor = MergeLayer(
             input_dim1=hidden_dim,
             input_dim2=hidden_dim,
@@ -279,12 +282,19 @@ class HiCoST(L.LightningModule):
         self.prev_batch_time = 0
         
         
+        # NEW: Epoch-level memory backup (for proper validation isolation)
+        self._sam_epoch_start_memory = None
+        self._sam_epoch_start_last_update = None
+
+
         # Log initialization
         if edge_features_dim == 0:
             logger.warning("Edge features disabled (dim=0). SAM will receive zero edge input.")
         else:
             logger.info(f"Edge features enabled: input_dim={edge_features_dim}, projected_dim={memory_dim}")
     
+        
+        
         logger.info(f"HiCoST initialized: SAM({num_prototypes}p) + WalkSampler + "
                    f"{'HCT(' + str(hct_d_model) + 'd, ' + str(hct_nhead) + 'h)' if use_hct else 'SimpleWalkEncoder'}")
     
@@ -292,11 +302,11 @@ class HiCoST(L.LightningModule):
         """Generate cache key from batch data."""
         src_nodes = batch['src_nodes']
         timestamps = batch['timestamps'] if 'timestamps' in batch else batch.get('ts', torch.tensor([]))
-        
+
         # Sample first 5 elements for key (or all if smaller)
         src_sample = src_nodes[:min(5, len(src_nodes))]
         ts_sample = timestamps[:min(5, len(timestamps))] if len(timestamps) > 0 else torch.tensor([0.0])
-        
+
         # Convert to numpy for hashing
         src_bytes = src_sample.cpu().numpy().tobytes()
         ts_bytes = ts_sample.cpu().numpy().tobytes()
@@ -321,16 +331,14 @@ class HiCoST(L.LightningModule):
         if edge_features is not None:
             self.edge_raw_features = self.edge_raw_features.to(self.device)
         
-        # Optional: Update SAM module with node features if needed
+        # Update SAM module with node features if needed
         if self.use_sam and hasattr(self.sam_module, 'set_node_features'):
             self.sam_module.set_node_features(self.node_raw_features)
         
         logger.debug(f"Set raw features: node_feat_dim={self.node_raw_features.shape[-1] if self.node_raw_features is not None else 0}, "
                     f"edge_feat_dim={self.edge_raw_features.shape[-1] if self.edge_raw_features is not None else 0}")
 
-    
-    
-    
+  
     def _prepare_stode_observations(self, batch):
         """Convert batch interactions to ST-ODE observation format (vectorized)."""
         if not self.use_st_ode or not self.use_sam:
@@ -380,7 +388,8 @@ class HiCoST(L.LightningModule):
         node_obs_flat.scatter_add_(0, flat_idx_dst.unsqueeze(-1).expand(-1, self.memory_dim), sorted_dst_emb)
         counts_flat.scatter_add_(0, flat_idx_src, torch.ones_like(sorted_src, dtype=torch.float))
         counts_flat.scatter_add_(0, flat_idx_dst, torch.ones_like(sorted_dst, dtype=torch.float))
-        
+
+
         # Normalize
         node_obs = node_obs / counts.unsqueeze(-1).clamp(min=1)
         
@@ -510,14 +519,15 @@ class HiCoST(L.LightningModule):
         """
         device = self.device
         
-        # 1. Get SAM memory (detach to prevent gradient leakage during walk sampling)
-        node_memory = self.sam_module.raw_memory.detach()
+        # 1. Get SAM memory (detach to prevent gradient leakage during walk sampling)        
+        node_memory = self.sam_module.raw_memory
         
         # Validate memory (critical for stability)
         if not torch.isfinite(node_memory).all():
             logger.error("SAM memory contains NaN/Inf! Resetting...")
             self.sam_module.reset_memory()
-            node_memory = self.sam_module.raw_memory.detach()
+            # node_memory = self.sam_module.raw_memory.detach()
+            node_memory = self.sam_module.raw_memory
         
         # Fix NaN in timestamps
         edge_times = torch.nan_to_num(edge_times, nan=0.0)
@@ -529,6 +539,7 @@ class HiCoST(L.LightningModule):
         batch_size = src_tensor.size(0)
         
         # 2. Generate walks (cached if possible)
+        # Generate walks
         cache_key = self._get_batch_key(batch) if batch is not None else None
         if cache_key == self._cache_batch_key and self._walk_cache is not None:
             walk_data = self._walk_cache
@@ -538,7 +549,7 @@ class HiCoST(L.LightningModule):
                     source_nodes=src_tensor,
                     target_nodes=dst_tensor,
                     current_times=ts_tensor,
-                    memory_states=node_memory,
+                    memory_states=node_memory.detach(),  # Detach only for sampling, not for gradients
                     edge_index=None,
                     edge_time=None
                 )
@@ -562,7 +573,6 @@ class HiCoST(L.LightningModule):
         dst_masks = None
         
         if self.use_hct and not self.debug_simple_walk:
-            # Combine source/target walks for batch processing
             combined_walks = {
                 'short': {
                     'nodes': torch.cat([walk_data['source']['short']['nodes'], walk_data['target']['short']['nodes']], dim=0),
@@ -600,8 +610,8 @@ class HiCoST(L.LightningModule):
             
             # Project per-type embeddings to hidden dim if needed
             if src_per_type is not None and src_per_type.size(-1) != self.hidden_dim:
-                if not hasattr(self, '_per_type_proj'):
-                    self._per_type_proj = nn.Linear(src_per_type.size(-1), self.hidden_dim).to(device)
+                # if not hasattr(self, '_per_type_proj'):
+                #     self._per_type_proj = nn.Linear(src_per_type.size(-1), self.hidden_dim).to(device)
                 src_per_type = self._per_type_proj(src_per_type)
                 dst_per_type = self._per_type_proj(dst_per_type)
         else:
@@ -609,34 +619,47 @@ class HiCoST(L.LightningModule):
             walk_src_emb = self._simple_walk_embed(walk_data['source'], node_memory)
             walk_dst_emb = self._simple_walk_embed(walk_data['target'], node_memory)
         
-        # 5. Mutual Refinement (walk embeddings only - no TGN base embeddings)
-        combined_walk = torch.cat([walk_src_emb, walk_dst_emb], dim=0)
+        # # 5. Mutual Refinement (walk embeddings only - no TGN base embeddings)
+        # combined_walk = torch.cat([walk_src_emb, walk_dst_emb], dim=0)
         
-        # Prepare per-type embeddings for refinement
-        if src_per_type is not None and dst_per_type is not None:
-            combined_per_type = torch.cat([src_per_type, dst_per_type], dim=0)
-            combined_masks = torch.cat([src_masks, dst_masks], dim=0).bool()
-        else:
-            combined_per_type = None
-            combined_masks = None
+        # # Prepare per-type embeddings for refinement
+        # if src_per_type is not None and dst_per_type is not None:
+        #     combined_per_type = torch.cat([src_per_type, dst_per_type], dim=0)
+        #     combined_masks = torch.cat([src_masks, dst_masks], dim=0).bool()
+        # else:
+        #     combined_per_type = None
+        #     combined_masks = None
         
         # Run mutual refinement (walk embeddings self-refinement)
-        refined_walk, _ = self.mutual_refine(
-            src_walk=combined_walk,
-            dst_walk=combined_walk,  # Self-refinement (no TGN base to refine with)
-            src_per_type=combined_per_type,
-            dst_per_type=None,
-            src_masks=combined_masks,
-            dst_masks=None,
+        # refined_walk, _ = self.mutual_refine(
+        #     src_walk=combined_walk,
+        #     dst_walk=combined_walk,  # Self-refinement (no TGN base to refine with)
+        #     src_per_type=combined_per_type,
+        #     dst_per_type=None,
+        #     src_masks=combined_masks,
+        #     dst_masks=None,
+        # )
+        
+        # # Split back to source/destination
+        # final_src = refined_walk[:batch_size]
+        # final_dst = refined_walk[batch_size:]
+
+        # Run mutual refinement (walk embeddings self-refinement)
+        refined_src, refined_dst = self.mutual_refine(
+            src_walk=walk_src_emb,
+            dst_walk=walk_dst_emb,
+            src_per_type=src_per_type,
+            dst_per_type=dst_per_type,
+            src_masks=src_masks,
+            dst_masks=dst_masks,
         )
         
-        # Split back to source/destination
-        final_src = refined_walk[:batch_size]
-        final_dst = refined_walk[batch_size:]
+        # final_src = refined_src
+        # final_dst = refined_dst
         
         # Final NaN protection
-        final_src = torch.nan_to_num(final_src, nan=0.0, posinf=10.0, neginf=-10.0)
-        final_dst = torch.nan_to_num(final_dst, nan=0.0, posinf=10.0, neginf=-10.0)
+        final_src = torch.nan_to_num(refined_src, nan=0.0, posinf=10.0, neginf=-10.0)
+        final_dst = torch.nan_to_num(refined_dst, nan=0.0, posinf=10.0, neginf=-10.0)
         
         return final_src, final_dst
     
@@ -675,16 +698,17 @@ class HiCoST(L.LightningModule):
     
     def _store_sam_interactions(self, batch: Dict[str, torch.Tensor]):
         """Store interactions in buffer for deferred SAM update."""
-        device = self.device
-        src_nodes = batch['src_nodes'].to(device)
-        dst_nodes = batch['dst_nodes'].to(device)
-        timestamps = batch['timestamps'].to(device)
+        # Store tensors as-is from batch (they'll be moved to correct device in on_train_batch_end)
+        src_nodes = batch['src_nodes']
+        dst_nodes = batch['dst_nodes']
+        timestamps = batch['timestamps']
         
         # Handle edge features (zero if not available)
         if 'edge_features' in batch and batch['edge_features'] is not None:
-            edge_feats = batch['edge_features'].to(device)
+            edge_feats = batch['edge_features']
         else:
-            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=device)
+            # Create on the same device as src_nodes
+            edge_feats = torch.zeros(len(src_nodes), self.edge_features_dim, device=src_nodes.device)
         
         self._sam_batch_buffer = {
             'src_nodes': src_nodes,
@@ -873,32 +897,43 @@ class HiCoST(L.LightningModule):
         self._cache_batch_key = None
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Batch end processing (SAM/ST-ODE updates)."""
+        """Batch end with FIXED ST-ODE residual update."""
         if not self.use_sam:
-            return
-        
-        # 1. SAM memory update
+                return
+                
+        # 1. SAM memory update (no_grad - doesn't need gradients)
         if self.training and self._sam_batch_buffer is not None:
             buffer = self._sam_batch_buffer
+            device = self.sam_module.raw_memory.device
+
             with torch.no_grad():
                 try:
+                    src_nodes = buffer['src_nodes'].to(device)
+                    dst_nodes = buffer['dst_nodes'].to(device)
+                    timestamps = buffer['timestamps'].to(device)
+                    edge_feats = buffer['edge_features'].to(device)
+                    
+                    node_feats = None
+                    if hasattr(self, 'node_raw_features') and self.node_raw_features is not None:
+                        node_feats = self.node_raw_features.to(device)
+                    
                     self.sam_module.update_memory_batch(
-                        source_nodes=buffer['src_nodes'],
-                        target_nodes=buffer['dst_nodes'],
-                        edge_features=buffer['edge_features'],
-                        current_time=buffer['timestamps'],
-                        node_features=self.node_raw_features if hasattr(self, 'node_raw_features') else None  # Adjust if node features exist
+                        source_nodes=src_nodes,
+                        target_nodes=dst_nodes,
+                        edge_features=edge_feats,
+                        current_time=timestamps,
+                        node_features=node_feats
                     )
                 except Exception as e:
                     logger.error(f"SAM update failed: {e}")
                     self.sam_module.reset_memory()
             self._sam_batch_buffer = None
         
-        # 2. ST-ODE update (throttled for efficiency)
+        # 2. ST-ODE update with RESIDUAL (not destructive)
         if self.use_st_ode and self.st_ode is not None:
             self._st_ode_batch_counter += 1
-            current_time = batch['timestamps'].max()
-            time_delta = current_time - self.last_update_time
+            current_time = batch['timestamps'].max().to(self.device)
+            time_delta = current_time - self.last_update_time.to(self.device)
             
             if self._st_ode_batch_counter >= self.st_ode_update_interval or time_delta > 1000:
                 self._st_ode_batch_counter = 0
@@ -906,6 +941,11 @@ class HiCoST(L.LightningModule):
                     try:
                         obs_data = self._prepare_stode_observations(batch)
                         if obs_data is not None:
+                            for key in obs_data:
+                                if isinstance(obs_data[key], torch.Tensor):
+                                    obs_data[key] = obs_data[key].to(self.device)
+                            
+                            # FIX: Residual update instead of destructive overwrite
                             with torch.no_grad():
                                 evolved = self.st_ode(
                                     node_states=self.sam_module.raw_memory,
@@ -915,18 +955,29 @@ class HiCoST(L.LightningModule):
                                     adj_matrix=obs_data['adjs'],
                                 )
                                 if torch.isfinite(evolved).all():
-                                    self.sam_module.raw_memory.data.copy_(evolved)
+                                    # Compute residual with gating
+                                    gate = self.st_ode_gate(
+                                        torch.cat([self.sam_module.raw_memory, evolved], dim=-1)
+                                    )
+                                    # Residual update: gate * evolved + (1 - gate) * current
+                                    updated = gate * evolved + (1 - gate) * self.sam_module.raw_memory
+                                    self.sam_module.raw_memory.data.copy_(updated)
                                     self.last_update_time = current_time
                     except Exception as e:
                         logger.warning(f"ST-ODE update skipped: {e}")
                         self.last_update_time = current_time
     
     def on_train_epoch_start(self):
-        """Epoch start setup (temporal state reset)."""
+        """FIX: Backup memory BEFORE any training occurs."""
         self.prev_batch_time = 0
         if self.st_ode is not None:
             self.st_ode.reset_temporal_state()
-        logger.info(f"Epoch start - Temporal state reset")
+        
+        # FIX: Backup clean memory state at epoch start
+        if self.use_sam:
+            self._sam_epoch_start_memory = self.sam_module.raw_memory.clone().detach()
+            self._sam_epoch_start_last_update = self.sam_module.last_update.clone().detach()
+            logger.info(f"Epoch start - Backed up clean SAM memory")
     
     def on_train_epoch_end(self):
         """Epoch end cleanup (cache clearing)."""
@@ -938,17 +989,25 @@ class HiCoST(L.LightningModule):
     
     def on_validation_epoch_start(self):
         """Validation start (SAM memory clone)."""
+        self._walk_cache = None
+        self._cache_batch_key = None
         if self.use_sam:
-            self._sam_validation_memory = self.sam_module.raw_memory.clone().detach()
-            self._sam_validation_last_update = self.sam_module.last_update.clone().detach()
-            logger.info("Cloned SAM memory for validation")
+            # FIX: Restore to clean epoch-start memory, not current (potentially corrupted)
+            if self._sam_epoch_start_memory is not None:
+                self.sam_module.raw_memory.data.copy_(self._sam_epoch_start_memory)
+                self.sam_module.last_update.data.copy_(self._sam_epoch_start_last_update)
+                logger.info("Restored clean SAM memory for validation")
+            else:
+                # Fallback if backup missing
+                self._sam_validation_memory = self.sam_module.raw_memory.clone().detach()
+                self._sam_validation_last_update = self.sam_module.last_update.clone().detach()
     
     def on_validation_epoch_end(self):
         """Validation end (SAM memory restore + temperature calibration)."""
         # Restore SAM memory
-        if self.use_sam:
-            self.sam_module.raw_memory.data.copy_(self._sam_validation_memory)
-            self.sam_module.last_update.data.copy_(self._sam_validation_last_update)
+        if self.use_sam and self._sam_epoch_start_memory is not None:
+            self.sam_module.raw_memory.data.copy_(self._sam_epoch_start_memory)
+            self.sam_module.last_update.data.copy_(self._sam_epoch_start_last_update)
         
         # Temperature calibration
         if hasattr(self, '_val_logits_labels') and len(self._val_logits_labels) > 0:
@@ -958,7 +1017,7 @@ class HiCoST(L.LightningModule):
             # Find optimal temperature
             best_temp = 1.0
             best_loss = float('inf')
-            for temp in [0.5, 0.7, 1.0, 1.5, 2.0, 3.0]:
+            for temp in [0.5, 0.7, 1.0, 1.5, 2.0]:
                 scaled_logits = all_logits / temp
                 loss = F.binary_cross_entropy_with_logits(scaled_logits, all_labels)
                 if loss < best_loss:
@@ -968,7 +1027,7 @@ class HiCoST(L.LightningModule):
             # Update link predictor temperature
             if hasattr(self.link_predictor, 'temperature'):
                 self.link_predictor.temperature.data.fill_(best_temp)
-                logger.info(f"Optimal validation temperature: {best_temp:.2f} (loss={best_loss:.4f})")
+                logger.info(f"Optimal temperature: {best_temp:.2f} (loss={best_loss:.4f})")
             
             self._val_logits_labels = []
     

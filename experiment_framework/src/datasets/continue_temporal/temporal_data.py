@@ -174,6 +174,9 @@ class TemporalDataset(Dataset):
         """
         Collate function that preserves temporal ordering and handles wrapped batches.
         """
+        # Check if edge features exist in the first sample
+        has_edge_feat = batch[0].get('edge_feature') is not None
+
         batch_dict = {
             'src_nodes': torch.stack([item['src_node'] for item in batch]),
             'dst_nodes': torch.stack([item['dst_node'] for item in batch]),
@@ -181,6 +184,19 @@ class TemporalDataset(Dataset):
             'labels': torch.stack([item['label'] for item in batch]),
             'edge_features': torch.stack([item['edge_feature'] for item in batch]),
         }
+        
+        # Safely handle edge features (stack only if present)
+        if has_edge_feat:
+            try:
+                batch_dict['edge_features'] = torch.stack([item['edge_feature'] for item in batch])
+            except RuntimeError:
+                # Fallback if shapes mismatch (shouldn't happen with zeros)
+                logger.warning("Edge feature shape mismatch in batch, filling with zeros.")
+                dim = batch[0]['edge_feature'].shape[0]
+                batch_dict['edge_features'] = torch.zeros(len(batch), dim)
+        else:
+            batch_dict['edge_features'] = None
+        
         
         # Verify temporal monotonicity
         times = batch_dict['timestamps']

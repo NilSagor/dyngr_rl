@@ -27,6 +27,15 @@ class MutualRefineAndPooling(nn.Module):
         self.num_walk_types = num_walk_types
         self.max_walks_per_type = max_walks_per_type
 
+        # Validate nhead divides d_model
+        if d_model % nhead != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+        
+        # Store head dimension for checks
+        self.head_dim = d_model // nhead
+
+        
+        
         # ==================== Bidirectional Cross-Attention ====================
         self.cross_attn_src2dst = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True
@@ -59,12 +68,14 @@ class MutualRefineAndPooling(nn.Module):
         # Now preserves per-type information by keeping them separate
         self.type_fusion_src = nn.Sequential(
             nn.Linear(d_model * num_walk_types, d_model * 2),
+            nn.LayerNorm(d_model * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model),
         )
         self.type_fusion_dst = nn.Sequential(
             nn.Linear(d_model * num_walk_types, d_model * 2),
+            nn.LayerNorm(d_model * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 2, d_model),
@@ -75,14 +86,14 @@ class MutualRefineAndPooling(nn.Module):
         self.norm_dst = nn.LayerNorm(d_model)
         self.ffn_src = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
-            nn.ReLU(),
+            nn.GELU(),  # GELU is more stable than ReLU
             nn.Dropout(dropout),
             nn.Linear(d_model * 4, d_model),
             nn.Dropout(dropout),
         )
         self.ffn_dst = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 4, d_model),
             nn.Dropout(dropout),
@@ -97,78 +108,131 @@ class MutualRefineAndPooling(nn.Module):
         src_masks: Optional[torch.Tensor] = None,     # [B, num_types, max_walks] (valid walks mask)
         dst_masks: Optional[torch.Tensor] = None,     # [B, num_types, max_walks]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B = src_walk.shape[0]
+        # Validate inputs
+        B, D = src_walk.shape
+        assert D == self.d_model, f"src_walk dim {D} != d_model {self.d_model}"
+        assert dst_walk.shape == (B, D), f"dst_walk shape {dst_walk.shape} != {(B, D)}"
         
         # ==================== 1. Bidirectional Cross-Attention ====================
         s = src_walk.unsqueeze(1)  # [B, 1, D]
         d = dst_walk.unsqueeze(1)  # [B, 1, D]
         
-        src_cross, src_attn = self.cross_attn_src2dst(query=s, key=d, value=d)
-        dst_cross, dst_attn = self.cross_attn_dst2src(query=d, key=s, value=s)
+        src_cross, _ = self.cross_attn_src2dst(query=s, key=d, value=d)
+        dst_cross, _ = self.cross_attn_dst2src(query=d, key=s, value=s)
+
+        src_cross = src_cross.squeeze(1)  # [B, D]
+        dst_cross = dst_cross.squeeze(1)  # [B, D]
         
         # ==================== 2. Adaptive Gating ====================
-        gate_src = self.gate_src(torch.cat([src_walk, src_cross.squeeze(1)], dim=-1))
-        gate_dst = self.gate_dst(torch.cat([dst_walk, dst_cross.squeeze(1)], dim=-1))
+        gate_src = self.gate_src(torch.cat([src_walk, src_cross], dim=-1))
+        gate_dst = self.gate_dst(torch.cat([dst_walk, dst_cross], dim=-1))
         
-        refined_src = src_walk + gate_src * src_cross.squeeze(1)
-        refined_dst = dst_walk + gate_dst * dst_cross.squeeze(1)
+        refined_src = src_walk + gate_src * src_cross
+        refined_dst = dst_walk + gate_dst * dst_cross
         
         # ==================== 3. Hierarchical Pooling (if raw walks provided) ====================
         if src_per_type is not None and dst_per_type is not None:
-            # Pool within each walk type (across walks, not types)
+            # Validate shapes
+            expected_shape = (B, self.num_walk_types, self.max_walks_per_type, D)
+            assert src_per_type.shape == expected_shape, \
+                f"src_per_type shape {src_per_type.shape} != {expected_shape}"
+            assert dst_per_type.shape == expected_shape, \
+                f"dst_per_type shape {dst_per_type.shape} != {expected_shape}"
+            
+            # Ensure masks are boolean and correct shape
+            if src_masks is not None:
+                if src_masks.dtype != torch.bool:
+                    src_masks = src_masks.bool()
+                assert src_masks.shape == (B, self.num_walk_types, self.max_walks_per_type), \
+                    f"src_masks shape {src_masks.shape} != {(B, self.num_walk_types, self.max_walks_per_type)}"
+            
+            if dst_masks is not None:
+                if dst_masks.dtype != torch.bool:
+                    dst_masks = dst_masks.bool()
+                assert dst_masks.shape == (B, self.num_walk_types, self.max_walks_per_type)
+            
+            # Pool within each walk type
             src_type_embeds = []
             dst_type_embeds = []
             
+           
             # Expand pool query for batch
             pool_query = self.pool_query.expand(B, -1, -1)  # [B, 1, D]
             
             for t in range(self.num_walk_types):
-                # Extract walks of this type
-                src_walks_t = src_per_type[:, t]  # [B, max_walks, D]
-                dst_walks_t = dst_per_type[:, t]  # [B, max_walks, D]
+                # Extract walks of this type: [B, max_walks, D]
+                src_walks_t = src_per_type[:, t]
+                dst_walks_t = dst_per_type[:, t]
                 
-                # Get masks for this type (if provided)
-                src_mask_t = src_masks[:, t] if src_masks is not None else None
-                dst_mask_t = dst_masks[:, t] if dst_masks is not None else None
+                # Get masks: [B, max_walks], True = valid, False = pad
+                # For key_padding_mask: True = mask out (pad), so we invert
+                src_mask_t = None
+                dst_mask_t = None
                 
-                # Pool using attention with learnable query
-                # This effectively does weighted average across walks
-                src_pooled, _ = self.within_type_pool(
-                    query=pool_query,
-                    key=src_walks_t,
-                    value=src_walks_t,
-                    key_padding_mask=~src_mask_t if src_mask_t is not None else None
-                )  # [B, 1, D]
+                if src_masks is not None:
+                    src_mask_t = src_masks[:, t]  # [B, max_walks]
+                    # Check if all walks are valid (no padding needed)
+                    if not src_mask_t.any():
+                        # All masked - use zeros
+                        src_pooled = torch.zeros(B, 1, D, device=src_walk.device)
+                    else:
+                        # key_padding_mask expects True for positions to MASK OUT
+                        # So we pass ~src_mask_t (invert: valid becomes False, pad becomes True)
+                        src_pooled, _ = self.within_type_pool(
+                            query=pool_query,
+                            key=src_walks_t,
+                            value=src_walks_t,
+                            key_padding_mask=~src_mask_t  # True = mask out
+                        )
+                else:
+                    # No mask - assume all valid
+                    src_pooled, _ = self.within_type_pool(
+                        query=pool_query, key=src_walks_t, value=src_walks_t
+                    )
                 
-                dst_pooled, _ = self.within_type_pool(
-                    query=pool_query,
-                    key=dst_walks_t,
-                    value=dst_walks_t,
-                    key_padding_mask=~dst_mask_t if dst_mask_t is not None else None
-                )  # [B, 1, D]
+                if dst_masks is not None:
+                    dst_mask_t = dst_masks[:, t]
+                    if not dst_mask_t.any():
+                        dst_pooled = torch.zeros(B, 1, D, device=dst_walk.device)
+                    else:
+                        dst_pooled, _ = self.within_type_pool(
+                            query=pool_query,
+                            key=dst_walks_t,
+                            value=dst_walks_t,
+                            key_padding_mask=~dst_mask_t
+                        )
+                else:
+                    dst_pooled, _ = self.within_type_pool(
+                        query=pool_query, key=dst_walks_t, value=dst_walks_t
+                    )
                 
                 src_type_embeds.append(src_pooled.squeeze(1))  # [B, D]
                 dst_type_embeds.append(dst_pooled.squeeze(1))
             
-            # Stack type embeddings (preserving type information)
-            src_type_stack = torch.stack(src_type_embeds, dim=1)  # [B, num_types, D]
-            dst_type_stack = torch.stack(dst_type_embeds, dim=1)  # [B, num_types, D]
+            # Stack: [B, num_types, D]
+            src_type_stack = torch.stack(src_type_embeds, dim=1)
+            dst_type_stack = torch.stack(dst_type_embeds, dim=1)
             
-            # Fuse across types with per-type preservation
-            # Flatten but keep type order: [B, num_types * D]
-            src_flat = src_type_stack.reshape(B, -1)
+            # Flatten and fuse across types
+            src_flat = src_type_stack.reshape(B, -1)  # [B, num_types * D]
             dst_flat = dst_type_stack.reshape(B, -1)
             
-            # Project back to d_model (implicitly mixes type information)
             src_fused = self.type_fusion_src(src_flat)  # [B, D]
-            dst_fused = self.type_fusion_dst(dst_flat)  # [B, D]
+            dst_fused = self.type_fusion_dst(dst_flat)
             
-            # Add to refined embeddings
+            # Residual addition
             refined_src = refined_src + src_fused
             refined_dst = refined_dst + dst_fused
         
         # ==================== 4. Final FFN + Residual ====================
-        refined_src = self.norm_src(refined_src + self.ffn_src(refined_src))
-        refined_dst = self.norm_dst(refined_dst + self.ffn_dst(refined_dst))
+        refined_src = refined_src + self.ffn_src(refined_src)
+        refined_src = self.norm_src(refined_src)
+        
+        refined_dst = refined_dst + self.ffn_dst(refined_dst)
+        refined_dst = self.norm_dst(refined_dst)
+        
+        # Final safety check
+        refined_src = torch.nan_to_num(refined_src, nan=0.0, posinf=10.0, neginf=-10.0)
+        refined_dst = torch.nan_to_num(refined_dst, nan=0.0, posinf=10.0, neginf=-10.0)
         
         return refined_src, refined_dst

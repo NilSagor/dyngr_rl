@@ -156,6 +156,7 @@ class MergeLayer(nn.Module):
 class PositionalEncoding(nn.Module):
     """
     Sinusoidal positional encoding for walk positions.
+    Handles variable sequence lengths dynamically.
     """
     def __init__(self, d_model: int, max_len: int = 100):
         super(PositionalEncoding, self).__init__()
@@ -169,6 +170,7 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         
         self.register_buffer('pe', pe)
+        self.max_len = max_len
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -180,21 +182,50 @@ class PositionalEncoding(nn.Module):
         # Sanitize input before adding positional encoding
         x = _sanitize_tensor(x, "pos_enc_input")
 
-        # Validate shape compatibility
-        if x.size(-1) != self.pe.size(-1):
-            logger.error(f"Dimension mismatch in PositionalEncoding: x={x.shape}, pe={self.pe.shape}")
+        seq_len = x.size(1)
+        
+        # CRITICAL FIX: Handle sequence lengths longer than max_len
+        if seq_len > self.max_len:
+            # Extend positional encoding dynamically
+            logger.warning(f"Sequence length {seq_len} exceeds max_len {self.max_len}. Extending PE.")
+            pe = self._extend_pe(seq_len, x.device)
+        else:
+            pe = self.pe
+        
+        # Slice to exact sequence length
+        pe_slice = pe[:, :seq_len, :]
+        
+        # Ensure dimension match - project if needed
+        if x.size(-1) != pe_slice.size(-1):
+            logger.error(f"Dimension mismatch in PositionalEncoding: x={x.shape}, pe={pe_slice.shape}")
             # Project x to match pe dimension
-            projection = nn.Linear(x.size(-1), self.pe.size(-1), device=x.device)
+            projection = nn.Linear(x.size(-1), pe_slice.size(-1), device=x.device)
             x = projection(x)
-
+        
         # Clamp positional encoding to prevent extreme values
-        pe_slice = self.pe[:, :x.size(1), :]
         pe_slice = torch.clamp(pe_slice, -10.0, 10.0)
+        
+        # CRITICAL FIX: Ensure shapes match exactly before addition
+        if x.shape != pe_slice.shape:
+            # Try to broadcast/expand pe_slice to match x
+            if pe_slice.size(0) == 1 and x.size(0) != 1:
+                pe_slice = pe_slice.expand(x.size(0), -1, -1)
         
         result = x + pe_slice
         
         # Sanitize output
         return _sanitize_tensor(result, "pos_enc_output")
+    
+    def _extend_pe(self, new_max_len: int, device: torch.device) -> torch.Tensor:
+        """Dynamically extend positional encoding for longer sequences."""
+        pe = torch.zeros(new_max_len, self.pe.size(-1), device=device)
+        position = torch.arange(0, new_max_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.pe.size(-1), 2, device=device).float() * 
+                           (-math.log(10000.0) / self.pe.size(-1)))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)  # [1, new_max_len, d_model]
     
 
 class MultiHeadAttention(nn.Module):

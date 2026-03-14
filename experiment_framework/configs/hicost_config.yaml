@@ -5,29 +5,33 @@ model:
   name: "HiCoST"
   # num_nodes: null  # Will be set based on dataset
   # node_features: 0  # Use learned embeddings
-  hidden_dim: 172
+  hidden_dim: 64
   time_encoding_dim: 172
-  memory_dim: 172
-  message_dim: 172
+  memory_dim: 64
+  # message_dim: 172
   # edge_features_dim: 172
   num_layers: 2
   n_heads: 2
-  dropout: 0.5
-  embedding_module_type: "graph_attention"
-  aggregator_type: "mean"  
+  dropout: 0.3
+  # embedding_module_type: "graph_attention"
+  # aggregator_type: "mean"  
   use_memory: true
   n_neighbors: 20
-  memory_updater_type: 'gru'
-  use_gru_ode: True  
+  # memory_updater_type: 'gru'   
   #SAM
   use_sam: True # debug false,
+  num_prototypes: 3
   #HCT
   hct_d_model: 64  # Smaller dimension
-  hct_nhead: 2     # Fewer heads
+  # hct_nhead: 2     # Fewer heads
+  hct_nhead: 4        # Increase from 2
+  hct_num_intra_layers: 3  # Increase from 2
+  hct_num_inter_layers: 3  # Increase from 2
   # dropout: 0.0,     # No dropout during debugs  
   debug_simple_walk: False # if hct True, simple_walk False 
   use_hct: True # hct activate
   # ST ODE
+  use_gru_ode: True 
   mu: 0.0
   adaptive_mu: True
   use_st_ode: True
@@ -41,11 +45,11 @@ model:
 
 # Training parameters
 training:
-  batch_size: 512 # 200 
+  batch_size: 256 # 200 
   learning_rate: 0.00001
   weight_decay: 0.0001
   max_epochs: 100
-  patience: 5 # 3/5/10
+  patience: 10 # 3/5/10
   val_check_interval: 0.5
   # check_val_every_n_epoch: 5
   gradient_clip_val: 1.0
@@ -64,7 +68,7 @@ data:
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
-  max_neighbors: 10
+  max_neighbors: 20
   evaluation_type: "transductive"
   negative_sampling_strategy: "random"
   unseen_ratio: 0.1

@@ -14,6 +14,7 @@ from src.models.enhanced_tgn.variants.tgn_v5 import TGNv5
 from src.models.enhanced_tgn.variants.tgn_v6 import TGNv6
 from src.models.enhanced_tgn.variants.tgn_v7 import TGNv7
 from src.models.enhanced_tgn.variants.hicost import HiCoST
+from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
 
 
 # Constants
@@ -27,6 +28,7 @@ MODEL_REGISTRY = {
     "TGNv6": TGNv6,
     "TGNv7": TGNv7,
     "HiCoST": HiCoST,
+    "HiCoSTv2": HiCoSTv2,
 }
 
 

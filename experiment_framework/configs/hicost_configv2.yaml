@@ -1,0 +1,132 @@
+# Enhanced HiCoST Model Configuration (v2 - Ablation Ready)
+
+# Model parameters
+model:
+  name: "HiCoSTv2"
+  # num_nodes: null  # Will be set based on dataset
+  # node_features: 0  # Use learned embeddings
+  # Core Dimensions (Aligned for stability)
+  hidden_dim: 128           # Increased from 64 for better capacity
+  # time_encoding_dim: 128    # Matched to hidden_dim (was 172)
+  time_dim: 128    # Matched to hidden_dim (was 172)
+  memory_dim: 128           # Matched to hidden_dim (was 64)
+  edge_features_dim: 172    # Keep high if edge features are rich
+  
+  # Architecture Toggles
+  # use_sam: True
+  use_hct: True  
+  debug_simple_walk: False  # Set True to bypass HCT completely
+  
+  # --- SAM Parameters ---
+  num_prototypes: 5         # Increased from 3 for better stability
+  similarity_metric: "cosine"
+
+  # --- Walk Sampler Parameters ---
+  walk_length_short: 3
+  walk_length_long: 8
+  walk_length_tawr: 6
+  num_walks_short: 5
+  num_walks_long: 3
+  num_walks_tawr: 3
+  walk_temperature: 0.1
+  walk_time_noise_std: 0.05   # Enable temporal noise
+  walk_mask_prob: 0.05        # Enable masking augmentation
+  walk_adaptive_factor: 0.5   # Enable adaptive lengths
+  
+  
+  
+  # --- HCT Parameters ---
+  hct_d_model: 128            # Matched to hidden_dim
+  hct_nhead: 4
+  hct_num_intra_layers: 2
+  hct_num_inter_layers: 2
+  hct_cooccurrence_sigma: 2.0
+  hct_drop_path: 0.1          # Stochastic depth for stability
+  
+  
+  # --- ST-ODE Parameters ---
+  use_st_ode: false
+  ode_method: 'rk4'           # 'dopri5' (adaptive) or 'rk4' (fixed)
+  ode_step_size: 0.1          # 500 was too large for rk4. Use 0.1-1.0.
+  mu: 0.1                     # Spectral reg strength
+  adaptive_mu: True
+  use_gru_ode: True
+  st_ode_update_interval: 50  # Update ODE every 10 batches
+  
+  
+  # --- Hard Negative Mining ---
+  neg_sample_ratio: 5
+  hard_neg_threshold: 0.7
+  label_smoothing: 0.1
+
+  # === ABLATION FLAGS (NEW & CRITICAL) ===
+  # Set these to False via CLI or here to disable specific components
+  ablation_sam_prototypes: True       # False -> Disables prototype attention (uses raw memory)
+  ablation_hct_hierarchical: True     # False -> Disables co-occurrence matrix & inter-walk transformer
+  ablation_mrp_gating: True           # False -> Replaces gated refiner with simple concat
+  ablation_walk_multi_scale: True     # False -> Uses only short walks (single scale)
+
+
+
+# Training parameters
+training:
+  batch_size: 256 # 200 
+  learning_rate: 0.00001
+  weight_decay: 0.0001
+  max_epochs: 100
+  patience: 10 # 3/5/10
+  val_check_interval: 0.5
+  # check_val_every_n_epoch: 5
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  log_every_n_steps: 10
+  lr_scheduler: "reduce_on_plateau"
+  lr_patience: 3
+  lr_factor: 0.5
+  continuous_time: true  
+  
+  
+# Data parameters
+data:
+  dataset: "wikipedia"
+  shuffle: false
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  max_neighbors: 20
+  evaluation_type: "transductive"
+  negative_sampling_strategy: "random"
+  unseen_ratio: 0.1
+  validate_batches: true
+  
+# Experiment parameters
+experiment:
+  # name: "${model.name}_${data.evaluation_type}_${data.negative_sampling_strategy}"
+  # description: "${model.name} on ${data.dataset} |${data.evaluation_type}|${data.negative_sampling_strategy}"
+  seed: 42  
+  device: "auto"  # auto, cpu, cuda
+  precision: 32
+  debug: False
+  
+# Logging
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  save_top_k: 3
+  monitor: "val_ap"
+  mode: "max"
+  
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "ap", "auc"]
+  test_batch_size: 1000
+
+profiling:
+  enabled: true
+  profile_type: 'pytorch'
+
+# Hardware
+hardware:
+  gpus: 1  # null for CPU, number for GPU count
+  num_workers: 4
+  pin_memory: false
