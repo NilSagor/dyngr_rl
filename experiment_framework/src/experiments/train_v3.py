@@ -39,7 +39,8 @@ from src.experiments.exp_utils.model_profile import ModelProfiler
 from src.experiments.exp_utils.experiment_logger import ExperimentLogger
 from src.experiments.exp_utils.trainer_setup import TrainerSetup
 
-
+import torch
+torch.autograd.set_detect_anomaly(True)
 
 # ============================================================================
 # CONFIGURATION

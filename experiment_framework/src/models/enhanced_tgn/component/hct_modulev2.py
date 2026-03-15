@@ -6,11 +6,9 @@ from loguru import logger
 import math
 import inspect
 
-# Assuming these exist in your project structure
 from .transformer_encoder import PositionalEncoding, TransformerEncoderLayer
 
-# === CONFIG ===
-DEBUG_SANITIZE = True  # KEEP THIS TRUE TO CATCH ERRORS
+DEBUG_SANITIZE = True
 
 def _sanitize_tensor(
     x: torch.Tensor,
@@ -37,40 +35,32 @@ class SpectralLinear(nn.Linear):
         self.eps = eps
         if self.weight.dim() > 1:
             nn.init.xavier_uniform_(self.weight, gain=0.1)
-            # Register u as 1-D vector, not 2-D
             self.register_buffer('weight_u', torch.empty(out_features).normal_(0, 0.02))
             self._update_weight_u()
 
     def _update_weight_u(self):
         if not hasattr(self, 'weight_u'): 
             return
-        
-        weight = self.weight.detach()  # CRITICAL: Detach weight to avoid graph
-        u = self.weight_u.detach()     # Detach u as well
-        
-        for _ in range(self.n_power_iterations):
-            v = torch.mv(weight.t(), u)
-            v = F.normalize(v, dim=-1, eps=self.eps)
-            u = torch.mv(weight, v)
-            u = F.normalize(u, dim=-1, eps=self.eps)
-        
-        # Use no_grad context to ensure this doesn't affect gradients
         with torch.no_grad():
+            weight = self.weight.detach()
+            u = self.weight_u.detach()
+            for _ in range(self.n_power_iterations):
+                v = torch.mv(weight.t(), u)
+                v = F.normalize(v, dim=-1, eps=self.eps)
+                u = torch.mv(weight, v)
+                u = F.normalize(u, dim=-1, eps=self.eps)
             self.weight_u.copy_(u)
 
     def forward(self, input):
         if self.training and hasattr(self, 'weight_u'):
-            # CRITICAL FIX: Update in no_grad context to avoid inplace in graph
             with torch.no_grad():
                 self._update_weight_u()
-            
-            u = self.weight_u.detach()  # Detach to avoid graph connection
+            u = self.weight_u
             v = torch.mv(self.weight.t(), u)
             v = F.normalize(v, dim=-1, eps=self.eps)
             sigma = torch.dot(u, torch.mv(self.weight, v))
             weight_norm = self.weight / (sigma + self.eps)
             return F.linear(input, weight_norm, self.bias)
-        
         return super().forward(input)
 
 class DropPath(nn.Module):
@@ -108,8 +98,7 @@ class CausalIntraWalkEncoder(nn.Module):
         self.nhead = nhead
         self.max_walk_length = max_walk_length
         
-                
-        effective_max_len = max_walk_length * 2 + 10  # Buffer for safety
+        effective_max_len = max_walk_length * 2 + 10
         self.pos_encoder = PositionalEncoding(d_model, effective_max_len)
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
@@ -121,7 +110,7 @@ class CausalIntraWalkEncoder(nn.Module):
         ])
         self.drop_paths = nn.ModuleList([DropPath(dpr[i]) if dpr[i] > 0. else nn.Identity() for i in range(num_layers)])
         
-        self.output_proj = SpectralLinear(d_model, d_model)
+        self.output_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
         self.norm_proj = nn.LayerNorm(d_model, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
         
@@ -137,7 +126,6 @@ class CausalIntraWalkEncoder(nn.Module):
         if is_5d_input:
             B1, B2, W, L, D = walk_embeddings.shape
             walk_embeddings = walk_embeddings.view(B1 * B2, W, L, D)
-            # Properly reshape walk_masks to match
             if walk_masks.dim() == 5:
                 walk_masks = walk_masks.view(B1 * B2, W, L)
             elif walk_masks.dim() == 4:
@@ -145,63 +133,49 @@ class CausalIntraWalkEncoder(nn.Module):
         
         batch_size, num_walks, walk_len, d_model = walk_embeddings.shape
         
-        # CRITICAL FIX: Ensure walk_masks matches walk_embeddings shape exactly
         if walk_masks.shape != (batch_size, num_walks, walk_len):
-            # Try to reshape if total elements match
             if walk_masks.numel() == batch_size * num_walks * walk_len:
                 walk_masks = walk_masks.view(batch_size, num_walks, walk_len)
             else:
-                # Truncate or pad walk_masks to match walk_len
                 current_len = walk_masks.shape[-1] if walk_masks.dim() >= 3 else walk_len
                 if current_len > walk_len:
                     walk_masks = walk_masks[..., :walk_len]
                 elif current_len < walk_len:
-                    # Pad with zeros (invalid positions)
                     pad_size = walk_len - current_len
                     if walk_masks.dim() == 2:
-                        walk_masks = walk_masks.unsqueeze(1)  # Add walk dimension
+                        walk_masks = walk_masks.unsqueeze(1)
                     if walk_masks.dim() == 3:
                         pad_shape = list(walk_masks.shape[:-1]) + [pad_size]
                         pad = torch.zeros(pad_shape, device=walk_masks.device, dtype=walk_masks.dtype)
                         walk_masks = torch.cat([walk_masks, pad], dim=-1)
-                    # Ensure final shape
                     if walk_masks.shape != (batch_size, num_walks, walk_len):
                         walk_masks = walk_masks.view(batch_size, num_walks, walk_len)
         
-        # Flatten for transformer: [B*W, L, D]
         x = walk_embeddings.reshape(-1, walk_len, d_model)
         flat_masks = walk_masks.reshape(-1, walk_len)
         
         total_sequences = x.size(0)
         actual_seq_len = x.size(1)
         
-        # Ensure we don't exceed causal mask size
         if actual_seq_len > self.causal_mask.size(0):
             logger.warning(f"Sequence length {actual_seq_len} exceeds causal mask size {self.causal_mask.size(0)}. Truncating.")
             actual_seq_len = self.causal_mask.size(0)
             x = x[:, :actual_seq_len, :]
             flat_masks = flat_masks[:, :actual_seq_len]
         
-        # Construct Attention Mask using actual sequence length
         causal_mask_slice = self.causal_mask[:actual_seq_len, :actual_seq_len]
         padding_mask = ~flat_masks.bool()
         
-        # Ensure padding_mask is 2D [total_sequences, actual_seq_len]
         if padding_mask.dim() == 1:
             padding_mask = padding_mask.unsqueeze(0)
         
-        # Expand causal mask: [actual_seq_len, actual_seq_len] -> [total_sequences, actual_seq_len, actual_seq_len]
         causal_expanded = causal_mask_slice.unsqueeze(0).expand(total_sequences, -1, -1)
-        
-        # Expand padding mask: [total_sequences, actual_seq_len] -> [total_sequences, actual_seq_len, actual_seq_len]
         pad_mask_2d = padding_mask.unsqueeze(1).expand(-1, actual_seq_len, -1)
         
-        # Ensure shapes match before OR operation
         if causal_expanded.shape != pad_mask_2d.shape:
             min_len = min(causal_expanded.size(-1), pad_mask_2d.size(-1))
             causal_expanded = causal_expanded[..., :min_len, :min_len]
             pad_mask_2d = pad_mask_2d[..., :min_len, :min_len]
-            # Also truncate x to match
             if x.size(1) > min_len:
                 x = x[:, :min_len, :]
                 actual_seq_len = min_len
@@ -211,7 +185,6 @@ class CausalIntraWalkEncoder(nn.Module):
         attn_bias = torch.zeros_like(full_mask, dtype=torch.float)
         attn_bias.masked_fill_(full_mask, -1e9)
         
-        # Apply positional encoding
         x = self.pos_encoder(x)
         x = self.dropout(x)
         
@@ -223,56 +196,38 @@ class CausalIntraWalkEncoder(nn.Module):
         
         x = self.norm_proj(x)
         
-        # CRITICAL FIX: Get actual output sequence length after transformer
         output_seq_len = x.size(1)
         
-        # Reshape back: [B*W, L', D] -> [B, W, L', D]
         x = x.view(batch_size, num_walks, output_seq_len, d_model)
         
-        # CRITICAL FIX: Truncate walk_masks to match output sequence length
-        # This ensures masks align with the actual transformer output
         if walk_masks.size(-1) != output_seq_len:
             if walk_masks.size(-1) > output_seq_len:
                 walk_masks = walk_masks[..., :output_seq_len]
             else:
-                # Pad walk_masks if transformer output is longer (unlikely but safe)
                 pad_size = output_seq_len - walk_masks.size(-1)
                 pad_shape = list(walk_masks.shape[:-1]) + [pad_size]
                 pad = torch.zeros(pad_shape, device=walk_masks.device, dtype=walk_masks.dtype)
                 walk_masks = torch.cat([walk_masks, pad], dim=-1)
         
-        # CRITICAL FIX: Proper broadcasting for pooling
-        # masks_expanded should be [B, W, L', 1] to broadcast with x [B, W, L', D]
-        masks_expanded = walk_masks.unsqueeze(-1).float()  # [B, W, L', 1]
-        
-        # Ensure shapes match for element-wise multiplication
+        masks_expanded = walk_masks.unsqueeze(-1).float()
         if x.shape != masks_expanded.shape:
-            # Expand masks_expanded to match x's feature dimension if needed
             if masks_expanded.size(-1) == 1 and x.size(-1) != 1:
                 masks_expanded = masks_expanded.expand(-1, -1, -1, x.size(-1))
         
-        # Pooling: masked mean over sequence dimension
-        sum_feats = (x * masks_expanded).sum(dim=2)  # [B, W, D]
-        
-        # CRITICAL FIX: count should be [B, W, 1] for proper broadcasting
-        count = masks_expanded.sum(dim=2)  # [B, W, 1]
-        
-        # Ensure count has correct shape for broadcasting with sum_feats [B, W, D]
+        sum_feats = (x * masks_expanded).sum(dim=2)
+        count = masks_expanded.sum(dim=2)
         if count.dim() == 2:
-            count = count.unsqueeze(-1)  # [B, W, 1]
+            count = count.unsqueeze(-1)
         
-        # Safe division with broadcasting: [B, W, D] / [B, W, 1] -> [B, W, D]
         walk_summaries = sum_feats / (count + 1e-6)
         
-        # Handle zero-count cases
-        zero_count_mask = (count.squeeze(-1) < 1e-6)  # [B, W]
+        zero_count_mask = (count.squeeze(-1) < 1e-6)
         if zero_count_mask.any():
             walk_summaries[zero_count_mask] = 0.0
         
         walk_summaries = self.output_proj(walk_summaries)
         walk_summaries = self.norm_proj(walk_summaries)
         
-        # Restore original shape if input was 5D
         if is_5d_input:
             x = x.view(*original_shape[:-1], d_model)
         
@@ -394,26 +349,25 @@ class StabilizedInterWalkTransformer(nn.Module):
         """
         B, W, D = x.shape
         
-       
-        # Ensure bias is [B, W, W] -> [B, 1, W, W] -> [B, H, W, W]
-        if cooccurrence_bias.dim() == 3:
+        if self._supports_attn_bias:
+            # Expand bias to [B, H, W, W]
             cooccurrence_bias = cooccurrence_bias.unsqueeze(1).expand(-1, self.nhead, -1, -1)
-        
-        bias_scale = 0.1 / (self.d_model ** 0.5)
-        cooccurrence_bias = self.gamma * cooccurrence_bias * bias_scale
-        
-        for i, layer in enumerate(self.layers):
-            if self._supports_attn_bias:
-                # Pass expanded bias [B, H, W, W]
-                x_res = layer(x, attn_bias=cooccurrence_bias, key_padding_mask=key_padding_mask)
-            else:
-                x_res = layer(x, key_padding_mask=key_padding_mask)
-                # Fallback bias injection
-                bias_effect = cooccurrence_bias.mean(dim=1).squeeze(1) * 0.1
-                x_res = x_res + bias_effect
+            bias_scale = 0.1 / (self.d_model ** 0.5)
+            cooccurrence_bias = self.gamma * cooccurrence_bias * bias_scale
             
-            x = x + self.drop_paths[i](x_res)
-            x = _sanitize_tensor(x, f"inter_layer_{i}")
+            for i, layer in enumerate(self.layers):
+                x_res = layer(x, attn_bias=cooccurrence_bias, key_padding_mask=key_padding_mask)
+                x = x + self.drop_paths[i](x_res)
+                x = _sanitize_tensor(x, f"inter_layer_{i}")
+        else:
+            # Fallback: inject bias via addition after softmax (simplified)
+            for i, layer in enumerate(self.layers):
+                x_res = layer(x, key_padding_mask=key_padding_mask)
+                # Add co‑occurrence bias as a residual after attention (simplified)
+                bias_effect = cooccurrence_bias.mean(dim=2, keepdim=True) * 0.1  # [B, W, 1]
+                x_res = x_res + bias_effect
+                x = x + self.drop_paths[i](x_res)
+                x = _sanitize_tensor(x, f"inter_layer_{i}")
             
         return self.norm(x)
 
@@ -436,6 +390,8 @@ class StabilizedHCT(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.use_walk_type_embedding = use_walk_type_embedding
+        
+        
         
         self.intra_walk_encoder = CausalIntraWalkEncoder(
             d_model, nhead, num_intra_layers, dim_feedforward, dropout,
@@ -524,8 +480,6 @@ class StabilizedHCT(nn.Module):
                 'cooccurrence': cooccurrence
             }
         
-        # Pass raw [B, W, W] cooccurrence to InterWalkTransformer
-        # The InterWalkTransformer will handle expansion to [B, H, W, W]
         refined_walks = self.inter_walk_transformer(
             walk_summaries, cooccurrence, ~walk_level_mask.bool()
         )

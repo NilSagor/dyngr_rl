@@ -277,8 +277,8 @@ class StabilizedIntegrator(nn.Module):
         step_size: Optional[float] = None,
         rtol: float = 1e-6,
         atol: float = 1e-8,
-        adjoint: bool = False,
-        max_steps: int = 2000,
+        adjoint: bool = True,
+        max_steps: int = 50,
     ):
         super().__init__()
         self.odefunc = odefunc
@@ -286,7 +286,7 @@ class StabilizedIntegrator(nn.Module):
         self.adjoint = adjoint
         self.base_rtol = rtol
         self.base_atol = atol
-        self.base_step_size = step_size if step_size is not None else 0.1
+        self.base_step_size = step_size if step_size is not None else 2.0
         self.max_steps = max_steps
         
         self.solver = odeint_adjoint if adjoint else odeint
@@ -310,7 +310,7 @@ class StabilizedIntegrator(nn.Module):
         options = {}
         if self.method in self.FIXED_STEP:
             # Fixed-step solvers: Use step_size, NOT max_num_steps
-            dt = self.base_step_size / schedule_factor
+            dt = max(self.base_step_size / schedule_factor, 0.5)
             options['step_size'] = dt
             # Don't set max_num_steps for fixed-step solvers!
         else:
@@ -334,57 +334,42 @@ class StabilizedIntegrator(nn.Module):
 
     def batch_integrate(
         self,
-        h0: torch.Tensor,           # [N, H]
-        t_spans: torch.Tensor,      # [B, 2]
-        adj_matrices: torch.Tensor, # [B, N, N]
+        h0: torch.Tensor,
+        t_spans: torch.Tensor,
+        adj_matrices: torch.Tensor,
         training_progress: float = 1.0,
     ) -> torch.Tensor:
-        """
-        Fully Vectorized Batch Integration.
-        Note: torchdiffeq doesn't support true parallel batching of different ODEs 
-        in a single call easily without flattening B*N. 
-        We optimize by processing unique time spans or using vmap if available.
-        Here we use a optimized loop over B, but internal ops are vectorized over N.
-        """
         B = t_spans.size(0)
         N, H = h0.shape
         device = h0.device
         
-        # Output buffer
         H_ode_batch = torch.zeros(B, N, H, device=device, dtype=h0.dtype)
-        
-        # Current state evolves sequentially if intervals are contiguous, 
-        # but here t_spans might be disjoint. We assume independent intervals from h0 
-        # OR contiguous evolution. 
-        # Based on previous code: "H_current = H_ode_batch[b]" implies contiguous evolution.
-        # However, true vectorization requires independent trajectories.
-        # Let's assume independent trajectories starting from h0 for each batch item 
-        # (common in attention-based time intervals) OR sequential if specified.
-        # To match previous logic (sequential evolution):
-        
         H_current = h0
         
-        # Optimization: Group identical time spans? 
-        # For now, loop is unavoidable for sequential dependency, but internal math is vectorized.
         for b in range(B):
-            t_start = t_spans[b, 0]
-            t_end = t_spans[b, 1]
+            t_start = t_spans[b, 0].item()  # .item() to free graph
+            t_end = t_spans[b, 1].item()
             
             if abs(t_end - t_start) < 1e-7:
                 H_ode_batch[b] = H_current
                 continue
             
-            # Integrate
-            res = self.integrate(
-                h0=H_current,
-                t_span=(t_start, t_end),
-                adj_matrix=adj_matrices[b],
-                training_progress=training_progress
-            )
+            # Integrate with no_grad if not last step (saves memory)
+            with torch.set_grad_enabled(b == B - 1):  # Only last step needs grad
+                res = self.integrate(
+                    h0=H_current.detach() if b < B - 1 else H_current,  # Detach intermediate
+                    t_span=(t_start, t_end),
+                    adj_matrix=adj_matrices[b],
+                    training_progress=training_progress
+                )
             
             H_ode_batch[b] = res
-            H_current = res # Sequential update
+            H_current = res
             
+            # Explicit cleanup every few steps
+            if b % 2 == 0:
+                torch.cuda.empty_cache()
+        
         return H_ode_batch
 
 # ============================================================================
@@ -437,48 +422,54 @@ class StabilizedSTODELayer(nn.Module):
             return H_init
             
         device = H_init.device
+        N, H = H_init.shape
         
-        # Ensure Adj is [T, N, N]
+        # Expand adjacency to [T, N, N] if needed
         if adj_matrix.dim() == 2:
             adj_batch = adj_matrix.unsqueeze(0).expand(T, -1, -1)
         else:
             adj_batch = adj_matrix
             
-        # Construct Time Spans [T, 2]
-        # First span starts 1.0 unit before first obs (or min delta)
+        # Construct time intervals
         t_starts = torch.cat([
-            obs_times[:1] - 1.0,
+            obs_times[:1] - 1.0,      # first interval starts 1 unit before first observation
             obs_times[:-1]
         ])
         t_ends = obs_times
-        t_spans = torch.stack([t_starts, t_ends], dim=1)
-        
-        # Batch Integrate (Sequential Evolution)
-        H_ode_seq = self.integrator.batch_integrate(
-            h0=H_init,
-            t_spans=t_spans,
-            adj_matrices=adj_batch,
-            training_progress=training_progress
-        ) # [T, N, H]
-        
-        # Vectorized GRU Update
-        # Flatten T and N to process all updates in one go? 
-        # GRUCell is sequential in time, but we have T steps.
-        # We must loop over T for GRU, but internal ops are vectorized over N.
+        # (t_starts, t_ends) now define T intervals
         
         H_current = H_init
+        
         for i in range(T):
-            H_ode = H_ode_seq[i]
-            H_obs = observations[i]
+            t_start = t_starts[i].item()   # convert to Python scalar to avoid graph
+            t_end   = t_ends[i].item()
             
-            # GRU Step
+            if abs(t_end - t_start) < 1e-7:
+                H_ode = H_current
+            else:
+                # Integrate – the adjoint solver will not store the full graph
+                H_ode = self.integrator.integrate(
+                    h0=H_current,
+                    t_span=(t_start, t_end),
+                    adj_matrix=adj_batch[i],
+                    training_progress=training_progress
+                )   # returns [N, H]
+            
+            H_obs = observations[i]   # [N, H]
+            
+            # GRU update – flattens to [N*H] internally, but we keep shape
             H_new = self.update_fn(
-                H_obs.view(-1, self.hidden_dim),
-                H_ode.view(-1, self.hidden_dim)
-            ).view(self.num_nodes, self.hidden_dim)
+                H_obs.view(-1, H),
+                H_ode.view(-1, H)
+            ).view(N, H)
             
             H_current = self.dropout(self.norm(H_new))
             
+            # Explicitly delete intermediate tensors to free memory
+            del H_ode, H_obs, H_new
+            # The graph for this interval is now freed because H_ode goes out of scope
+            # and no references to intermediate ODE tensors are kept.
+        
         return H_current
 
 # ============================================================================
@@ -496,7 +487,7 @@ class NumericallyStabilizedSTODE(nn.Module):
     
     def __init__(
         self,
-        hidden_dim: int,
+         hidden_dim: int,
         num_nodes: int,
         num_eigenvectors: int = 10,
         mu: float = 0.1,
@@ -505,7 +496,7 @@ class NumericallyStabilizedSTODE(nn.Module):
         ode_method: str = "dopri5",
         ode_step_size: Optional[float] = None,
         num_layers: int = 1,
-        adjoint: bool = False,
+        adjoint: bool = True,               
         dropout: float = 0.1,
         max_cache_size: int = 4,
     ):
@@ -585,6 +576,37 @@ class NumericallyStabilizedSTODE(nn.Module):
              
         unique_times, inverse = torch.unique(valid_t, sorted=True, return_inverse=True)
         T = unique_times.size(0)
+        
+        MAX_TIMES = 5
+        if T > MAX_TIMES:
+            # Keep MAX_TIMES most recent times (or uniformly spaced)
+            # Here we keep the last MAX_TIMES
+            keep_indices = torch.arange(T - MAX_TIMES, T, device=device)
+            unique_times = unique_times[keep_indices]
+            # Rebuild obs_tensor for only these times
+            # We'll create a mask to select only the relevant times
+            time_mask = torch.isin(inverse, keep_indices)
+            valid_enc = valid_enc[time_mask]
+            valid_n = valid_n[time_mask]
+            valid_t = valid_t[time_mask]
+            inverse = inverse[time_mask]
+            # Recompute unique_times (should be the same as keep_indices)
+            unique_times, inverse = torch.unique(valid_t, sorted=True, return_inverse=True)
+            T = unique_times.size(0)
+            # Recreate obs_tensor with the new T
+            obs_tensor = torch.zeros(T, N, H, device=device, dtype=walk_encodings.dtype)
+            counts = torch.zeros(T, N, device=device)
+            flat_idx = inverse * N + valid_n
+            obs_tensor_view = obs_tensor.view(-1, H)
+            obs_tensor_view.index_add_(0, flat_idx, valid_enc)
+            counts_view = counts.view(-1)
+            counts_view.index_add_(0, flat_idx, torch.ones_like(valid_n, dtype=torch.float))
+            mask_counts = counts.clamp(min=1.0).unsqueeze(-1)
+            obs_tensor = obs_tensor / mask_counts
+            
+        
+        if T > 50:
+            logger.warning(f"Large number of observation times ({T}), ODE may be slow.")
         
         # Vectorized Aggregation using index_add
         obs_tensor = torch.zeros(T, N, H, device=device, dtype=walk_encodings.dtype)

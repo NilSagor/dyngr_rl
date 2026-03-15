@@ -22,12 +22,12 @@ model:
   similarity_metric: "cosine"
 
   # --- Walk Sampler Parameters ---
-  walk_length_short: 3
-  walk_length_long: 8
-  walk_length_tawr: 6
-  num_walks_short: 5
-  num_walks_long: 3
-  num_walks_tawr: 3
+  walk_length_short: 4           # was 3
+  walk_length_long: 10             # was 8
+  walk_length_tawr: 8            # was 6
+  num_walks_short: 5              # was 5
+  num_walks_long: 3               # was 3
+  num_walks_tawr: 3               # was 3
   walk_temperature: 0.1
   walk_time_noise_std: 0.05   # Enable temporal noise
   walk_mask_prob: 0.05        # Enable masking augmentation
@@ -37,7 +37,7 @@ model:
   
   # --- HCT Parameters ---
   hct_d_model: 128            # Matched to hidden_dim
-  hct_nhead: 4
+  hct_nhead: 2
   hct_num_intra_layers: 2
   hct_num_inter_layers: 2
   hct_cooccurrence_sigma: 2.0
@@ -45,18 +45,19 @@ model:
   
   
   # --- ST-ODE Parameters ---
-  use_st_ode: false
-  ode_method: 'rk4'           # 'dopri5' (adaptive) or 'rk4' (fixed)
-  ode_step_size: 0.1          # 500 was too large for rk4. Use 0.1-1.0.
+  use_st_ode: true
+  ode_method: 'euler'           # 'dopri5' (adaptive) or 'rk4' (fixed)
+  ode_step_size: 1.0          # 500 was too large for rk4. Use 0.1-1.0.
   mu: 0.1                     # Spectral reg strength
   adaptive_mu: True
   use_gru_ode: True
-  st_ode_update_interval: 50  # Update ODE every 10 batches
+  adjoint: true
+  st_ode_update_interval: 10  # Update ODE every 10 batches
   
   
   # --- Hard Negative Mining ---
-  neg_sample_ratio: 5
-  hard_neg_threshold: 0.7
+  neg_sample_ratio: 10
+  hard_neg_threshold: 0.5
   label_smoothing: 0.1
 
   # === ABLATION FLAGS (NEW & CRITICAL) ===
@@ -71,8 +72,8 @@ model:
 # Training parameters
 training:
   batch_size: 256 # 200 
-  learning_rate: 0.00001
-  weight_decay: 0.0001
+  learning_rate: 0.0001
+  weight_decay: 0.00001
   max_epochs: 100
   patience: 10 # 3/5/10
   val_check_interval: 0.5

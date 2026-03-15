@@ -8,7 +8,7 @@ from loguru import logger
 from sklearn.metrics import roc_auc_score, average_precision_score
 import lightning as L
 
-from torch_geometric.utils import get_laplacian
+# from torch_geometric.utils import get_laplacian
 
 # --- Import Your Optimized Components ---
 # Ensure these files are in your project structure
@@ -43,7 +43,7 @@ class HiCoSTv2(L.LightningModule):
         self,
         num_nodes: int,
         node_feat_dim: int = 0,
-        edge_feat_dim: int = 64,
+        edge_feat_dim: int = 64,          # will be overridden by 'edge_features_dim' if present
         hidden_dim: int = 172,
         time_dim: int = 64,
         memory_dim: int = 172,
@@ -52,7 +52,7 @@ class HiCoSTv2(L.LightningModule):
         weight_decay: float = 1e-5,
         warmup_epochs: float = 0.1,
         min_lr_ratio: float = 0.01,
-        # SAM Params (Robust)
+        # SAM Params
         num_prototypes: int = 5,
         sam_residual_alpha: float = 0.8,
         sam_time_decay: float = 0.99,
@@ -68,14 +68,14 @@ class HiCoSTv2(L.LightningModule):
         walk_time_noise_std: float = 0.0,
         walk_mask_prob: float = 0.05,
         walk_adaptive_factor: float = 0.5,
-        # HCT Params (Stabilized)
+        # HCT Params
         use_hct: bool = True,
         hct_d_model: int = 128,
-        hct_nhead: int = 4,
-        hct_num_layers: int = 2,
+        hct_nhead: int = 2,
+        hct_num_layers: int = 1,
         hct_drop_path: float = 0.1,
         hct_sigma_time: float = 5.0,
-        # ST-ODE Params (Stabilized)
+        # ST-ODE Params
         use_st_ode: bool = True,
         ode_method: str = "dopri5",
         ode_mu: float = 0.1,
@@ -87,13 +87,22 @@ class HiCoSTv2(L.LightningModule):
         hard_neg_threshold: float = 0.7,
         label_smoothing: float = 0.1,
         dropout: float = 0.1,
-        # Ablation Flags (NEW)
-        ablation_sam_prototypes: bool = True,  # Enable SAM prototype mechanism
-        ablation_hct_hierarchical: bool = True, # Enable HCT hierarchical co-occurrence
-        ablation_mrp_gating: bool = True,       # Enable MRP gated refinement
-        ablation_walk_multi_scale: bool = True, # Enable multi-scale walks (else single scale)
+        # Ablation Flags
+        ablation_sam_prototypes: bool = True,
+        ablation_hct_hierarchical: bool = True,
+        ablation_mrp_gating: bool = True,
+        ablation_walk_multi_scale: bool = True,
         **kwargs
     ):
+        # --- Handle alternative naming from config ---
+        # Some configs use 'node_features_dim' or 'edge_features_dim'
+        if 'node_features_dim' in kwargs and node_feat_dim == 0:
+            node_feat_dim = kwargs['node_features_dim']
+        if 'edge_features_dim' in kwargs:
+            edge_feat_dim = kwargs['edge_features_dim']
+        # (Optional) also handle 'node_feat_dim' if present
+        if 'node_feat_dim' in kwargs:
+            node_feat_dim = kwargs['node_feat_dim']
         super().__init__()
         torch.autograd.set_detect_anomaly(True)
         self.save_hyperparameters()
@@ -111,6 +120,7 @@ class HiCoSTv2(L.LightningModule):
         # State Tracking
         self.register_buffer('last_ode_update_time', torch.tensor(0.0))
         self._ode_batch_counter = 0
+
         self._sam_epoch_backup = None
 
          # Store ablation flags (NEW)
@@ -142,10 +152,9 @@ class HiCoSTv2(L.LightningModule):
         
         # === 3. Walk Sampler (Ablation: Multi-Scale) ===
         if not ablation_walk_multi_scale:
-            # Force single scale (short) for ablation
             logger.info("Ablation: Disabling multi-scale walks (Single Scale Only)")
             w_len_short = walk_length_short
-            w_num_short = num_walks_short + num_walks_long + num_walks_tawr # Combine all budget into short
+            w_num_short = num_walks_short + num_walks_long + num_walks_tawr
             w_len_long = 0
             w_num_long = 0
             w_len_tawr = 0
@@ -163,7 +172,7 @@ class HiCoSTv2(L.LightningModule):
         self.walk_sampler = MultiScaleWalkSampler(
             num_nodes=num_nodes,
             walk_length_short=w_len_short,
-            walk_length_long=w_len_long if w_len_long > 0 else 1, # Avoid 0 length errors
+            walk_length_long=w_len_long if w_len_long > 0 else 1,
             walk_length_tawr=w_len_tawr if w_len_tawr > 0 else 1,
             num_walks_short=w_num_short,
             num_walks_long=w_num_long,
@@ -173,7 +182,7 @@ class HiCoSTv2(L.LightningModule):
             time_dim=time_dim,
             time_noise_std=walk_time_noise_std,
             mask_prob=walk_mask_prob,
-            adaptive_length_factor=walk_adaptive_factor if ablation_walk_multi_scale else 0.0 # Disable adaptive if single scale
+            adaptive_length_factor=walk_adaptive_factor if ablation_walk_multi_scale else 0.0
         )
         
         # === 4. HCT Module (Ablation: Hierarchical) ===
@@ -209,6 +218,8 @@ class HiCoSTv2(L.LightningModule):
                 adaptive_mu=True,
                 use_gru_ode=True,
                 ode_method=ode_method,
+                ode_step_size=1.0,               
+                adjoint=True,                    
                 dropout=dropout
             )
         else:
@@ -254,7 +265,7 @@ class HiCoSTv2(L.LightningModule):
         self.hard_neg_miner = HardNegativeMiner(
             neg_sample_ratio=neg_sample_ratio,
             hard_neg_threshold=hard_neg_threshold,
-            label_smoothing=label_smoothing if neg_sample_ratio > 0 else 0.0 # Disable smoothing if no mining? Optional.
+            label_smoothing=label_smoothing if neg_sample_ratio > 0 else 0.0
         )
         
         # Buffers for graph data
@@ -262,55 +273,39 @@ class HiCoSTv2(L.LightningModule):
         self.edge_time = None
         self.node_raw_features = None
         self.edge_raw_features = None
-        self.validation_step_outputs = []   # For accumulating validation results
+        self.validation_step_outputs = []
         
         logger.info(f"HiCoST Initialized: Robust-SAM + Stabilized-HCT + {'ST-ODE' if use_st_ode else 'No-ODE'} + Gated-Refinement")
 
     def set_graph(self, edge_index: torch.Tensor, edge_time: torch.Tensor):
-        """Initialize graph structure for walk sampling."""
         self.edge_index = edge_index
         self.edge_time = edge_time
         self.walk_sampler.update_neighbors(edge_index, edge_time)
         logger.info(f"Graph initialized: {edge_index.shape[1]} edges")
 
     def set_raw_features(self, node_features: Optional[torch.Tensor], edge_features: Optional[torch.Tensor]):
-        """Set static node/edge features."""
         if node_features is not None:
             self.node_raw_features = node_features.to(self.device)
-        if edge_features is not None:
-            # Store for batch usage if needed, usually passed in batch
-            pass
 
     def set_neighbor_finder(self, neighbor_finder):
-        """
-        Set the neighbor finder and initialize the walk sampler with the graph structure.
-        
-        Args:
-            neighbor_finder: An object that should contain `edge_index` (2, num_edges)
-                            and `edge_time` (num_edges) tensors.
-        """
         if hasattr(neighbor_finder, 'edge_index') and hasattr(neighbor_finder, 'edge_time'):
-            # Move to the model's device
             device = next(self.parameters()).device
             edge_index = neighbor_finder.edge_index.to(device)
             edge_time = neighbor_finder.edge_time.to(device)
-            self.sampler.update_neighbors(edge_index, edge_time, force=True)
+            self.walk_sampler.update_neighbors(edge_index, edge_time, force=True)
             logger.info("Neighbor finder passed to walk sampler.")
         else:
             logger.warning(
                 "Neighbor finder does not provide 'edge_index' and 'edge_time'. "
-                "Walk sampler will not be initialized. Graph structure updates may fail."
+                "Walk sampler will not be initialized."
             )
     
     
-    def _get_hct_embeddings(self, walk_data: Dict, node_memory: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process walks through StabilizedHCT."""
+    def _get_hct_embeddings(self, walk_data: Dict, node_memory: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         device = node_memory.device
         
-        
-        # Handle Ablation: If no HCT, perform simple mean pooling
         if self.hct is None:
-            # Simple pooling logic
+            # Simple pooling logic for ablation
             all_nodes = torch.cat([walk_data['source']['short']['nodes'], walk_data['target']['short']['nodes']], dim=0)
             all_masks = torch.cat([walk_data['source']['short']['masks'], walk_data['target']['short']['masks']], dim=0)
             
@@ -319,20 +314,16 @@ class HiCoSTv2(L.LightningModule):
             flat_f = node_memory[flat_n].view(B_total, all_nodes.size(1), all_nodes.size(2), -1)
             
             m_sum = all_masks.sum(dim=-1, keepdim=True).clamp(min=1)
-            pooled = (flat_f * all_masks.unsqueeze(-1)).sum(dim=2) / m_sum # [B, W, D]
-            # Pool over walks
+            pooled = (flat_f * all_masks.unsqueeze(-1)).sum(dim=2) / m_sum
             w_sum = pooled.sum(dim=1) / pooled.size(1)
             
             src_simple = w_sum[:batch_size]
             dst_simple = w_sum[batch_size:]
-            return src_simple, dst_simple, walk_data        
-        
-        
+            return src_simple, dst_simple, walk_data
         
         # Combine source/target walks for batched HCT processing
-        combined_walks = {}
         types = ['short', 'long', 'tawr'] if self.ablation_walk_multi_scale else ['short']
-        
+        combined_walks = {}
         for wt in types:
             if wt not in walk_data['source']: continue
             combined_walks[wt] = {
@@ -347,20 +338,12 @@ class HiCoSTv2(L.LightningModule):
                     walk_data['target'][wt]['restart_flags']
                 ], dim=0)
         
-        # Run HCT
-        # Returns [B*2, D] if return_all=False (fused) or dict if True
-        # We need per-type for refiner, so we might need to adjust HCT forward or extract intermediates
-        # For this integration, let's assume HCT returns fused [B*2, D] AND we extract per-type from walk_data separately if needed
-        # Actually, GatedRefiner needs per-type raw walks. 
-        # Strategy: HCT gives global structural context. Refiner takes HCT output + Raw Walks.
-        
         hct_out = self.hct(
             walks_dict=combined_walks,
             node_memory=node_memory,
             return_all=False
-        ) # [B*2, D_hct]
-        
-        hct_out = self.hct_proj(hct_out) # [B*2, D_hidden]
+        )
+        hct_out = self.hct_proj(hct_out)
         
         src_hct = hct_out[:batch_size]
         dst_hct = hct_out[batch_size:]
@@ -372,8 +355,7 @@ class HiCoSTv2(L.LightningModule):
         src_nodes: torch.Tensor,
         dst_nodes: torch.Tensor,
         timestamps: torch.Tensor,
-        batch: Optional[Dict] = None,
-        co_occurrence_matrix: Optional[Dict] = None
+        batch: Optional[Dict] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Full Forward Pass:
@@ -385,8 +367,6 @@ class HiCoSTv2(L.LightningModule):
         device = src_nodes.device
         batch_size = src_nodes.size(0)
         
-        # 1. Get Current Memory (SAM)
-        # Detach for walk sampling to prevent gradient loops through history
         current_memory = self.sam_module.raw_memory.detach()
         
         src_tensor = src_nodes.to(device).long()
@@ -403,39 +383,14 @@ class HiCoSTv2(L.LightningModule):
             current_times=ts_tensor,
             memory_states=current_memory,
             edge_index=self.edge_index,
-            edge_time=self.edge_time,
-            co_occurrence_scores=co_occurrence_matrix # Pass the HCT co-occurrence here
+            edge_time=self.edge_time
         )
-        
-        # Ensure you pass the augmented data to HCT
-        if self.use_hct and not self.debug_simple_walk:
-            combined_walks = {
-                'short': {
-                    'nodes': torch.cat([walk_data['source']['short']['nodes'], walk_data['target']['short']['nodes']], dim=0),
-                    'nodes_anon': torch.cat([walk_data['source']['short']['nodes_anon'], walk_data['target']['short']['nodes_anon']], dim=0),
-                    'masks': torch.cat([walk_data['source']['short']['masks'], walk_data['target']['short']['masks']], dim=0),
-                    'times': torch.cat([walk_data['source']['short']['times'], walk_data['target']['short']['times']], dim=0),
-                },
-                'long': {
-                    'nodes': torch.cat([walk_data['source']['long']['nodes'], walk_data['target']['long']['nodes']], dim=0),
-                    'nodes_anon': torch.cat([walk_data['source']['long']['nodes_anon'], walk_data['target']['long']['nodes_anon']], dim=0),
-                    'masks': torch.cat([walk_data['source']['long']['masks'], walk_data['target']['long']['masks']], dim=0),
-                    'times': torch.cat([walk_data['source']['long']['times'], walk_data['target']['long']['times']], dim=0),
-                },
-                'tawr': {
-                    'nodes': torch.cat([walk_data['source']['tawr']['nodes'], walk_data['target']['tawr']['nodes']], dim=0),
-                    'nodes_anon': torch.cat([walk_data['source']['tawr']['nodes_anon'], walk_data['target']['tawr']['nodes_anon']], dim=0),
-                    'masks': torch.cat([walk_data['source']['tawr']['masks'], walk_data['target']['tawr']['masks']], dim=0),
-                    'times': torch.cat([walk_data['source']['tawr']['times'], walk_data['target']['tawr']['times']], dim=0),
-                },
-            }
         
         # 3. Encode Walks (HCT) -> Structural Embeddings
         src_hct, dst_hct, combined_walks = self._get_hct_embeddings(walk_data, current_memory, batch_size)
         
         # 4. Evolve Memory (ST-ODE) -> Temporal Embeddings
-        # Only update periodically or if enough time has passed to save compute
-        src_stode = current_memory[src_nodes] # Default to current memory if ODE skipped
+        src_stode = current_memory[src_nodes]
         dst_stode = current_memory[dst_nodes]
         
         if self.use_st_ode and self.training and self.st_ode is not None:
@@ -443,59 +398,49 @@ class HiCoSTv2(L.LightningModule):
             t_max = timestamps.max()
             dt = t_max - self.last_ode_update_time
             
-            # Update condition: Interval reached OR large time jump
             if self._ode_batch_counter >= self.st_ode_update_interval or dt > 100.0:
                 self._ode_batch_counter = 0
                 
                 free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-                if free_memory < 2 * 1024**3:  # Less than 2GB free
+                if free_memory < 2 * 1024**3:
                     logger.warning(f"Skipping ST-ODE due to low memory ({free_memory/1024**3:.2f} GB free)")
                 else:
-                # Here we simulate obs using the sampled walk nodes and times
                     obs_encodings = self._prepare_ode_observations(walk_data, current_memory, batch_size)
                 
                 if obs_encodings is not None:
-                    
                     observed_nodes = obs_encodings['node_map']
                     observed_memory = current_memory[observed_nodes]
                     try:
                         evolved_observed = self.st_ode(
-                            node_states=observed_memory,  # Only observed nodes
+                            node_states=observed_memory,
                             walk_encodings=obs_encodings['encodings'],
                             walk_times=obs_encodings['times'],
                             walk_masks=obs_encodings['masks'],
                             adj_matrix=obs_encodings['adj']
                         )
                         
-                        # Update global memory state (Residual update handled inside ST-ODE or here)
-                        # RobustSAM already has residual, but ST-ODE evolves the whole graph
                         with torch.no_grad():
-                            # Simple blending for stability
                             self.sam_module.raw_memory.data[observed_nodes] = \
                                 0.9 * self.sam_module.raw_memory.data[observed_nodes] + \
                                 0.1 * evolved_observed
                             
                         self.last_ode_update_time = t_max
                         
-                        # Fetch updated memory for src/dst
                         src_stode = self.sam_module.raw_memory[src_nodes]
                         dst_stode = self.sam_module.raw_memory[dst_nodes]
                     except RuntimeError as e:
                         logger.warning(f"ST-ODE failed: {e}")
-                        # Fall back to current memory
                         src_stode = current_memory[src_nodes]
                         dst_stode = current_memory[dst_nodes]
                     
-                    # Clean up
                     del obs_encodings
                     torch.cuda.empty_cache()
 
-        # 5. Get SAM Memory Embeddings (Direct Lookup) -> Memory Embeddings
+        # 5. Get SAM Memory Embeddings
         src_sam = current_memory[src_nodes]
         dst_sam = current_memory[dst_nodes]
         
-        # 6. Gated Mutual Refinement (Fuse SAM, HCT, STODE)
-        # Prepare per-type raw embeddings for the refiner
+        # 6. Gated Mutual Refinement
         src_per_type, src_masks = self._extract_per_type_embeds(walk_data['source'], current_memory)
         dst_per_type, dst_masks = self._extract_per_type_embeds(walk_data['target'], current_memory)
         
@@ -508,12 +453,10 @@ class HiCoSTv2(L.LightningModule):
                 src_masks=src_masks, dst_masks=dst_masks
             )
         else:
-            # Simple Concat Fusion
             stacked_src = torch.cat([src_sam, src_hct, src_stode], dim=-1)
             stacked_dst = torch.cat([dst_sam, dst_hct, dst_stode], dim=-1)
             final_src = self.refiner(stacked_src)
             final_dst = self.refiner(stacked_dst)
-
         
         return final_src, final_dst
 
@@ -521,24 +464,19 @@ class HiCoSTv2(L.LightningModule):
         """Prepare sparse observations for ST-ODE from walk data - Memory Efficient Version."""
         device = memory.device
         
-        # Use only the current batch nodes instead of all nodes
         key = 'short' if not self.ablation_walk_multi_scale else 'short'
         
-        # Get nodes from walk data (only source and target from current batch)
-        src_nodes = walk_data['source'][key]['nodes'].view(batch_size, -1)  # [B, W*L]
-        tgt_nodes = walk_data['target'][key]['nodes'].view(batch_size, -1)  # [B, W*L]
-        src_times = walk_data['source'][key]['times'].view(batch_size, -1)  # [B, W*L]
-        tgt_times = walk_data['target'][key]['times'].view(batch_size, -1)  # [B, W*L]
+        src_nodes = walk_data['source'][key]['nodes'].view(batch_size, -1)
+        tgt_nodes = walk_data['target'][key]['nodes'].view(batch_size, -1)
+        src_times = walk_data['source'][key]['times'].view(batch_size, -1)
+        tgt_times = walk_data['target'][key]['times'].view(batch_size, -1)
         
-        # Combine and get unique nodes for this batch only
-        batch_nodes = torch.cat([src_nodes, tgt_nodes], dim=1)  # [B, 2*W*L]
-        batch_times = torch.cat([src_times, tgt_times], dim=1)  # [B, 2*W*L]
+        batch_nodes = torch.cat([src_nodes, tgt_nodes], dim=1)
+        batch_times = torch.cat([src_times, tgt_times], dim=1)
         
-        # Flatten and get unique
         flat_nodes = batch_nodes.view(-1)
         flat_times = batch_times.view(-1)
         
-        # Filter valid nodes (non-zero)
         valid_mask = flat_nodes > 0
         valid_nodes = flat_nodes[valid_mask]
         valid_times = flat_times[valid_mask]
@@ -546,24 +484,19 @@ class HiCoSTv2(L.LightningModule):
         if valid_nodes.numel() == 0:
             return None
         
-        # Get unique nodes and times for this batch only
         unique_nodes, node_inv = torch.unique(valid_nodes, return_inverse=True)
         unique_times, time_inv = torch.unique(valid_times, return_inverse=True)
         
         num_unique_nodes = unique_nodes.size(0)
         num_unique_times = unique_times.size(0)
         
-        # CRITICAL FIX: Aggressively limit dimensions to prevent OOM
-        max_nodes = min(num_unique_nodes, 500)   # Cap at 500 nodes
-        max_times = min(num_unique_times, 50)     # Cap at 50 time points
+        max_nodes = min(num_unique_nodes, 500)
+        max_times = min(num_unique_times, 10)
         
-        # Sample nodes if too many
         if num_unique_nodes > max_nodes:
-            # Keep nodes with most observations
             node_counts = torch.bincount(node_inv, minlength=num_unique_nodes)
             top_node_indices = torch.topk(node_counts, max_nodes).indices
             unique_nodes = unique_nodes[top_node_indices]
-            # Remap indices
             node_map = torch.full((num_unique_nodes,), -1, dtype=torch.long, device=device)
             node_map[top_node_indices] = torch.arange(max_nodes, device=device)
             node_inv = node_map[node_inv]
@@ -574,7 +507,6 @@ class HiCoSTv2(L.LightningModule):
             time_inv = time_inv[valid_mask]
             num_unique_nodes = max_nodes
         
-        # Sample recent times if too many
         if num_unique_times > max_times:
             sorted_times, sorted_idx = torch.sort(unique_times, descending=True)
             selected_times = sorted_times[:max_times]
@@ -589,54 +521,38 @@ class HiCoSTv2(L.LightningModule):
             unique_times = selected_times
             num_unique_times = max_times
         
-        # Create 2D indices for scatter operation
-        # Flatten (node, time) pairs to 1D index: idx = node * num_times + time
-        flat_idx = node_inv * num_unique_times + time_inv  # [num_valid]
+        flat_idx = node_inv * num_unique_times + time_inv
         
-        # Get features for valid nodes
-        node_features = memory[unique_nodes]  # [num_unique_nodes, memory_dim]
-        feats_expanded = node_features[node_inv]  # [num_valid, memory_dim]
+        node_features = memory[unique_nodes]
+        feats_expanded = node_features[node_inv]
         
-        # CRITICAL FIX: Use scatter_add_ with proper 2D indexing
-        # Create output tensor [num_unique_nodes * num_unique_times, memory_dim]
         total_slots = num_unique_nodes * num_unique_times
         obs_flat = torch.zeros(total_slots, self.memory_dim, device=device)
         counts_flat = torch.zeros(total_slots, device=device)
         
-        # Scatter add features
-        # feats_expanded: [num_valid, memory_dim]
-        # flat_idx: [num_valid]
-        # obs_flat: [total_slots, memory_dim]
         obs_flat.scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, self.memory_dim), feats_expanded)
         counts_flat.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float))
         
-        # Reshape to 3D: [num_unique_nodes, num_unique_times, memory_dim]
         obs = obs_flat.view(num_unique_nodes, num_unique_times, self.memory_dim)
         counts = counts_flat.view(num_unique_nodes, num_unique_times)
         
-        # Normalize
-        counts = counts.clamp(min=1.0).unsqueeze(-1)  # [num_nodes, num_times, 1]
-        obs = obs / counts  # Broadcasting: [N, T, D] / [N, T, 1] -> [N, T, D]
+        counts = counts.clamp(min=1.0).unsqueeze(-1)
+        obs = obs / counts
         
-        # Create sparse adjacency matrix for unique nodes only
         adj = torch.eye(num_unique_nodes, device=device)
         
-        # Create time tensor [num_unique_nodes, num_unique_times, 1]
         times_matrix = unique_times.view(1, num_unique_times, 1).expand(num_unique_nodes, -1, -1)
-        
-        # Create mask [num_unique_nodes, num_unique_times, 1]
         masks = (counts.squeeze(-1) > 0).float().unsqueeze(-1)
         
         return {
-            'encodings': obs.unsqueeze(2),  # [num_nodes, num_times, 1, memory_dim]
-            'times': times_matrix,  # [num_nodes, num_times, 1]
-            'masks': masks,  # [num_nodes, num_times, 1]
-            'adj': adj,  # [num_nodes, num_nodes]
-            'node_map': unique_nodes,  # Mapping back to global node IDs
+            'encodings': obs.unsqueeze(2),
+            'times': times_matrix,
+            'masks': masks,
+            'adj': adj,
+            'node_map': unique_nodes,
         }
 
     def _extract_per_type_embeds(self, side_data, memory) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Extract [B, Types, MaxWalks, D] and masks for Refiner."""
         types = ['short', 'long', 'tawr'] if self.ablation_walk_multi_scale else ['short']
         embeds = []
         masks = []
@@ -647,19 +563,16 @@ class HiCoSTv2(L.LightningModule):
         device = memory.device
         
         for t in types:
-            nodes = side_data[t]['nodes'] # [B, W, L]
-            m = side_data[t]['masks']     # [B, W, L]
+            nodes = side_data[t]['nodes']
+            m = side_data[t]['masks']
             W, L = nodes.shape[1], nodes.shape[2]
             
-            # Lookup embeddings
             flat_n = nodes.view(-1)
             flat_f = memory[flat_n].view(B, W, L, D)
             
-            # Pool over Length
             m_sum = m.sum(dim=-1, keepdim=True).clamp(min=1)
-            pooled = (flat_f * m.unsqueeze(-1)).sum(dim=2) / m_sum # [B, W, D]
+            pooled = (flat_f * m.unsqueeze(-1)).sum(dim=2) / m_sum
             
-            # Pad/Trim to max_w
             if W < max_w:
                 pad = max_w - W
                 pooled = F.pad(pooled, (0,0,0,pad))
@@ -674,17 +587,13 @@ class HiCoSTv2(L.LightningModule):
             
         return torch.stack(embeds, dim=1), torch.stack(masks, dim=1)
 
-    def forward(self, batch: Dict, return_probs: bool = False, co_occurrence_matrix: Optional[Dict] = None) -> torch.Tensor:
+    def forward(self, batch: Dict, return_probs: bool = False) -> torch.Tensor:
         src_nodes = batch['src_nodes']
         dst_nodes = batch['dst_nodes']
         timestamps = batch['timestamps']  
         
         src, dst = self.compute_temporal_embeddings(
-            src_nodes, 
-            dst_nodes, 
-            timestamps,   
-            batch=batch,
-            co_occurrence_matrix=co_occurrence_matrix
+            src_nodes, dst_nodes, timestamps, batch=batch
         )
         logits = self.link_predictor(src, dst).squeeze(-1)
         
@@ -695,50 +604,23 @@ class HiCoSTv2(L.LightningModule):
         return logits
 
     def training_step(self, batch, batch_idx):
-        
         if batch_idx % 50 == 0:
             torch.cuda.empty_cache()
         
-        # 1. Mine Hard Negatives & Smooth Labels        
-        # Get HCT co-occurrence scores for hard negative mining (NEW)
-        current_memory = self.sam_module.raw_memory.detach()
-
-        walk_data = self.walk_sampler(
-            source_nodes=batch['src_nodes'],
-            target_nodes=batch['dst_nodes'],
-            current_times=batch['timestamps'],
-            memory_states=current_memory,
-            edge_index=self.edge_index,
-            edge_time=self.edge_time
-        )
-
-        # Get HCT co-occurrence matrix (from StabilizedHCT)
-        hct_cooccur = self.hct.get_cooccurrence_matrix(walk_data, current_memory)
-        
-        
-        # Pass HCT co-occurrence to HNM (NEW)
+        # Hard negative mining (co‑occurrence matrix not needed here)
         aug_batch = self.hard_neg_miner(
             batch, 
             memory=self.sam_module.raw_memory,
-            cooccurrence_matrix=hct_cooccur  
+            cooccurrence_matrix=None  # Co‑occurrence is computed inside HCT later
         )
         
-        # 2. Forward Pass
-        logits = self(aug_batch, co_occurrence_matrix=hct_cooccur)
-        
-        # 3. Loss (BCE works with smoothed labels)
+        logits = self(aug_batch)
         loss = F.binary_cross_entropy_with_logits(logits, aug_batch['labels'])
         
-        # 4. Log
         self.log('train_loss', loss, prog_bar=True)
-
-        # Clean up intermediate tensors
-        del walk_data, hct_cooccur, aug_batch, current_memory
-
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Update SAM Memory after batch."""
         if self.training:
             src = batch['src_nodes']
             dst = batch['dst_nodes']
@@ -753,8 +635,7 @@ class HiCoSTv2(L.LightningModule):
                     current_time=ts.detach(),
                     node_features=self.node_raw_features.detach() if self.node_raw_features is not None else None
                 )
-            
-                # Reset prototypes if NaN detected
+                
                 all_nodes = torch.unique(torch.cat([src, dst]))
                 self.sam_module.reset_prototypes_if_needed(all_nodes)
 
@@ -765,7 +646,6 @@ class HiCoSTv2(L.LightningModule):
             weight_decay=self.hparams.weight_decay
         )
         
-        # Safely determine steps_per_epoch for the cosine scheduler
         if (self.trainer.train_dataloader is not None and 
                 hasattr(self.trainer.train_dataloader, '__len__')):
             steps_per_epoch = len(self.trainer.train_dataloader) // self.trainer.accumulate_grad_batches
@@ -773,8 +653,9 @@ class HiCoSTv2(L.LightningModule):
             total_steps = self.trainer.estimated_stepping_batches
             steps_per_epoch = total_steps // self.trainer.max_epochs
         else:
-            # Fallback to the known value from dataset logs (862 batches/epoch)
-            logger.warning("Could not determine steps_per_epoch. Using default of 862 steps (from dataset info).")
+            logger.warning(
+                "Could not determine steps_per_epoch. Using default of 862 steps."
+            )
             steps_per_epoch = 862
 
         scheduler = self.hard_neg_miner.get_cosine_scheduler(
@@ -800,28 +681,21 @@ class HiCoSTv2(L.LightningModule):
         loss = F.binary_cross_entropy_with_logits(logits, labels)
         
         self.log('val_loss', loss, prog_bar=True)
-        # Compute AP/AUC on epoch end to save time
-        # Store for epoch-end aggregation
         self.validation_step_outputs.append({'probs': probs, 'labels': labels})
         return {'probs': probs, 'labels': labels}
 
     def on_validation_epoch_start(self):
-        """Backup SAM memory to avoid contamination during validation (NEW)"""
         if hasattr(self, '_sam_val_backup'): delattr(self, '_sam_val_backup')
         if self.training:
             self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
             self._stode_val_backup = self.st_ode.node_states.clone().detach() if self.use_st_ode else None
 
-
     def on_validation_epoch_end(self):
-        """Restore SAM/ST-ODE memory after validation (NEW)"""
         if hasattr(self, '_sam_val_backup'):
             self.sam_module.raw_memory.data.copy_(self._sam_val_backup)
-        
         if self.use_st_ode and hasattr(self, '_stode_val_backup'):
             self.st_ode.node_states.data.copy_(self._stode_val_backup)
         
-        # Aggregate validation outputs
         outputs = self.validation_step_outputs
         if not outputs:
             self.validation_step_outputs.clear()
@@ -836,7 +710,6 @@ class HiCoSTv2(L.LightningModule):
         self.log('val_ap', ap, prog_bar=True)
         self.log('val_auc', auc, prog_bar=True)
 
-        # Clear the list for next validation epoch
         self.validation_step_outputs.clear()
 
 

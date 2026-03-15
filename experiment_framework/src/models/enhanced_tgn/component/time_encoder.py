@@ -58,8 +58,7 @@ class TimeEncoder(nn.Module):
             torch.sin(projection)
         ], dim=-1) # [N, time_dim]
 
-        
-        
+
         if flattened:
             encodings = encodings.view(batch_size, n_neighbors, -1)
         else:

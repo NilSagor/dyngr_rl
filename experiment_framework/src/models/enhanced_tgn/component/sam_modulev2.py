@@ -48,69 +48,39 @@ def _align_batch_size(tensor: torch.Tensor, batch_size: int, name: str = "tensor
         return torch.cat([tensor, padding], dim=0)
 
 class SpectralLinear(nn.Linear):
-    """
-    Linear layer with Spectral Normalization for gradient stability.
-    Constrains the Lipschitz constant of the layer.
-    """
+    """Linear layer with Spectral Normalization for gradient stability."""
     def __init__(self, in_features, out_features, bias=True, n_power_iterations=1, eps=1e-12):
         super().__init__(in_features, out_features, bias=bias)
         self.n_power_iterations = n_power_iterations
         self.eps = eps
-        
-        # Initialize spectral norm weight
         if self.weight.dim() > 1:
-            nn.init.xavier_uniform_(self.weight, gain=0.1) # Smaller gain for stability
-            # Register buffer for u vector (power iteration)
-            self.register_buffer('weight_u', torch.empty(1, self.weight.size(0)).normal_(0, 0.02))
-            self._make_weight_norm()
+            nn.init.xavier_uniform_(self.weight, gain=0.1)
+            self.register_buffer('weight_u', torch.empty(out_features).normal_(0, 0.02))
+            self._update_weight_u()
 
-    def _make_weight_norm(self):
-        """Perform one step of power iteration to estimate spectral norm."""
-        if not hasattr(self, 'weight_u'):
+    def _update_weight_u(self):
+        if not hasattr(self, 'weight_u'): 
             return
-            
-        weight = self.weight
-        if self.n_power_iterations > 0:
-            with torch.no_grad():
-                for _ in range(self.n_power_iterations):
-                    # v = w^T u
-                    v = F.linear(self.weight_u, weight.t())
-                    v = F.normalize(v, dim=-1, eps=self.eps)
-                    # u = w v
-                    u = F.linear(v, weight)
-                    u = F.normalize(u, dim=-1, eps=self.eps)
-                    self.weight_u.copy_(u)
-                
-                # Remove batch dimension before mv/dot
-                u_vec = u.squeeze(0)           # [out_features]
-                v_vec = v.squeeze(0)           # [in_features]
-                
-                # sigma = u^T w v
-                sigma = torch.dot(u_vec, torch.mv(weight, v_vec))
-        
-        # Normalize weight
-        if sigma > 0:
-            self.weight.data = self.weight.data / (sigma + self.eps)
+        with torch.no_grad():
+            weight = self.weight.detach()
+            u = self.weight_u.detach()
+            for _ in range(self.n_power_iterations):
+                v = torch.mv(weight.t(), u)
+                v = F.normalize(v, dim=-1, eps=self.eps)
+                u = torch.mv(weight, v)
+                u = F.normalize(u, dim=-1, eps=self.eps)
+            self.weight_u.copy_(u)
 
     def forward(self, input):
-        # Re-apply normalization in forward pass if training (optional, usually done in eval too for consistency)
-        # For strict spectral norm, we often do it in forward. 
-        # Here we rely on the buffer update, but let's ensure strictness if needed.
-        # To keep it lightweight, we assume the buffer update in __init__ or a separate hook is enough,
-        # BUT standard SN applies every forward. Let's apply a lightweight version.
-        
         if self.training and hasattr(self, 'weight_u'):
-             # Quick single step update during training
-             u = self.weight_u
-             v = F.linear(u, self.weight.t())
-             v = F.normalize(v, dim=-1, eps=self.eps)
-             u = F.linear(v, self.weight)
-             u = F.normalize(u, dim=-1, eps=self.eps)
-             self.weight_u.copy_(u)
-             sigma = torch.dot(u.flatten(), torch.mv(self.weight, v).flatten())
-             weight_norm = self.weight / (sigma + self.eps)
-             return F.linear(input, weight_norm, self.bias)
-        
+            with torch.no_grad():
+                self._update_weight_u()
+            u = self.weight_u
+            v = torch.mv(self.weight.t(), u)
+            v = F.normalize(v, dim=-1, eps=self.eps)
+            sigma = torch.dot(u, torch.mv(self.weight, v))
+            weight_norm = self.weight / (sigma + self.eps)
+            return F.linear(input, weight_norm, self.bias)
         return super().forward(input)
 
 
@@ -123,7 +93,7 @@ class RobustSAMCell(nn.Module):
             num_prototypes: int = 5, 
             similarity_metric: str = "cosine", 
             dropout: float = 0.1,
-            residual_alpha: float = 0.8  # Alpha for residual connection (0.8 = 80% old, 20% new)
+            residual_alpha: float = 0.8
         ):
         super().__init__()
         self.memory_dim = memory_dim
@@ -134,11 +104,9 @@ class RobustSAMCell(nn.Module):
         self.query_input_dim = memory_dim + edge_feat_dim + time_dim
         self.gate_input_dim = 2 * memory_dim + time_dim
         
-        # Use SpectralLinear for stability
         self.query_proj = SpectralLinear(self.query_input_dim, memory_dim)
         self.gate_proj = SpectralLinear(self.gate_input_dim, 1)
         
-        # Temperature parameter
         self.temperature = nn.Parameter(torch.ones(1) * 1.0)
         self.register_buffer("temperature_min", torch.tensor(0.5))
         self.register_buffer("temperature_max", torch.tensor(5.0))
@@ -153,7 +121,6 @@ class RobustSAMCell(nn.Module):
         if self.similarity_metric == "cosine":
             query_norm = F.normalize(query, dim=-1, eps=1e-6)
             proto_norm = F.normalize(prototypes, dim=-1, eps=1e-6)
-            # [B, 1, D] x [B, D, K] -> [B, 1, K]
             sim = torch.bmm(query_norm.unsqueeze(1), proto_norm.transpose(1, 2)).squeeze(1)
         elif self.similarity_metric == "dot":
             sim = torch.bmm(query.unsqueeze(1), prototypes.transpose(1, 2)).squeeze(1)
@@ -188,14 +155,14 @@ class RobustSAMCell(nn.Module):
         query_input_cat = torch.cat(query_inputs, dim=-1)
         query = self.query_proj(query_input_cat)
         query = self.layer_norm(query)
-        query = torch.tanh(query)  # Bound activation
+        query = torch.tanh(query)
         
         # Similarity & Attention
         similarity = self.compute_similarity(query, prototypes)
         
         if node_mask is not None:
             all_masked = (~node_mask).all(dim=-1, keepdim=True)
-            masked_sim = similarity.masked_fill(~node_mask, -1e9) # Large negative for safety
+            masked_sim = similarity.masked_fill(~node_mask, -1e9)
             if all_masked.any():
                 uniform = torch.ones_like(similarity) / self.num_prototypes
                 attention_weights = torch.where(all_masked, uniform, F.softmax(masked_sim, dim=-1))
@@ -228,9 +195,7 @@ class RobustSAMCell(nn.Module):
         # Standard Gated Update
         gated_update = (1 - update_gate) * raw_memory + update_gate * candidate_memory
         
-        # --- NEW: Residual Memory Update ---
-        # Blend the gated update with the original memory to prevent catastrophic forgetting
-        # Formula: mem_new = alpha * mem_old + (1 - alpha) * gated_update
+        # Residual Memory Update
         updated_memory = (self.residual_alpha * raw_memory) + ((1 - self.residual_alpha) * gated_update)
         
         updated_memory = self.layer_norm(updated_memory)
@@ -266,7 +231,7 @@ class RobustStabilityAugmentedMemory(nn.Module):
             similarity_metric: str = "cosine",
             dropout: float = 0.1,
             residual_alpha: float = 0.8,
-            time_decay_factor: float = 0.99,  # Decay per unit time (or scaled time)
+            time_decay_factor: float = 0.99,
         ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -284,12 +249,11 @@ class RobustStabilityAugmentedMemory(nn.Module):
         else:
             self.node_proj = None
 
-        # Spectral Normalized Edge Projection
-        self.edge_proj = SpectralLinear(edge_feat_dim, memory_dim)
+        self.edge_proj = nn.Linear(edge_feat_dim, memory_dim)
         
         self.sam_cell = RobustSAMCell(
             memory_dim=memory_dim,
-            edge_feat_dim=memory_dim, # Projected dim
+            edge_feat_dim=memory_dim,
             time_dim=time_dim,
             num_prototypes=num_prototypes,
             similarity_metric=similarity_metric,
@@ -309,9 +273,6 @@ class RobustStabilityAugmentedMemory(nn.Module):
             torch.empty(num_nodes, num_prototypes, memory_dim)
         )
         nn.init.xavier_uniform_(self.all_prototypes, gain=0.1)
-        
-        # Reset tracking
-        self._nodes_needing_reset: Optional[torch.Tensor] = None
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
         return self.raw_memory[node_ids]
@@ -324,44 +285,30 @@ class RobustStabilityAugmentedMemory(nn.Module):
         return self.prototype_norm(prototypes)
 
     def _apply_time_decay(self, node_ids: torch.Tensor, current_time: torch.Tensor):
-        """
-        Apply time-decay to memory of nodes that haven't been updated recently.
-        Simulates continuous dynamics where old information fades.
-        """
+        """Apply time-decay to memory of nodes that haven't been updated recently."""
         if node_ids.numel() == 0:
             return
             
         device = self.raw_memory.device
         current_time = current_time.to(device)
         
-        # Get last update times for these nodes
         last_times = self.last_update_time[node_ids]
-        
-        # Calculate time delta
-        # Ensure current_time is broadcastable
         if current_time.dim() == 0 or current_time.size(0) == 1:
-            dt = (current_time.item() if isinstance(current_time, torch.Tensor) else current_time) - last_times
+            dt = current_time.item() - last_times
         else:
-            # Batched case: assume node_ids and current_time align or current_time is global
             if current_time.size(0) == node_ids.size(0):
                 dt = current_time - last_times
             else:
-                # Global time assumption
                 t_val = current_time.mean()
                 dt = t_val - last_times
         
-        dt = torch.clamp(dt, min=0.0) # Should be non-negative
-        
+        dt = torch.clamp(dt, min=0.0)
         if dt.max() == 0:
-            return # No time passed
+            return
             
-        # Decay factor: exp(-lambda * dt) or factor^dt
-        # Using exponential decay for smoothness
         decay_vals = torch.exp(-torch.abs(torch.log(torch.tensor(self.time_decay_factor))) * dt)
-        decay_vals = decay_vals.unsqueeze(-1) # [B, 1]
+        decay_vals = decay_vals.unsqueeze(-1)
         
-        # Apply decay
-        # Only decay if dt > 0 to save compute
         mask = (dt > 1e-6).unsqueeze(-1)
         if mask.any():
             self.raw_memory[node_ids] = torch.where(
@@ -369,7 +316,6 @@ class RobustStabilityAugmentedMemory(nn.Module):
                 self.raw_memory[node_ids] * decay_vals,
                 self.raw_memory[node_ids]
             )
-            # Clamp after decay
             self.raw_memory[node_ids] = torch.clamp(self.raw_memory[node_ids], -10.0, 10.0)
 
     def update_memory_batch(
@@ -388,22 +334,18 @@ class RobustStabilityAugmentedMemory(nn.Module):
         batch_size = source_nodes.size(0)
         device = source_nodes.device
         
-        # Update global max time
         if current_time.numel() > 0:
             self.global_max_time.fill_(max(self.global_max_time.item(), current_time.max().item()))
         
-        # Apply time decay to involved nodes (already vectorized)
         all_involved = torch.unique(torch.cat([source_nodes, target_nodes]))
         self._apply_time_decay(all_involved, current_time)
         
-        # Sanity check raw memory
         if not torch.isfinite(self.raw_memory).all():
             bad_mask = ~torch.isfinite(self.raw_memory).all(dim=1)
             bad_nodes = bad_mask.nonzero(as_tuple=True)[0]
             self.raw_memory[bad_nodes] = 0.0
             self.all_prototypes[bad_nodes] = torch.randn_like(self.all_prototypes[bad_nodes]) * 0.01
 
-        # Edge feature projection
         if edge_features is not None and edge_features.numel() > 0:
             edge_proj = self.edge_proj(edge_features)
             edge_proj = _sanitize_tensor(edge_proj, "edge_proj")
@@ -413,11 +355,9 @@ class RobustStabilityAugmentedMemory(nn.Module):
         else:
             edge_proj = torch.zeros(batch_size, self.memory_dim, device=device)
         
-        # Time encoding
         time_enc = self.time_encoder(current_time)
         time_enc = _align_batch_size(time_enc, batch_size, "time_enc")
         
-        # Retrieve current memory and prototypes
         src_mem = self.raw_memory[source_nodes]
         tgt_mem = self.raw_memory[target_nodes]
         src_proto = self.get_prototypes(source_nodes)
@@ -426,44 +366,35 @@ class RobustStabilityAugmentedMemory(nn.Module):
         src_node_feat = self.node_proj(node_features[source_nodes]) if (self.node_proj and node_features is not None) else None
         tgt_node_feat = self.node_proj(node_features[target_nodes]) if (self.node_proj and node_features is not None) else None
         
-        # Run SAM cells
         src_new, src_info = self.sam_cell(src_mem, src_node_feat, edge_proj, time_enc, src_proto)
         tgt_new, tgt_info = self.sam_cell(tgt_mem, tgt_node_feat, edge_proj, time_enc, tgt_proto)
         
         if not torch.isfinite(src_new).all() or not torch.isfinite(tgt_new).all():
             logger.error("SAM Cell produced NaN. Skipping write-back.")
-            self._nodes_needing_reset = torch.unique(torch.cat([source_nodes, target_nodes]))
             return {
                 'source_attention': src_info, 'target_attention': tgt_info,
                 'source_memory': torch.zeros_like(src_mem), 'target_memory': torch.zeros_like(tgt_mem)
             }
         
-        # ---------- VECTORIZED OVERLAP HANDLING ----------
-        # Concatenate all updates
-        all_nodes = torch.cat([source_nodes, target_nodes])                # [2*batch]
-        all_updates = torch.cat([src_new, tgt_new])                        # [2*batch, D]
-        all_times = torch.cat([current_time, current_time])                # [2*batch]
+        # Vectorized overlap handling
+        all_nodes = torch.cat([source_nodes, target_nodes])
+        all_updates = torch.cat([src_new, tgt_new])
+        all_times = torch.cat([current_time, current_time])
 
-        # Unique nodes and inverse mapping
-        unique_nodes, inverse = torch.unique(all_nodes, return_inverse=True)  # unique: [U], inverse: [2*batch]
+        unique_nodes, inverse = torch.unique(all_nodes, return_inverse=True)
 
-        # 1. Per-group max of times (for softmax stability)
         group_max = torch.zeros(len(unique_nodes), device=device, dtype=all_times.dtype)
         group_max.scatter_reduce_(0, inverse, all_times, reduce='amax', include_self=False)
 
-        # 2. Centered times and exponentials
         centered = all_times - group_max[inverse]
         exp_vals = torch.exp(centered)
 
-        # 3. Per-group sum of exponentials
         group_exp_sum = torch.zeros(len(unique_nodes), device=device, dtype=exp_vals.dtype)
         group_exp_sum.scatter_reduce_(0, inverse, exp_vals, reduce='sum', include_self=False)
 
-        # 4. Softmax weights
-        weights = exp_vals / group_exp_sum[inverse]                         # [2*batch]
+        weights = exp_vals / group_exp_sum[inverse]
 
-        # 5. Weighted sum of updates per group
-        weighted_updates = all_updates * weights.unsqueeze(-1)              # [2*batch, D]
+        weighted_updates = all_updates * weights.unsqueeze(-1)
         group_weighted_sum = torch.zeros(len(unique_nodes), all_updates.size(1),
                                         device=device, dtype=weighted_updates.dtype)
         group_weighted_sum.scatter_reduce_(
@@ -471,23 +402,18 @@ class RobustStabilityAugmentedMemory(nn.Module):
             weighted_updates, reduce='sum', include_self=False
         )
 
-        # 6. Sum of weights per group (should be 1, but numeric safety)
         group_weight_sum = torch.zeros(len(unique_nodes), device=device, dtype=weights.dtype)
         group_weight_sum.scatter_reduce_(0, inverse, weights, reduce='sum', include_self=False)
 
-        # 7. Final updates
-        final_updates = group_weighted_sum / group_weight_sum.unsqueeze(-1)  # [U, D]
+        final_updates = group_weighted_sum / (group_weight_sum.unsqueeze(-1) + 1e-8)
+        final_updates = torch.nan_to_num(final_updates, nan=0.0)
 
-        # 8. Write back to raw_memory
         self.raw_memory[unique_nodes] = final_updates
 
-        # 9. Update last_update_time with max time per node
         group_max_time = torch.zeros(len(unique_nodes), device=device, dtype=all_times.dtype)
         group_max_time.scatter_reduce_(0, inverse, all_times, reduce='amax', include_self=False)
         self.last_update_time[unique_nodes] = group_max_time
-        # ------------------------------------------------
 
-        # Final global sanitize
         self.raw_memory.data = torch.clamp(
             torch.nan_to_num(self.raw_memory.data, nan=0.0, posinf=10.0, neginf=-10.0),
             -10.0, 10.0
@@ -515,13 +441,11 @@ class RobustStabilityAugmentedMemory(nn.Module):
         node_ids = node_ids.to(device)
         current_time = current_time.to(device)
         
-        # Apply decay virtually (copy, decay, process)
         raw = self.raw_memory[node_ids].clone()
         
-        # Calculate decay locally for inference
         last_times = self.last_update_time[node_ids]
         if current_time.dim() == 0 or current_time.size(0) == 1:
-            dt = (current_time if isinstance(current_time, float) else current_time.item()) - last_times
+            dt = current_time.item() - last_times
         else:
             dt = current_time - last_times if current_time.size(0) == node_ids.size(0) else (current_time.mean() - last_times)
         
@@ -545,6 +469,33 @@ class RobustStabilityAugmentedMemory(nn.Module):
             
         stabilized, _ = self.sam_cell(raw, None, edge_proj, time_enc, proto)
         return stabilized.detach()
+
+    @torch.no_grad()
+    def reset_prototypes_if_needed(self, node_ids: torch.Tensor, threshold: float = 0.01):
+        """
+        Reset prototypes for nodes where the memory has become stale or NaN.
+        Called after each batch to ensure prototypes remain stable.
+        """
+        if node_ids.numel() == 0:
+            return
+        mem = self.raw_memory[node_ids]
+        proto = self.all_prototypes[node_ids]
+        # Check for NaNs in prototypes
+        if torch.isnan(proto).any():
+            logger.warning("NaN detected in prototypes, resetting affected nodes.")
+            self.all_prototypes[node_ids] = torch.randn_like(proto) * 0.01
+            return
+        # Optionally reset if memory has drifted too far from prototypes
+        # (simple check: average distance)
+        with torch.no_grad():
+            mem_exp = mem.unsqueeze(1)  # [n, 1, D]
+            proto_norm = proto / (proto.norm(dim=-1, keepdim=True) + 1e-8)
+            mem_norm = mem / (mem.norm(dim=-1, keepdim=True) + 1e-8)
+            sim = (mem_norm.unsqueeze(1) * proto_norm).sum(dim=-1)  # [n, P]
+            max_sim = sim.max(dim=-1)[0]
+            if (max_sim < (1 - threshold)).any():
+                reset_nodes = node_ids[max_sim < (1 - threshold)]
+                self.all_prototypes[reset_nodes] = torch.randn_like(self.all_prototypes[reset_nodes]) * 0.01
 
     def reset_memory(self, node_ids: Optional[torch.Tensor] = None):
         if node_ids is None:
