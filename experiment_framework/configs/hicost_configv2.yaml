@@ -6,14 +6,14 @@ model:
   # num_nodes: null  # Will be set based on dataset
   # node_features: 0  # Use learned embeddings
   # Core Dimensions (Aligned for stability)
-  hidden_dim: 128           # Increased from 64 for better capacity
+  hidden_dim: 172           # Increased from 64 for better capacity
   # time_encoding_dim: 128    # Matched to hidden_dim (was 172)
-  time_dim: 128    # Matched to hidden_dim (was 172)
-  memory_dim: 128           # Matched to hidden_dim (was 64)
+  time_dim: 172    # Matched to hidden_dim (was 172)
+  memory_dim: 172           # Matched to hidden_dim (was 64)
   edge_features_dim: 172    # Keep high if edge features are rich
   
   # Architecture Toggles
-  # use_sam: True
+  use_sam: True
   use_hct: True  
   debug_simple_walk: False  # Set True to bypass HCT completely
   
@@ -22,8 +22,8 @@ model:
   similarity_metric: "cosine"
 
   # --- Walk Sampler Parameters ---
-  walk_length_short: 4           # was 3
-  walk_length_long: 10             # was 8
+  walk_length_short: 5           # was 3
+  walk_length_long: 12             # was 8
   walk_length_tawr: 8            # was 6
   num_walks_short: 5              # was 5
   num_walks_long: 3               # was 3
@@ -36,7 +36,7 @@ model:
   
   
   # --- HCT Parameters ---
-  hct_d_model: 128            # Matched to hidden_dim
+  hct_d_model: 172           # Matched to hidden_dim
   hct_nhead: 2
   hct_num_intra_layers: 2
   hct_num_inter_layers: 2
@@ -45,7 +45,7 @@ model:
   
   
   # --- ST-ODE Parameters ---
-  use_st_ode: true
+  use_st_ode: false
   ode_method: 'euler'           # 'dopri5' (adaptive) or 'rk4' (fixed)
   ode_step_size: 1.0          # 500 was too large for rk4. Use 0.1-1.0.
   mu: 0.1                     # Spectral reg strength
@@ -56,8 +56,8 @@ model:
   
   
   # --- Hard Negative Mining ---
-  neg_sample_ratio: 10
-  hard_neg_threshold: 0.5
+  neg_sample_ratio: 5
+  hard_neg_threshold: 0.7
   label_smoothing: 0.1
 
   # === ABLATION FLAGS (NEW & CRITICAL) ===
@@ -75,7 +75,7 @@ training:
   learning_rate: 0.0001
   weight_decay: 0.00001
   max_epochs: 100
-  patience: 10 # 3/5/10
+  patience: 5 # 3/5/10
   val_check_interval: 0.5
   # check_val_every_n_epoch: 5
   gradient_clip_val: 1.0

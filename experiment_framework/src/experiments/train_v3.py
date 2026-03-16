@@ -38,6 +38,7 @@ from src.experiments.exp_utils.model_factory import ModelFactory
 from src.experiments.exp_utils.model_profile import ModelProfiler
 from src.experiments.exp_utils.experiment_logger import ExperimentLogger
 from src.experiments.exp_utils.trainer_setup import TrainerSetup
+from src.experiments.exp_utils.analysis_callback import AnalysisCollector
 
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -237,6 +238,12 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     model.set_graph(pipeline.train_edges, pipeline.train_times)
     
 
+    memory_trace = []  # Collect prototype attention per epoch
+    ode_trajectory = {'dirichlet_energy': [], 'embeddings': [], 'time_points': []}
+    negative_stats = {'hard_ratio': [], 'loss_contrib': []}
+    
+    
+    
     # Debug: Verify embedding module initialized
     if hasattr(model, 'embedding_module'):
         logger.debug(f"Embedding module initialized: {model.embedding_module is not None}")
@@ -249,10 +256,11 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     logger.debug(f"5. edge_raw_features shape: {model.edge_raw_features.shape if model.edge_raw_features is not None else 'None'}")
 
     # logger.debug(f"Embedding module: {model.embedding_module is not None}")
-       
+     # Create analysis collector to retrieve data after training
+    analysis_collector = AnalysisCollector()  
     
     # Setup trainer
-    trainer = TrainerSetup.create(config)
+    trainer = TrainerSetup.create(config, callbacks=[analysis_collector])
     logger.info(f"Trainer max_epochs: {trainer.max_epochs}")
     logger.info(f"EarlyStopping patience: {[c for c in trainer.callbacks if isinstance(c, EarlyStopping)]}")
     
@@ -264,6 +272,7 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         val_dataloaders=pipeline.loaders['val'],
     )
 
+    # Load best checkpoint for testing
     if trainer.checkpoint_callback.best_model_path:
         best_path = trainer.checkpoint_callback.best_model_path
         
@@ -317,26 +326,57 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
         if config['experiment'].get('debug', False):
             validate_model_ready(model, pipeline)
         
-        logger.info("Best checkpoint loaded and walk sampler initialized successfully.")
+        # logger.info("Best checkpoint loaded and walk sampler initialized successfully.")
         
         
-
+        # # Load best checkpoint for testing
+        # if trainer.checkpoint_callback.best_model_path:
+        #     best_path = trainer.checkpoint_callback.best_model_path
+        #     logger.info(f"Loading best checkpoint from {best_path}")        
+            
+        # else:
+        #     logger.warning("No best checkpoint found, using current model")
+        
+    
     # Test - Lightning auto-loads best checkpoint via ckpt_path='best'
     logger.info("Running evaluation with best checkpoint...")
     
     test_results = trainer.test(
         model=model,  # Same model instance (no recreation needed)
         dataloaders=pipeline.loaders['test'],
-        ckpt_path='best'  # ← Lightning handles loading + proper init
+        ckpt_path='best' if trainer.checkpoint_callback.best_model_path else None # ← Lightning handles loading + proper init
     )
+    
+    
+    
+    # Collect co-occurrence if available
+    cooccurrence_matrix = None
+    if hasattr(model, 'get_cooccurrence'):
+        try:
+            cooccurrence_matrix = model.get_cooccurrence()
+        except Exception as e:
+            logger.debug(f"Could not collect co-occurrence: {e}")
     
     # Log results
     training_time = (datetime.now() - start_time).total_seconds()
     exp_logger = ExperimentLogger(config['logging']['log_dir'])
-    exp_logger.log(config, test_results, training_time, model)
+    
+    # Log with analysis artifacts
+    exp_logger.log(
+        config=config, 
+        test_results=test_results, 
+        training_time=training_time, 
+        model=model,
+        walk_stats=analysis_collector.walk_stats,
+        memory_trace=analysis_collector.memory_trace,
+        ode_trajectory=analysis_collector.ode_trajectory,
+        negative_stats=analysis_collector.negative_stats,
+        cooccurrence_matrix=cooccurrence_matrix,
+    )
     
     # Save checkpoint
     final_path = Path(config['logging']['checkpoint_dir']) / 'final_model.ckpt'
+    final_path.parent.mkdir(parents=True, exist_ok=True)
     trainer.save_checkpoint(str(final_path))
     
     logger.info(f"Training complete in {training_time:.1f}s")

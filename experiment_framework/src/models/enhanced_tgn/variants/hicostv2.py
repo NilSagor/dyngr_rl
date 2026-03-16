@@ -43,7 +43,7 @@ class HiCoSTv2(L.LightningModule):
         self,
         num_nodes: int,
         node_feat_dim: int = 0,
-        edge_feat_dim: int = 64,          # will be overridden by 'edge_features_dim' if present
+        edge_feat_dim: int = 64,
         hidden_dim: int = 172,
         time_dim: int = 64,
         memory_dim: int = 172,
@@ -275,7 +275,7 @@ class HiCoSTv2(L.LightningModule):
         self.edge_raw_features = None
         self.validation_step_outputs = []
         
-        logger.info(f"HiCoST Initialized: Robust-SAM + Stabilized-HCT + {'ST-ODE' if use_st_ode else 'No-ODE'} + Gated-Refinement")
+        logger.info(f"HiCoST Initialized: Robust-SAM {self.sam_module} + {'Stabilized-HCT' if use_hct else 'No hct'} + {'ST-ODE' if use_st_ode else 'No-ODE'} + {'Gated-Refinement' if ablation_mrp_gating else 'No Gated-Refinement'}")
 
     def set_graph(self, edge_index: torch.Tensor, edge_time: torch.Tensor):
         self.edge_index = edge_index
@@ -711,6 +711,19 @@ class HiCoSTv2(L.LightningModule):
         self.log('val_auc', auc, prog_bar=True)
 
         self.validation_step_outputs.clear()
+
+    def test_step(self, batch, batch_idx):
+        """Test step for PyTorch Lightning."""
+        # Same logic as validation_step
+        loss, metrics = self._shared_eval_step(batch, batch_idx, "test")
+        
+        # Log test metrics
+        self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test_ap", metrics["ap"], on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test_auc", metrics["auc"], on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test_accuracy", metrics["accuracy"], on_step=False, on_epoch=True, prog_bar=True)
+        
+        return {"loss": loss, **metrics}
 
 
     # Ablation Flags actively modify architecture behavior:

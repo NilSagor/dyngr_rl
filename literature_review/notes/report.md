@@ -52,6 +52,119 @@ Link Predictor Module
 output: Link Prediction
 
 
+
+
+Multi-Scale Walk Sampler
+
+code: https://github.com/NilSagor/dyngr_rl/blob/main/experiment_framework/src/models/enhanced_tgn/component/multi_swalkv2.py
+
+The primary goal of the Multi-Scale Walk Sampler is to generate a set of temporal walks for a node $u$ at time $t$ that collectively capture:
+- Local, fine-grained structure (e.g., immediate neighbors, recent interactions).
+- Global, coarse-grained structure (e.g., community patterns, long-range dependencies).
+- Exploratory behavior (e.g., nodes that frequently form new connections beyond their immediate neighborhood).
+
+It achieves this by sampling three distinct types of walks: Short Walks, Long Walks, and TAWR-style Walks with Restart.
+
+Step 1: Temporal Neighbor Sampling with Exponential Bias
+
+Before defining the walk types, we need a core sampling function. For any node $x$ at a current walk time $\tau$, we sample a neighbor $y$ from its valid historical neighbors $\mathcal{N}_{\tau}(x)$ with a probability that favors more recent interactions. 
+
+$$
+P(y, \tau' \mid x, \tau) = \sum_{z \in N_{\tau}(x)} \frac{\exp \left( \beta \frac{\tau' - \tau_{max}}{\cdot} \right)}{\exp \left( \beta \frac{\tau_z - \tau_{max}}{\cdot} \right)}
+$$
+
+Where:
+-$\tau'$ is the timestamp of edge $(x, y)$.
+-$\tau_{\text{max}} = \max{\tau_z : z \in \mathcal{N}_{\tau}(x)}$ (the most recent neighbor timestamp).
+-$\beta$ is a temperature parameter controlling the bias strength (small $\beta$ strongly favors the most recent neighbor).
+
+This ensures walks are temporally coherent and emphasize recent, likely more relevant, interactions.
+
+Step 2: Short Walks (Capturing Local Structure)
+Short walks are designed to capture the immediate, fine-grained neighborhood of node $u$. They are shallow and stay close to $u$.
+
+For $r = 1$ to $R_s$:
+
+-Initialize walk $W = [(u, t)]$.
+-Set current node $x = u$, current time $\tau = t$.
+-For step $i = 1$ to $L_s$:
+	a. If $\mathcal{N}_{\tau}(x) = \emptyset$, break.
+	b. Sample next node $y$ using the temporal bias $P(y, \tau' | x, \tau)$ from Step 1.
+	c. Append $(y, \tau')$ to $W$.
+	d. Update $x = y$, $\tau = \tau'$.
+-Add $W$ to $\mathcal{W}_u^{\text{short}}$.
+
+Short walks approximate a truncated, temporally-biased random walk on the graph. They explore the $L_s$-hop neighborhood but are likely to stay in high-density regions due to the temporal bias. They provide the "local texture" for HCT.
+
+
+
+Step 3: Long Walks (Capturing Global Structure)
+Long walks are designed to explore further from $u$, capturing broader community structures and longer-range dependencies. They are deeper and can venture into other parts of the graph.
+
+For $r = 1$ to $R_l$:
+
+- Initialize walk $W = [(u, t)]$.
+- Set current node $x = u$, current time $\tau = t$.
+- For step $i = 1$ to $L_l$:
+a. If $\mathcal{N}_{\tau}(x) = \emptyset$, break.
+b. Sample next node $y$ using the temporal bias $P(y, \tau' | x, \tau)$ from Step 1.
+c. Append $(y, \tau')$ to $W$.
+d. Update $x = y$, $\tau = \tau'$.
+- Add $W$ to $\mathcal{W}_u^{\text{long}}$.
+
+The only difference from short walks is the length $L_l > L_s$. This allows the walk to take more steps and potentially reach nodes far from $u$, capturing global patterns. However, the temporal bias still applies at each step, so the walk remains temporally coherent.
+
+
+Step 4: TAWR-style Walks with Restart (Capturing Exploratory Behavior). 
+TAWR-style walks introduce a learnable, time-dependent, node-specific restart probability $\rho_u(\tau)$. At each step, instead of always continuing the walk, the walk may "restart" from the original source node $u$, allowing it to explore multiple "branches" from the source.
+
+First, we define the restart probability for node $u$ at time $\tau$ (the current walk time):
+
+$$
+\rho_u(\tau) = \sigma \left( w_{\rho}^T \cdot [m_u(\tau) \parallel \Phi(\tau)] + b_{\rho} \right)
+$$
+
+Where:
+
+- $\sigma$ is the sigmoid function, ensuring $\rho_u(\tau) \in (0, 1)$.
+
+- $\mathbf{m}_u(\tau)$ is the memory state of node $u$ at time $\tau$ (from the SAM component).
+
+- $\Phi(\tau)$ is the fixed time encoding.
+
+- $\mathbf{w}\rho$ and $b\rho$ are learnable parameters.
+
+This probability is node-specific (different nodes have different restart tendencies), time-dependent (a node may become more exploratory at certain times), and learnable (the model can discover optimal restart strategies from data).
+
+
+
+TAWR Walk Generation:
+
+For $r = 1$ to $R_r$:
+1. Initialize walk $W = [(u, t)]$.
+2. Set current node $x = u$, current time $\tau = t$.
+3. For step $i = 1$ to $L_r$:
+a.If $\mathcal{N}_{\tau}(x) = \emptyset$, break.
+b. With probability $\rho_u(\tau)$: Restart. Set $x = u$ (reset to source node), $\tau = t$ (reset to original time). Append a special restart token $(u, t, \text{restart=true})$ to the walk to mark this event.
+c. With probability $1 - \rho_u(\tau)$: Continue normally.
+i. Sample next node $y$ using the temporal bias $P(y, \tau' | x, \tau)$ from Step 1.
+ii. Append $(y, \tau')$ to $W$.
+iii. Update $x = y$, $\tau = \tau'$.
+4. Add $W$ to $\mathcal{W}_u^{\text{tawr}}$.
+
+Step 5: Walk Anonymization (Crucial for Inductive Learning)
+
+Before passing the walks to HCT, we must anonymize them.
+For each walk set $\mathcal{W}_u$, we:
+
+Identify all unique nodes $\mathcal{V}_{\text{walk}}$ appearing in the walks.
+
+For each walk $W \in \mathcal{W}u$, replace each node identity with an anonymized identifier based on its first occurrence time and frequency across all walks from $u$. This creates anonymized walks $W{\text{anon}}$.
+
+For TAWR walks, the restart token is treated as a special anonymized node with its own identifier.
+This anonymization ensures that the representations learned by HCT are isomorphism-aware and inductive—they depend on structural roles, not specific node IDs.
+
+
 Stability-Augmented Memory (SAM)
 Addresses embedding staleness and instability.
 
@@ -103,11 +216,86 @@ SAM provides enriched node embeddings that are fed to the subsequent components 
 
 
 Hierarchical Co-occurrence Transformer (HCT)
+
+code: https://github.com/NilSagor/dyngr_rl/blob/main/experiment_framework/src/models/enhanced_tgn/component/hct_modulev2.py
+
 Context: HCT's hierarchical approach and multi-scale walks capture neighbor correlations from local to global scales, creating rich, context-aware embeddings.
 
 Addresses limited contextual awareness.
 
 This component extends DyGFormer's neighbor co-occurrence idea and TAWRMAC's NCE to capture higher-order correlations. HCT operates on the sets of walks sampled by the multi-scale sampler. It first uses a Transformer to learn embeddings for nodes within a single walk (intra-walk dependencies). Then, another Transformer aggregates information across all walks for a given node (inter-walk dependencies). A novel co-occurrence matrix is computed not just for first-hop neighbors, but for the anonymized node roles appearing in the walks, capturing deeper structural patterns (e.g., "node that appears as a common second neighbor").
+
+
+Step 1: Input Representation for a Single Walk
+
+For each step $i$ in walk $W_u^{(r)}$, we first create an input embedding $\mathbf{z}_i^{(r)}$ that combines the anonymized node feature and the time encoding.
+
+$$z_i^{(r)} = A(a_i^{(r)}) + \Phi(t_i^{(r)})$$
+
+This gives us a sequence $\mathbf{Z}^{(r)} = [\mathbf{z}_1^{(r)}, \mathbf{z}2^{(r)}, ..., \mathbf{z}L^{(r)}] \in \mathbb{R}^{L \times d{\text{model}}}$ for walk $r$, where $d{\text{model}}$ is the Transformer's hidden dimension.
+
+Step 2: Intra-Walk Transformer (Capturing Local Context)
+
+We apply a Transformer encoder to each walk independently. This allows nodes within a walk to attend to each other, capturing the sequential and structural dependencies along the walk.
+
+For walk $r$, we compute:
+
+$$ H^{(r)} = \text{TransformerEncoder}_1(Z^{(r)}) $$
+
+Where $\mathbf{H}^{(r)} \in \mathbb{R}^{L \times d_{\text{model}}}$ is the sequence of context-aware embeddings for each step in walk $r$. The TransformerEncoder uses multi-head self-attention, where for a single head, the attention from position $i$ to position $j$ is:
+
+$$ \alpha_{ij}^{(r)} = \text{softmax} \left( \frac{(z_i^{(r)} W_Q^1)(z_j^{(r)} W_K^1)^T}{\sqrt{d_k}} \right) $$
+
+This allows the model to learn, for example, that the second node in a walk is often influenced by the first node, regardless of the specific node IDs.
+
+After the intra-walk Transformer, we aggregate each walk into a single vector, e.g., by mean-pooling:
+	
+$$w_u^{(r)} = \text{MeanPool}(H^{(r)}) \in \mathbb{R}^{d_{model}}$$
+
+Now, we have a set of walk embeddings for node $u$: $\mathcal{E}_{u} = {\mathbf{w}_u^{(1)}, \mathbf{w}_u^{(2)}, ..., \mathbf{w}_u^{(R)}}$.
+
+
+
+Step 3: Co-occurrence Matrix Construction
+
+We construct a co-occurrence matrix $\mathbf{C}_u \in \mathbb{R}^{R \times R}$ that captures how often the same anonymized roles appear in similar positions across different walks. This goes beyond simple neighbor co-occurrence (as in DyGFormer) to higher-order structural patterns.
+
+For two walks $r$ and $s$, we compute their co-occurrence score as:
+
+$$ C_u[r, s] = \sum_{i=1}^{L} \sum_{j=1}^{L} \mathbb{I}(a_i^{(r)} = a_j^{(s)}) \cdot \kappa(i, j) $$
+
+Where:$\mathbb{I}(a_i^{(r)} = a_j^{(s)})$ is an indicator function that is 1 if the anonymized node at position $i$ in walk $r$ is the same as the anonymized node at position $j$ in walk $s$. $\kappa(i, j)$ is a positional kernel that weighs co-occurrences based on how similar the positions are. For example:
+
+$$ \kappa(i, j) = \exp\left(-\frac{|i - j|^2}{\sigma^2}\right) $$
+
+This gives higher weight when the same anonymized node appears at similar positions in both walks (e.g., both as the starting node, both as the second node).
+
+This matrix $\mathbf{C}_u$ captures rich structural information: if two walks share many of the same anonymized nodes in similar positions, they likely represent similar structural patterns.
+
+
+Step 4: Inter-Walk Transformer with Co-occurrence Bias (Capturing Global Context)
+we apply a second Transformer to model interactions between the $R$ walks of node $u$. This Transformer uses the co-occurrence matrix $\mathbf{C}_u$ as a bias in its attention mechanism, encouraging walks with similar structural patterns to attend more to each other. First, we compute the base attention between walks:
+
+$$ \text{AttentionBase}(Q, K, V) = \text{softmax} \left( \frac{QK^T}{\sqrt{d_k}} \right) V $$
+
+Where $\mathbf{Q} = \mathcal{E}_u \mathbf{W}_Q^2$, $\mathbf{K} = \mathcal{E}_u \mathbf{W}_K^2$, and $\mathbf{V} = \mathcal{E}_u \mathbf{W}_V^2$. We then incorporate the co-occurrence bias by adding it to the attention logits before the softmax:
+
+$$ A_u = \text{softmax} \left( \frac{QK^T}{\sqrt{d_k}} + \gamma \cdot C_u \right) $$
+
+Where $\gamma$ is a learnable scalar that controls the strength of the co-occurrence bias. The output of this inter-walk Transformer is:
+
+$$ E'_u = A_u V \in \mathbb{R}^{R \times d_{model}} $$
+
+This is a refined set of walk embeddings, where each walk's representation is now informed by other walks that share similar structural patterns.
+
+Step 5: Pooling to Final Node Embedding
+Finally, we pool the refined walk embeddings to produce a single embedding for node $u$:
+
+$$ h_u = \text{Pooling}(E'_u) \in \mathbb{R}^{d_{model}} $$
+
+The pooling can be a simple mean, or a more sophisticated attention-based pooling that learns to weight walks based on their importance.
+
+
 
 
 
@@ -163,6 +351,25 @@ H(t_{i+1}) = \text{GRUCell}(H_{obs}, H_{ode})
 $$
 
 Because computing the full eigen‑decomposition at every step is prohibitive, we cache the eigenvectors and reuse them as long as the graph structure remains unchanged. A lightweight hash of the adjacency matrix detects changes, triggering a recomputation only when necessary. This caching makes the heavy spectral term practical in training and inference.
+
+
+
+Time Encoder
+Mulit-Scale Walk Sampler
+Stability-Augmented Memory
+Hierarchical Co-occurrence Transformer
+Spectral-Temporal ODE
+Mutual Refinement
+Hard Negative Mining
+
+
+
+Experiment:
+
+Datasets:
+Baseline:
+
+
 
 
 

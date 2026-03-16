@@ -4,8 +4,8 @@ from loguru import logger
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, Callback
+from src.experiments.exp_utils.analysis_callback import AnalysisCollector
 from src.experiments.exp_utils.model_profile import ModelProfiler
 
 # ============================================================================
@@ -16,9 +16,9 @@ class TrainerSetup:
     """Encapsulates trainer configuration."""
     
     @staticmethod
-    def create(config: Dict) -> L.Trainer:
+    def create(config: Dict, callbacks: Optional[List[Callback]] = None) -> L.Trainer:
         """Create PyTorch Lightning trainer."""
-        callbacks = [
+        base_callbacks = [
             ModelCheckpoint(
                 dirpath=config['logging']['checkpoint_dir'],
                 filename='{epoch}-{val_ap:.2f}',
@@ -34,8 +34,22 @@ class TrainerSetup:
                 verbose=True,
             ),
             LearningRateMonitor(logging_interval='epoch'),
+            AnalysisCollector(),
             # ReduceLROnPlateau(monitor='val_ap', mode='max', patience=10, factor=0.5)
         ]
+
+        has_analysis_collector = any(
+            isinstance(c, AnalysisCollector) for c in (callbacks or [])
+        )
+        if not has_analysis_collector:
+            base_callbacks.append(AnalysisCollector())
+
+        if callbacks:
+            for cb in callbacks:
+                if not any(type(cb) == type(existing) for existing in base_callbacks):
+                    base_callbacks.append(cb)
+        
+        all_callbacks = base_callbacks
         
         loggers = [
             CSVLogger(

@@ -49,7 +49,7 @@ def _align_batch_size(tensor: torch.Tensor, batch_size: int, name: str = "tensor
 
 class SpectralLinear(nn.Linear):
     """Linear layer with Spectral Normalization for gradient stability."""
-    def __init__(self, in_features, out_features, bias=True, n_power_iterations=1, eps=1e-12):
+    def __init__(self, in_features, out_features, bias=True, n_power_iterations=1, eps=1e-12):        
         super().__init__(in_features, out_features, bias=bias)
         self.n_power_iterations = n_power_iterations
         self.eps = eps
@@ -223,11 +223,11 @@ class RobustStabilityAugmentedMemory(nn.Module):
     def __init__(
             self,
             num_nodes: int,
-            memory_dim: int=128,
-            node_feat_dim: int=0,
-            edge_feat_dim: int=64,
+            memory_dim: int = 128,
+            node_feat_dim: int = 0,
+            edge_feat_dim: int = 64,
             time_dim: int = 64,
-            num_prototypes: int=5,
+            num_prototypes: int = 5,
             similarity_metric: str = "cosine",
             dropout: float = 0.1,
             residual_alpha: float = 0.8,
@@ -249,19 +249,20 @@ class RobustStabilityAugmentedMemory(nn.Module):
         else:
             self.node_proj = None
 
-        self.edge_proj = nn.Linear(edge_feat_dim, memory_dim)
+        self.edge_proj = nn.Linear(edge_feat_dim, memory_dim) if edge_feat_dim > 0 else nn.Identity()
         
         self.sam_cell = RobustSAMCell(
             memory_dim=memory_dim,
-            edge_feat_dim=memory_dim,
+            edge_feat_dim=memory_dim,   
             time_dim=time_dim,
             num_prototypes=num_prototypes,
             similarity_metric=similarity_metric,
             dropout=dropout,
             residual_alpha=residual_alpha
-        )    
+        )     
 
         self.prototype_norm = nn.LayerNorm(memory_dim, eps=1e-6)
+        
         
         # Buffers
         self.register_buffer("raw_memory", torch.randn(num_nodes, memory_dim) * 0.01)
@@ -269,16 +270,17 @@ class RobustStabilityAugmentedMemory(nn.Module):
         self.register_buffer("global_max_time", torch.zeros(1))
         
         # Learnable Prototypes
-        self.all_prototypes = nn.Parameter(
-            torch.empty(num_nodes, num_prototypes, memory_dim)
+        # GLOBAL prototypes (shared across all nodes)
+        self.prototypes = nn.Parameter(
+            torch.empty(num_prototypes, memory_dim)
         )
-        nn.init.xavier_uniform_(self.all_prototypes, gain=0.1)
+        nn.init.xavier_uniform_(self.prototypes, gain=0.1)
 
     def get_memory(self, node_ids: torch.Tensor) -> torch.Tensor:
         return self.raw_memory[node_ids]
     
     def get_prototypes(self, node_ids: torch.Tensor) -> torch.Tensor:
-        prototypes = self.all_prototypes[node_ids]
+        prototypes = self.prototypes.unsqueeze(0).expand(len(node_ids), -1, -1)
         if not torch.isfinite(prototypes).all():
             logger.warning("NaN in prototypes detected during retrieval. Sanitizing.")
             prototypes = torch.nan_to_num(prototypes, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -286,6 +288,7 @@ class RobustStabilityAugmentedMemory(nn.Module):
 
     def _apply_time_decay(self, node_ids: torch.Tensor, current_time: torch.Tensor):
         """Apply time-decay to memory of nodes that haven't been updated recently."""
+        
         if node_ids.numel() == 0:
             return
             
@@ -317,6 +320,37 @@ class RobustStabilityAugmentedMemory(nn.Module):
                 self.raw_memory[node_ids]
             )
             self.raw_memory[node_ids] = torch.clamp(self.raw_memory[node_ids], -10.0, 10.0)
+        # if node_ids.numel() == 0:
+        #     return
+            
+        # device = self.raw_memory.device
+        # current_time = current_time.to(device)
+        
+        # last_times = self.last_update_time[node_ids]
+        # if current_time.dim() == 0 or current_time.size(0) == 1:
+        #     dt = current_time.item() - last_times
+        # else:
+        #     if current_time.size(0) == node_ids.size(0):
+        #         dt = current_time - last_times
+        #     else:
+        #         t_val = current_time.mean()
+        #         dt = t_val - last_times
+        
+        # dt = torch.clamp(dt, min=0.0)
+        # if dt.max() == 0:
+        #     return
+            
+        # decay_vals = torch.exp(-torch.abs(torch.log(torch.tensor(self.time_decay_factor))) * dt)
+        # decay_vals = decay_vals.unsqueeze(-1)
+        
+        # mask = (dt > 1e-6).unsqueeze(-1)
+        # if mask.any():
+        #     self.raw_memory[node_ids] = torch.where(
+        #         mask,
+        #         self.raw_memory[node_ids] * decay_vals,
+        #         self.raw_memory[node_ids]
+        #     )
+        #     self.raw_memory[node_ids] = torch.clamp(self.raw_memory[node_ids], -10.0, 10.0)
 
     def update_memory_batch(
             self,
@@ -326,7 +360,6 @@ class RobustStabilityAugmentedMemory(nn.Module):
             current_time: torch.Tensor,
             node_features: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        
         if source_nodes.numel() == 0:
             return {'source_attention': {}, 'target_attention': {}, 
                     'source_memory': torch.tensor([]), 'target_memory': torch.tensor([])}
@@ -344,9 +377,10 @@ class RobustStabilityAugmentedMemory(nn.Module):
             bad_mask = ~torch.isfinite(self.raw_memory).all(dim=1)
             bad_nodes = bad_mask.nonzero(as_tuple=True)[0]
             self.raw_memory[bad_nodes] = 0.0
-            self.all_prototypes[bad_nodes] = torch.randn_like(self.all_prototypes[bad_nodes]) * 0.01
+            # Note: prototypes are global, no per-node reset
 
-        if edge_features is not None and edge_features.numel() > 0:
+        # Edge feature projection
+        if edge_features is not None and edge_features.numel() > 0 and self.edge_feat_dim > 0:
             edge_proj = self.edge_proj(edge_features)
             edge_proj = _sanitize_tensor(edge_proj, "edge_proj")
             norm = edge_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
@@ -360,7 +394,7 @@ class RobustStabilityAugmentedMemory(nn.Module):
         
         src_mem = self.raw_memory[source_nodes]
         tgt_mem = self.raw_memory[target_nodes]
-        src_proto = self.get_prototypes(source_nodes)
+        src_proto = self.get_prototypes(source_nodes)   # [batch, num_proto, D]
         tgt_proto = self.get_prototypes(target_nodes)
         
         src_node_feat = self.node_proj(node_features[source_nodes]) if (self.node_proj and node_features is not None) else None
@@ -376,7 +410,7 @@ class RobustStabilityAugmentedMemory(nn.Module):
                 'source_memory': torch.zeros_like(src_mem), 'target_memory': torch.zeros_like(tgt_mem)
             }
         
-        # Vectorized overlap handling
+        # Vectorized overlap handling (unchanged)
         all_nodes = torch.cat([source_nodes, target_nodes])
         all_updates = torch.cat([src_new, tgt_new])
         all_times = torch.cat([current_time, current_time])
@@ -425,6 +459,106 @@ class RobustStabilityAugmentedMemory(nn.Module):
             'source_memory': src_new.detach(),
             'target_memory': tgt_new.detach()
         }
+        
+        
+        # if source_nodes.numel() == 0:
+        #     return {'source_attention': {}, 'target_attention': {}, 
+        #             'source_memory': torch.tensor([]), 'target_memory': torch.tensor([])}
+        
+        # batch_size = source_nodes.size(0)
+        # device = source_nodes.device
+        
+        # if current_time.numel() > 0:
+        #     self.global_max_time.fill_(max(self.global_max_time.item(), current_time.max().item()))
+        
+        # all_involved = torch.unique(torch.cat([source_nodes, target_nodes]))
+        # self._apply_time_decay(all_involved, current_time)
+        
+        # if not torch.isfinite(self.raw_memory).all():
+        #     bad_mask = ~torch.isfinite(self.raw_memory).all(dim=1)
+        #     bad_nodes = bad_mask.nonzero(as_tuple=True)[0]
+        #     self.raw_memory[bad_nodes] = 0.0
+        #     self.all_prototypes[bad_nodes] = torch.randn_like(self.all_prototypes[bad_nodes]) * 0.01
+
+        # if edge_features is not None and edge_features.numel() > 0:
+        #     edge_proj = self.edge_proj(edge_features)
+        #     edge_proj = _sanitize_tensor(edge_proj, "edge_proj")
+        #     norm = edge_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        #     edge_proj = (edge_proj / norm) * math.sqrt(self.memory_dim)
+        #     edge_proj = torch.clamp(edge_proj, -10.0, 10.0)
+        # else:
+        #     edge_proj = torch.zeros(batch_size, self.memory_dim, device=device)
+        
+        # time_enc = self.time_encoder(current_time)
+        # time_enc = _align_batch_size(time_enc, batch_size, "time_enc")
+        
+        # src_mem = self.raw_memory[source_nodes]
+        # tgt_mem = self.raw_memory[target_nodes]
+        # src_proto = self.get_prototypes(source_nodes)
+        # tgt_proto = self.get_prototypes(target_nodes)
+        
+        # src_node_feat = self.node_proj(node_features[source_nodes]) if (self.node_proj and node_features is not None) else None
+        # tgt_node_feat = self.node_proj(node_features[target_nodes]) if (self.node_proj and node_features is not None) else None
+        
+        # src_new, src_info = self.sam_cell(src_mem, src_node_feat, edge_proj, time_enc, src_proto)
+        # tgt_new, tgt_info = self.sam_cell(tgt_mem, tgt_node_feat, edge_proj, time_enc, tgt_proto)
+        
+        # if not torch.isfinite(src_new).all() or not torch.isfinite(tgt_new).all():
+        #     logger.error("SAM Cell produced NaN. Skipping write-back.")
+        #     return {
+        #         'source_attention': src_info, 'target_attention': tgt_info,
+        #         'source_memory': torch.zeros_like(src_mem), 'target_memory': torch.zeros_like(tgt_mem)
+        #     }
+        
+        # # Vectorized overlap handling
+        # all_nodes = torch.cat([source_nodes, target_nodes])
+        # all_updates = torch.cat([src_new, tgt_new])
+        # all_times = torch.cat([current_time, current_time])
+
+        # unique_nodes, inverse = torch.unique(all_nodes, return_inverse=True)
+
+        # group_max = torch.zeros(len(unique_nodes), device=device, dtype=all_times.dtype)
+        # group_max.scatter_reduce_(0, inverse, all_times, reduce='amax', include_self=False)
+
+        # centered = all_times - group_max[inverse]
+        # exp_vals = torch.exp(centered)
+
+        # group_exp_sum = torch.zeros(len(unique_nodes), device=device, dtype=exp_vals.dtype)
+        # group_exp_sum.scatter_reduce_(0, inverse, exp_vals, reduce='sum', include_self=False)
+
+        # weights = exp_vals / group_exp_sum[inverse]
+
+        # weighted_updates = all_updates * weights.unsqueeze(-1)
+        # group_weighted_sum = torch.zeros(len(unique_nodes), all_updates.size(1),
+        #                                 device=device, dtype=weighted_updates.dtype)
+        # group_weighted_sum.scatter_reduce_(
+        #     0, inverse.unsqueeze(-1).expand(-1, all_updates.size(1)),
+        #     weighted_updates, reduce='sum', include_self=False
+        # )
+
+        # group_weight_sum = torch.zeros(len(unique_nodes), device=device, dtype=weights.dtype)
+        # group_weight_sum.scatter_reduce_(0, inverse, weights, reduce='sum', include_self=False)
+
+        # final_updates = group_weighted_sum / (group_weight_sum.unsqueeze(-1) + 1e-8)
+        # final_updates = torch.nan_to_num(final_updates, nan=0.0)
+
+        # self.raw_memory[unique_nodes] = final_updates
+
+        # group_max_time = torch.zeros(len(unique_nodes), device=device, dtype=all_times.dtype)
+        # group_max_time.scatter_reduce_(0, inverse, all_times, reduce='amax', include_self=False)
+        # self.last_update_time[unique_nodes] = group_max_time
+
+        # self.raw_memory.data = torch.clamp(
+        #     torch.nan_to_num(self.raw_memory.data, nan=0.0, posinf=10.0, neginf=-10.0),
+        #     -10.0, 10.0
+        # )
+
+        # return {
+        #     'source_attention': {k: v.detach() for k, v in src_info.items()},
+        #     'target_attention': {k: v.detach() for k, v in tgt_info.items()},
+        #     'source_memory': src_new.detach(),
+        #     'target_memory': tgt_new.detach()
+        # }
 
     @torch.no_grad()
     def get_stabilized_memory(
@@ -455,7 +589,7 @@ class RobustStabilityAugmentedMemory(nn.Module):
         
         raw = _sanitize_tensor(raw, "inference_raw")
         
-        proto = self.get_prototypes(node_ids)
+        proto = self.get_prototypes(node_ids)   # [len(node_ids), num_proto, D]
         time_enc = self.time_encoder(current_time)
         time_enc = _align_batch_size(time_enc, node_ids.size(0), "time_enc_inf")
         
@@ -469,6 +603,42 @@ class RobustStabilityAugmentedMemory(nn.Module):
             
         stabilized, _ = self.sam_cell(raw, None, edge_proj, time_enc, proto)
         return stabilized.detach()
+        
+        # if node_ids.numel() == 0:
+        #     return torch.tensor([], device=self.raw_memory.device)
+        
+        # device = self.raw_memory.device
+        # node_ids = node_ids.to(device)
+        # current_time = current_time.to(device)
+        
+        # raw = self.raw_memory[node_ids].clone()
+        
+        # last_times = self.last_update_time[node_ids]
+        # if current_time.dim() == 0 or current_time.size(0) == 1:
+        #     dt = current_time.item() - last_times
+        # else:
+        #     dt = current_time - last_times if current_time.size(0) == node_ids.size(0) else (current_time.mean() - last_times)
+        
+        # dt = torch.clamp(dt, min=0.0)
+        # decay_vals = torch.exp(-torch.abs(torch.log(torch.tensor(self.time_decay_factor))) * dt).unsqueeze(-1)
+        # raw = raw * decay_vals
+        
+        # raw = _sanitize_tensor(raw, "inference_raw")
+        
+        # proto = self.get_prototypes(node_ids)
+        # time_enc = self.time_encoder(current_time)
+        # time_enc = _align_batch_size(time_enc, node_ids.size(0), "time_enc_inf")
+        
+        # if edge_features is not None:
+        #     edge_proj = self.edge_proj(edge_features.to(device))
+        #     edge_proj = _align_batch_size(edge_proj, node_ids.size(0), "edge_proj_inf")
+        #     norm = edge_proj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        #     edge_proj = torch.clamp((edge_proj / norm) * math.sqrt(self.memory_dim), -10.0, 10.0)
+        # else:
+        #     edge_proj = torch.zeros(node_ids.size(0), self.memory_dim, device=device)
+            
+        # stabilized, _ = self.sam_cell(raw, None, edge_proj, time_enc, proto)
+        # return stabilized.detach()
 
     @torch.no_grad()
     def reset_prototypes_if_needed(self, node_ids: torch.Tensor, threshold: float = 0.01):
@@ -476,27 +646,37 @@ class RobustStabilityAugmentedMemory(nn.Module):
         Reset prototypes for nodes where the memory has become stale or NaN.
         Called after each batch to ensure prototypes remain stable.
         """
-        if node_ids.numel() == 0:
-            return
-        mem = self.raw_memory[node_ids]
-        proto = self.all_prototypes[node_ids]
-        # Check for NaNs in prototypes
+        proto = self.prototypes
         if torch.isnan(proto).any():
-            logger.warning("NaN detected in prototypes, resetting affected nodes.")
-            self.all_prototypes[node_ids] = torch.randn_like(proto) * 0.01
+            logger.warning("NaN detected in global prototypes, resetting.")
+            nn.init.xavier_uniform_(self.prototypes, gain=0.1)
             return
-        # Optionally reset if memory has drifted too far from prototypes
-        # (simple check: average distance)
-        with torch.no_grad():
-            mem_exp = mem.unsqueeze(1)  # [n, 1, D]
-            proto_norm = proto / (proto.norm(dim=-1, keepdim=True) + 1e-8)
-            mem_norm = mem / (mem.norm(dim=-1, keepdim=True) + 1e-8)
-            sim = (mem_norm.unsqueeze(1) * proto_norm).sum(dim=-1)  # [n, P]
-            max_sim = sim.max(dim=-1)[0]
-            if (max_sim < (1 - threshold)).any():
-                reset_nodes = node_ids[max_sim < (1 - threshold)]
-                self.all_prototypes[reset_nodes] = torch.randn_like(self.all_prototypes[reset_nodes]) * 0.01
-
+        
+        
+        # if node_ids.numel() == 0:
+        #     return
+        # mem = self.raw_memory[node_ids]
+        # proto = self.all_prototypes[node_ids]
+        # # Check for NaNs in prototypes
+        # if torch.isnan(proto).any():
+        #     logger.warning("NaN detected in prototypes, resetting affected nodes.")
+        #     self.all_prototypes[node_ids] = torch.randn_like(proto) * 0.01
+        #     return
+        # # Optionally reset if memory has drifted too far from prototypes
+        # # (simple check: average distance)
+        # with torch.no_grad():
+        #     mem_exp = mem.unsqueeze(1)  # [n, 1, D]
+        #     proto_norm = proto / (proto.norm(dim=-1, keepdim=True) + 1e-8)
+        #     mem_norm = mem / (mem.norm(dim=-1, keepdim=True) + 1e-8)
+        #     sim = (mem_norm.unsqueeze(1) * proto_norm).sum(dim=-1)  # [n, P]
+        #     max_sim = sim.max(dim=-1)[0]
+        #     if (max_sim < (1 - threshold)).any():
+        #         reset_nodes = node_ids[max_sim < (1 - threshold)]
+        #         self.all_prototypes[reset_nodes] = torch.randn_like(self.all_prototypes[reset_nodes]) * 0.01
+               
+        
+        
+    
     def reset_memory(self, node_ids: Optional[torch.Tensor] = None):
         if node_ids is None:
             self.raw_memory.zero_()
@@ -506,3 +686,5 @@ class RobustStabilityAugmentedMemory(nn.Module):
             self.raw_memory[node_ids] = 0.0
             self.last_update_time[node_ids] = 0.0
             self.all_prototypes[node_ids] = torch.randn_like(self.all_prototypes[node_ids]) * 0.01
+
+    
