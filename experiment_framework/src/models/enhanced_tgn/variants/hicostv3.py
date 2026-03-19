@@ -1,3 +1,6 @@
+# === HiCoST v3  ===
+
+
 import os
 import torch
 import torch.nn as nn
@@ -8,39 +11,31 @@ from loguru import logger
 from sklearn.metrics import roc_auc_score, average_precision_score
 import lightning as L
 
-# from torch_geometric.utils import get_laplacian
-
-# --- Import Your Optimized Components ---
-# Ensure these files are in your project structure
 from ..component.time_encoder import TimeEncoder
-from ..component.sam_modulev2 import RobustStabilityAugmentedMemory  # The enhanced version
-from ..component.multi_swalkv2 import MultiScaleWalkSampler          # The enhanced version
-from ..component.hct_modulev2 import StabilizedHCT                   # The enhanced version
-from ..component.stode_modulev2 import NumericallyStabilizedSTODE    # The enhanced version
-from ..component.mrp_modulev2 import GatedMutualRefinementPooling    # The enhanced version
-from ..component.hardnegative_modulev2 import HardNegativeMiner, _DummyHardNegativeMiner # The enhanced version
-from ..component.transformer_encoder import MergeLayer             # Standard link predictor head
+from ..component.sam_modulev2 import RobustStabilityAugmentedMemory
+from ..component.multi_swalkv2 import MultiScaleWalkSampler
+from ..component.hct_modulev2 import StabilizedHCT
+from ..component.stode_modulev2 import NumericallyStabilizedSTODE
+from ..component.mrp_modulev2 import GatedMutualRefinementPooling
+from ..component.hardnegative_modulev2 import HardNegativeMiner, _DummyHardNegativeMiner
+from ..component.transformer_encoder import MergeLayer
 
 def parse_bool(value):
-    if isinstance(value, bool): return value
-    if isinstance(value, str): return value.lower() in ('true', '1', 'yes')
+    if isinstance(value, bool): 
+        return value
+    if isinstance(value, str): 
+        return value.lower() in ('true', '1', 'yes', 'on', 'enabled')
     return bool(value)
 
-class HiCoSTv2(L.LightningModule):
+def parse_float(value):
+    """Parse float from string or number."""
+    if isinstance(value, str):
+        return float(value)
+    return float(value)
+
+class HiCoSTv3(L.LightningModule):
     """
     HiCoST: Hierarchical Co-occurrence Spatio-Temporal Network (Production Version)
-    
-    Architecture Flow:
-    1. Input Graph -> MultiScaleWalkSampler (Vectorized, Adaptive, Noisy)
-    2. Walks -> StabilizedHCT (Causal, Temporal Co-occurrence, DropPath)
-    3. Memory -> RobustStabilityAugmentedMemory (Spectral Norm, Residual, Decay)
-    4. Temporal -> NumericallyStabilizedSTODE (Velocity Gating, Low-Rank Spectral)
-    5. Fusion -> GatedMutualRefinementPooling (Tri-Modal Gating, Vectorized Pooling)
-    6. Loss -> HardNegativeMiner + Label Smoothing + Cosine LR
-    
-    Ablation Flag Convention:
-    - use_* = True/False to enable/disable entire modules
-    - ablation_* = True to USE advanced feature, False to FALLBACK to simple baseline
     """
     
     def __init__(
@@ -98,27 +93,35 @@ class HiCoSTv2(L.LightningModule):
         use_gru_ode: bool = True,           
         adjoint: bool = True,                
         # Hard Negative Mining
-        use_hard_negative_mining: bool = True,  # NEW: Explicit enable/disable
+        use_hard_negative_mining: bool = True,
         neg_sample_ratio: int = 5,
         hard_neg_threshold: float = 0.7,
         label_smoothing: float = 0.1,
         dropout: float = 0.1,
         # Ablation Flags (NEW CONVENTION: True = USE advanced feature)
-        use_prototype_attention: bool = True,      # Renamed from ablation_sam_prototypes
-        use_hct_hierarchical: bool = True,         # Renamed from ablation_hct_hierarchical  
-        use_gated_refinement: bool = True,        # Renamed from ablation_mrp_gating
-        use_multi_scale_walks: bool = True,       # Renamed from ablation_walk_multi_scale
+        use_prototype_attention: bool = True,
+        use_hct_hierarchical: bool = True,
+        use_gated_refinement: bool = True,
+        use_multi_scale_walks: bool = True,
         **kwargs
     ):
         # --- Handle alternative naming from config ---
-        # Some configs use 'node_features_dim' or 'edge_features_dim'
         if 'node_features_dim' in kwargs and node_feat_dim == 0:
             node_feat_dim = kwargs['node_features_dim']
         if 'edge_features_dim' in kwargs:
             edge_feat_dim = kwargs['edge_features_dim']
-        # (Optional) also handle 'node_feat_dim' if present
         if 'node_feat_dim' in kwargs:
             node_feat_dim = kwargs['node_feat_dim']
+            
+        # --- CRITICAL FIX: Convert string values to proper types ---
+        # Handle weight_decay that might come as string from YAML
+        if isinstance(weight_decay, str):
+            weight_decay = float(weight_decay)
+        if isinstance(learning_rate, str):
+            learning_rate = float(learning_rate)
+        if isinstance(dropout, str):
+            dropout = float(dropout)
+            
         super().__init__()
         torch.autograd.set_detect_anomaly(True)
         self.save_hyperparameters()
@@ -141,9 +144,6 @@ class HiCoSTv2(L.LightningModule):
         if hct_cooccurrence_sigma != 2.0 and hct_sigma_time == 5.0:
             hct_sigma_time = hct_cooccurrence_sigma
         
-        
-        
-        
         # State Tracking
         self.register_buffer('last_ode_update_time', torch.tensor(0.0))
         self._ode_batch_counter = 0
@@ -156,13 +156,10 @@ class HiCoSTv2(L.LightningModule):
         self.use_multi_scale_walks = use_multi_scale_walks
         self.use_hard_negative_mining = use_hard_negative_mining
 
-        
         # === 1. Time Encoder ===
         self.time_encoder = TimeEncoder(time_dim)
         
-        # === 2. SAM Module (Prototype Attention) ===
-        # use_prototype_attention=True: Use multiple prototypes (full model)
-        # use_prototype_attention=False: Single prototype (ablation baseline)
+        # === 2. SAM Module ===
         effective_prototypes = num_prototypes if use_prototype_attention else 1
         self.sam_module = RobustStabilityAugmentedMemory(
             num_nodes=num_nodes,
@@ -178,9 +175,7 @@ class HiCoSTv2(L.LightningModule):
         logger.info(f"SAM: Using {effective_prototypes} prototype(s) "
                    f"({'attention' if use_prototype_attention else 'single'})")
 
-        
-        
-        # === 3. Walk Sampler (Multi-Scale) ===
+        # === 3. Walk Sampler ===
         if use_multi_scale_walks:
             logger.info("Walk Sampler: Multi-scale enabled (short/long/TAWR)")
             w_len_short = walk_length_short
@@ -198,7 +193,6 @@ class HiCoSTv2(L.LightningModule):
             w_len_tawr = 0
             w_num_tawr = 0
         
-        
         self.walk_sampler = MultiScaleWalkSampler(
             num_nodes=num_nodes,
             walk_length_short=w_len_short,
@@ -215,7 +209,7 @@ class HiCoSTv2(L.LightningModule):
             adaptive_length_factor=walk_adaptive_factor if use_multi_scale_walks else 0.0
         )
         
-        # === 4. HCT Module (Hierarchical Co-occurrence) ===
+        # === 4. HCT Module ===
         if use_hct_hierarchical:
             self.hct = StabilizedHCT(
                 d_model=hct_d_model,
@@ -255,7 +249,7 @@ class HiCoSTv2(L.LightningModule):
             self.st_ode = None
             logger.info("ST-ODE: Disabled")
             
-        # === 6. Refiner (Gated Mutual Refinement) ===
+        # === 6. Refiner ===
         max_walks = max(w_num_short, w_num_long, w_num_tawr)
         if use_gated_refinement:
             self.refiner = GatedMutualRefinementPooling(
@@ -268,7 +262,6 @@ class HiCoSTv2(L.LightningModule):
             )
             logger.info("Refiner: Gated mutual refinement enabled")
         else:
-            # Simple fallback: Concatenate + Linear
             self.refiner = nn.Sequential(
                 nn.Linear(hidden_dim * 3, hidden_dim * 2),
                 nn.LayerNorm(hidden_dim * 2),
@@ -297,7 +290,6 @@ class HiCoSTv2(L.LightningModule):
             )
             logger.info(f"Hard Negative Mining: Enabled (ratio={neg_sample_ratio})")
         else:
-            # Dummy miner that just returns batch unchanged
             self.hard_neg_miner = _DummyHardNegativeMiner(label_smoothing)
             logger.info("Hard Negative Mining: Disabled")
         
@@ -308,8 +300,7 @@ class HiCoSTv2(L.LightningModule):
         self.edge_raw_features = None
         self.validation_step_outputs = []
         
-        # Final summary
-        logger.info(f"HiCoSTv2 Initialized: "
+        logger.info(f"HiCoSTv3 Initialized: "
                    f"SAM-proto={use_prototype_attention}, "
                    f"HCT-hier={use_hct_hierarchical}, "
                    f"Gated-refine={use_gated_refinement}, "
@@ -362,8 +353,8 @@ class HiCoSTv2(L.LightningModule):
             dst_simple = w_sum[batch_size:]
             return src_simple, dst_simple, walk_data
         
-        # Combine source/target walks for batched HCT processing
-        types = ['short', 'long', 'tawr'] if self.ablation_walk_multi_scale else ['short']
+        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
         combined_walks = {}
         for wt in types:
             if wt not in walk_data['source']: continue
@@ -398,13 +389,6 @@ class HiCoSTv2(L.LightningModule):
         timestamps: torch.Tensor,
         batch: Optional[Dict] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Full Forward Pass:
-        1. Sample Walks
-        2. Encode Walks (HCT)
-        3. Evolve Memory (ST-ODE) - Optional/Batched
-        4. Fuse Modalities (Refiner)
-        """
         device = src_nodes.device
         batch_size = src_nodes.size(0)
         
@@ -427,10 +411,10 @@ class HiCoSTv2(L.LightningModule):
             edge_time=self.edge_time
         )
         
-        # 3. Encode Walks (HCT) -> Structural Embeddings
+        # 3. Encode Walks (HCT)
         src_hct, dst_hct, combined_walks = self._get_hct_embeddings(walk_data, current_memory, batch_size)
         
-        # 4. Evolve Memory (ST-ODE) -> Temporal Embeddings
+        # 4. Evolve Memory (ST-ODE)
         src_stode = current_memory[src_nodes]
         dst_stode = current_memory[dst_nodes]
         
@@ -485,7 +469,8 @@ class HiCoSTv2(L.LightningModule):
         src_per_type, src_masks = self._extract_per_type_embeds(walk_data['source'], current_memory)
         dst_per_type, dst_masks = self._extract_per_type_embeds(walk_data['target'], current_memory)
         
-        if self.ablation_mrp_gating:
+        # CRITICAL FIX: Use self.use_gated_refinement instead of self.ablation_mrp_gating
+        if self.use_gated_refinement:
             final_src, final_dst = self.refiner(
                 src_hct=src_hct, dst_hct=dst_hct,
                 src_sam=src_sam, dst_sam=dst_sam,
@@ -502,10 +487,10 @@ class HiCoSTv2(L.LightningModule):
         return final_src, final_dst
 
     def _prepare_ode_observations(self, walk_data, memory, batch_size) -> Optional[Dict]:
-        """Prepare sparse observations for ST-ODE from walk data - Memory Efficient Version."""
         device = memory.device
         
-        key = 'short' if not self.ablation_walk_multi_scale else 'short'
+        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        key = 'short' if not self.use_multi_scale_walks else 'short'
         
         src_nodes = walk_data['source'][key]['nodes'].view(batch_size, -1)
         tgt_nodes = walk_data['target'][key]['nodes'].view(batch_size, -1)
@@ -594,7 +579,8 @@ class HiCoSTv2(L.LightningModule):
         }
 
     def _extract_per_type_embeds(self, side_data, memory) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        types = ['short', 'long', 'tawr'] if self.ablation_walk_multi_scale else ['short']
+        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
         embeds = []
         masks = []
         max_w = max(self.hparams.num_walks_short, self.hparams.num_walks_long, self.hparams.num_walks_tawr)
@@ -648,11 +634,10 @@ class HiCoSTv2(L.LightningModule):
         if batch_idx % 50 == 0:
             torch.cuda.empty_cache()
         
-        # Hard negative mining (co‑occurrence matrix not needed here)
         aug_batch = self.hard_neg_miner(
             batch, 
             memory=self.sam_module.raw_memory,
-            cooccurrence_matrix=None  # Co‑occurrence is computed inside HCT later
+            cooccurrence_matrix=None
         )
         
         logits = self(aug_batch)
@@ -681,20 +666,22 @@ class HiCoSTv2(L.LightningModule):
                 self.sam_module.reset_prototypes_if_needed(all_nodes)
 
     def configure_optimizers(self):
+        # CRITICAL FIX: Ensure weight_decay is float
+        weight_decay = self.hparams.weight_decay
+        if isinstance(weight_decay, str):
+            weight_decay = float(weight_decay)
+            
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams.learning_rate,
-            weight_decay=self.hparams.weight_decay
+            weight_decay=weight_decay
         )
         
-        # Robust calculation of steps_per_epoch
         steps_per_epoch = None
         
-        # Method 1: Try to get length from train_dataloader
         if hasattr(self.trainer, 'train_dataloader') and self.trainer.train_dataloader is not None:
             try:
                 dl = self.trainer.train_dataloader
-                # Handle case where dataloader is a list or single loader
                 if isinstance(dl, list):
                     dl = dl[0]
                 if hasattr(dl, '__len__'):
@@ -702,25 +689,14 @@ class HiCoSTv2(L.LightningModule):
             except (TypeError, AttributeError):
                 pass
         
-        # Method 2: Fallback to estimated_stepping_batches (Lightning's internal estimate)
         if steps_per_epoch is None and hasattr(self.trainer, 'estimated_stepping_batches'):
             if self.trainer.estimated_stepping_batches is not None:
                 total_steps = self.trainer.estimated_stepping_batches
-                # estimated_stepping_batches accounts for accumulate_grad_batches already? 
-                # No, usually it's total batches. Let's divide to be safe if we want per-epoch.
-                # Actually, estimated_stepping_batches is usually total steps for the whole training.
-                # We need steps per epoch for the scheduler.
-                # If we know max_epochs, we can derive it.
                 if hasattr(self.trainer, 'max_epochs') and self.trainer.max_epochs > 0:
                     steps_per_epoch = total_steps // self.trainer.max_epochs
         
-        # Method 3: Hardcoded Default (Last Resort)
         if steps_per_epoch is None or steps_per_epoch == 0:
-            logger.warning(
-                "Could not determine steps_per_epoch automatically. "
-                "Defaulting to 862 (Wikipedia default). If your dataset size differs, "
-                "the LR scheduler will be slightly off."
-            )
+            logger.warning("Could not determine steps_per_epoch. Defaulting to 862.")
             steps_per_epoch = 862
 
         logger.info(f"Configuring LR Scheduler with steps_per_epoch={steps_per_epoch}")
@@ -743,34 +719,17 @@ class HiCoSTv2(L.LightningModule):
         }
 
     def _shared_eval_step(self, batch, batch_idx, prefix: str):
-        """
-        Shared logic for validation and test steps.
-        
-        Args:
-            batch: Input batch
-            batch_idx: Index of the batch
-            prefix: 'val' or 'test' (used for logging keys)
-            
-        Returns:
-            loss: Scalar loss tensor
-            metrics: Dict containing 'ap', 'auc', 'accuracy'
-        """
-        # Forward pass (get probabilities)
         logits, probs = self(batch, return_probs=True)
         labels = batch['labels'].float()
         
-        # Calculate Loss
         loss = F.binary_cross_entropy_with_logits(logits, labels)
         
-        # Move to CPU for sklearn metrics
         probs_cpu = probs.detach().cpu().numpy()
         labels_cpu = labels.detach().cpu().numpy()
         
-        # Calculate Metrics
         ap = average_precision_score(labels_cpu, probs_cpu)
         auc = roc_auc_score(labels_cpu, probs_cpu)
         
-        # Calculate Accuracy (threshold 0.5)
         preds = (probs > 0.5).float()
         accuracy = (preds == labels).float().mean().item()
         
@@ -780,103 +739,41 @@ class HiCoSTv2(L.LightningModule):
             'accuracy': accuracy
         }
         
-        # Log metrics immediately with the correct prefix (val_ or test_)
         self.log(f"{prefix}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_ap", ap, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_auc", auc, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_accuracy", accuracy, on_step=False, on_epoch=True, prog_bar=True)
         
         return loss, metrics
-    
-    
-    # def validation_step(self, batch, batch_idx):
-    #     logits, probs = self(batch, return_probs=True)
-    #     labels = batch['labels'].float()
-    #     loss = F.binary_cross_entropy_with_logits(logits, labels)
-        
-    #     self.log('val_loss', loss, prog_bar=True)
-    #     self.validation_step_outputs.append({'probs': probs, 'labels': labels})
-    #     return {'probs': probs, 'labels': labels}
-
-    # def on_validation_epoch_start(self):
-    #     if hasattr(self, '_sam_val_backup'): delattr(self, '_sam_val_backup')
-    #     if self.training:
-    #         self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
-    #         self._stode_val_backup = self.st_ode.node_states.clone().detach() if self.use_st_ode else None
-
-    # def on_validation_epoch_end(self):
-    #     if hasattr(self, '_sam_val_backup'):
-    #         self.sam_module.raw_memory.data.copy_(self._sam_val_backup)
-    #     if self.use_st_ode and hasattr(self, '_stode_val_backup'):
-    #         self.st_ode.node_states.data.copy_(self._stode_val_backup)
-        
-    #     outputs = self.validation_step_outputs
-    #     if not outputs:
-    #         self.validation_step_outputs.clear()
-    #         return
-        
-    #     all_probs = torch.cat([x['probs'] for x in outputs])
-    #     all_labels = torch.cat([x['labels'] for x in outputs])
-        
-    #     ap = average_precision_score(all_labels.cpu(), all_probs.cpu())
-    #     auc = roc_auc_score(all_labels.cpu(), all_probs.cpu())
-        
-    #     self.log('val_ap', ap, prog_bar=True)
-    #     self.log('val_auc', auc, prog_bar=True)
-
-    #     self.validation_step_outputs.clear()
 
     def validation_step(self, batch, batch_idx):
-        """Validation step using shared logic."""
         loss, metrics = self._shared_eval_step(batch, batch_idx, "val")
-        
-        # Store for epoch-level aggregation if needed (though we log per-step above)
-        # For AP/AUC, per-step logging is often sufficient, but storing allows custom epoch-end logic
         self.validation_step_outputs.append({'probs': torch.tensor(metrics['ap']), 'labels': torch.tensor(metrics['auc'])}) 
-        
         return {"loss": loss, **metrics}
 
     def test_step(self, batch, batch_idx):
-        """Test step using shared logic."""
         loss, metrics = self._shared_eval_step(batch, batch_idx, "test")
-        
-        # Store for test epoch end if needed
         if not hasattr(self, 'test_step_outputs'):
             self.test_step_outputs = []
         self.test_step_outputs.append({'probs': torch.tensor(metrics['ap']), 'labels': torch.tensor(metrics['auc'])})
-        
         return {"loss": loss, **metrics}
     
     def on_validation_epoch_start(self):
-        """
-        Snapshot memory state before validation begins.
-        Crucial for preventing validation data from leaking into training memory.
-        """
-        # Only backup if we are coming from a training context.
-        # Note: During sanity checks, self.training might be False, so we check existence too.
         if hasattr(self, 'training') and self.training:
             self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
             if self.use_st_ode and hasattr(self, 'st_ode') and self.st_ode is not None:
-                # Handle potential missing node_states if ODE hasn't initialized yet
                 if hasattr(self.st_ode, 'node_states'):
                     self._stode_val_backup = self.st_ode.node_states.clone().detach()
                 else:
                     self._stode_val_backup = None
         else:
-            # Explicitly set to None if not backing up, to avoid stale references
             self._sam_val_backup = None
             self._stode_val_backup = None
     
     def on_validation_epoch_end(self):
-        """
-        Restore memory state after validation ends.
-        Ensures training resumes with the exact state it had before validation.
-        """
-        # RESTORE SAM
         if hasattr(self, '_sam_val_backup') and self._sam_val_backup is not None:
             self.sam_module.raw_memory.data.copy_(self._sam_val_backup)
         
-        # RESTORE ST-ODE
         if (self.use_st_ode and 
             hasattr(self, '_stode_val_backup') and 
             self._stode_val_backup is not None and 
@@ -885,7 +782,6 @@ class HiCoSTv2(L.LightningModule):
             hasattr(self.st_ode, 'node_states')):
             self.st_ode.node_states.data.copy_(self._stode_val_backup)
         
-        # CLEANUP: Safe deletion using getattr to avoid AttributeError
         if hasattr(self, '_sam_val_backup'):
             delattr(self, '_sam_val_backup')
         
@@ -893,14 +789,5 @@ class HiCoSTv2(L.LightningModule):
             delattr(self, '_stode_val_backup')
 
     def on_test_epoch_end(self):
-        """Clear test outputs."""
         if hasattr(self, 'test_step_outputs'):
             self.test_step_outputs.clear()
-
-
-    # Ablation Flags actively modify architecture behavior:
-    # - ablation_walk_multi_scale=False -> Single scale walks + Simple Pooling
-    # - ablation_sam_prototypes=False   -> SAM uses raw memory only (no prototype attention)
-    # - ablation_hct_hierarchical=False -> HCT skips co-occurrence & inter-walk attention
-    # - ablation_mrp_gating=False       -> Replaces Gated Refiner with Concat+Linear
-    # - use_st_ode=False                -> Skips ODE evolution entirely

@@ -1,0 +1,193 @@
+\documentclass{report}
+
+\begin{document}
+
+1. Introduction
+Briefly motivate the need for dynamic graph learning.
+
+Identify key challenges: embedding staleness, limited contextual awareness, and poor structural dynamics capture.
+
+Introduce HiCoSTv2 as a solution that integrates multi-scale temporal walks, hierarchical co-occurrence transformers, spectral-temporal ODEs, and robust memory with hard negative mining.
+
+Summarize contributions (novel components, ablation studies, state-of-the-art results).
+
+2. Related Work
+Categorize existing methods: discrete-time vs. continuous-time, memory-based (TGN), walk-based (CAWN, CTWalk), transformer-based (DyGFormer), and hybrid approaches (TAWRMAC).
+
+Highlight limitations addressed by HiCoSTv2.
+
+3. Preliminaries
+Define temporal graph, temporal walks, anonymization, and problem formulation (link prediction).
+
+4. Methodology (Core of the paper)
+4.1 Overview of HiCoSTv2 Architecture
+Provide a high-level diagram (flowchart) showing data flow:
+
+Input graph → Multi‑Scale Walk Sampler
+Walks → Stabilized Hierarchical Co‑occurrence Transformer (HCT)
+Memory → Robust Stability‑Augmented Memory (SAM)
+Temporal evolution → Numerically Stabilized ST‑ODE
+Fusion → Gated Mutual Refinement Pooling
+Training → Hard Negative Mining + Label Smoothing + Cosine LR
+4.2 Multi‑Scale Walk Sampler
+Describe the generation of short, long, and TAWR walks.
+
+Explain adaptive walk lengths based on node degree/activity.
+
+Introduce temporal bias sampling (Eq. 7 from TAWRMAC) with time noise injection for robustness.
+
+Discuss the masking strategy to handle incomplete walks.
+
+Provide pseudocode or algorithmic description.
+
+4.3 Stabilized Hierarchical Co‑occurrence Transformer (HCT)
+Intra‑walk encoding: Transformer with causal masking to respect temporal order.
+
+Co‑occurrence matrix construction using a time‑aware positional kernel.
+
+Inter‑walk transformer with co‑occurrence bias to capture structural correlations.
+
+DropPath regularization for training stability.
+
+Explain how HCT outputs walk‑level embeddings for each node.
+
+4.4 Robust Stability‑Augmented Memory (SAM)
+Maintain prototype vectors per node (ablatable).
+
+Query formation combining raw memory, edge features, and time encoding.
+
+Prototype attention to compute candidate memory.
+
+Gated update with residual connection and time‑based decay.
+
+Spectral normalization on prototypes to prevent collapse.
+
+Describe how SAM updates memory after each interaction.
+
+4.5 Numerically Stabilized Spectral‑Temporal ODE (ST‑ODE)
+Base ODE dynamics using GRU‑ODE cell.
+
+Spectral regularization via projection onto low‑frequency eigenvectors of the graph Laplacian.
+
+Velocity gating to prevent explosive gradients.
+
+Low‑rank approximation for scalability.
+
+Integration with adjoint method and adaptive step size.
+
+Discuss the update interval strategy to balance efficiency and accuracy.
+
+4.6 Gated Mutual Refinement Pooling
+Collect three modalities: SAM memory, HCT structural embeddings, ST‑ODE temporal embeddings.
+
+For each modality, pool walks using attention‑based pooling.
+
+Tri‑modal gating to adaptively fuse modalities per node pair.
+
+Output final source and target embeddings.
+
+4.7 Training Objectives and Optimization
+Hard Negative Mining:
+
+Vectorized similarity computation between source nodes and candidate negatives.
+
+Select top‑k hardest negatives based on similarity threshold.
+
+Fallback to random negatives if insufficient.
+
+Label Smoothing to improve generalization.
+
+Cosine learning rate scheduler with warm‑up.
+
+Loss function: Binary cross‑entropy on positive/negative pairs.
+
+4.8 Ablation Design
+Clearly define ablation flags:
+
+ablation_sam_prototypes: replace prototypes with single vector.
+
+ablation_hct_hierarchical: disable inter‑walk transformer (simple mean pooling).
+
+ablation_mrp_gating: replace gated fusion with concatenation + MLP.
+
+ablation_walk_multi_scale: use only short walks.
+
+These will be used in Section 5.4 to isolate contribution of each component.
+
+5. Experiments
+5.1 Datasets
+List datasets (Wikipedia, Reddit, MOOC, LastFM, Enron, etc.) with statistics (nodes, edges, timespan, feature dimensions).
+
+Mention train/validation/test splits (e.g., 70/15/15) and temporal ordering.
+
+5.2 Baselines
+Include strong recent methods: TGN, DyGFormer, CAWN, CTWalk, TAWRMAC, etc.
+
+Briefly describe their key mechanisms and why they are relevant.
+
+5.3 Experimental Setup
+Implementation details: Framework (PyTorch Lightning), hardware, hyperparameters (learning rate, hidden dim, number of walks, etc.) – can refer to code/config.
+
+Evaluation metrics: AUC‑ROC, Average Precision (AP).
+
+Protocol: Transductive and inductive settings; multiple negative sampling strategies (random, historical, etc.).
+
+5.4 Main Results
+Tables comparing HiCoSTv2 against baselines on all datasets for link prediction.
+
+Highlight best performance and relative improvements.
+
+Discuss performance on datasets with/without rich node features.
+
+5.5 Ablation Studies
+Run experiments with each ablation flag enabled/disabled.
+
+Present results in a table or bar chart showing contribution of:
+
+Multi‑scale walks
+
+Hierarchical co‑occurrence
+
+Prototype memory
+
+Gated fusion
+
+ST‑ODE
+
+Analyze which component is most critical for different dataset types.
+
+5.6 Analysis of Model Components
+Walk analysis: Distribution of walk lengths, restart probabilities learned by TAWR walks.
+
+Memory analysis: Visualize prototype attention weights over time; show how prototypes capture different roles.
+
+Co‑occurrence patterns: Example co‑occurrence matrices for nodes in different communities.
+
+ST‑ODE dynamics: Plot Dirichlet energy over time to show smoothness enforcement.
+
+Hard negative mining: Statistics on mined negatives vs. random negatives.
+
+5.7 Efficiency and Scalability
+Compare training/inference time and memory usage with baselines.
+
+Show how vectorized operations and sparse updates improve scalability.
+
+5.8 Hyperparameter Sensitivity
+Study impact of key hyperparameters: number of prototypes, number of walks, walk lengths, ODE update interval, etc.
+
+Use line plots to show performance vs. parameter value.
+
+6. Discussion
+Summarize findings.
+
+Discuss limitations (e.g., sensitivity to graph size, eigen decomposition cost).
+
+Potential future work: extending to heterogeneous graphs, incorporating edge features more explicitly, or using cheaper spectral approximations.
+
+7. Conclusion
+Recap contributions and results.
+
+Conclude with the significance of HiCoSTv2 for dynamic graph learning.
+
+
+\end{document}

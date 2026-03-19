@@ -2,32 +2,37 @@
 
 # Model parameters
 model:
-  name: "HiCoSTv2"
+  name: "HiCoSTv3"
   # num_nodes: null  # Will be set based on dataset
   # node_features: 0  # Use learned embeddings
-  # Core Dimensions (Aligned for stability)
-  hidden_dim: 172           # Increased from 64 for better capacity
+  # Core Dimensions
+  hidden_dim: 256           # Increased from 64 for better capacity, match hct_d_model
   # time_encoding_dim: 128    # Matched to hidden_dim (was 172)
-  time_dim: 172    # Matched to hidden_dim (was 172)
-  memory_dim: 172           # Matched to hidden_dim (was 64)
+  time_dim: 256    # Matched to hidden_dim (was 172)
+  memory_dim: 256           # Matched to hidden_dim (was 64)
   edge_features_dim: 172    # Keep high if edge features are rich
   
-  # Architecture Toggles
-  use_sam: True
-  use_hct: True  
+  dropout: 0.3
+  weight_decay: 0.0001
+  
+  
+  # Architecture Toggles   
   debug_simple_walk: False  # Set True to bypass HCT completely
   
-  # --- SAM Parameters ---
-  num_prototypes: 5         # Increased from 3 for better stability
-  similarity_metric: "cosine"
+  # === SAM Parameters (Stability) ===
+  use_sam: True
+  num_prototypes: 8         # Increased from 8 from 5 for better stability, try 3/5/8
+  similarity_metric: "cosine"  
+  sam_residual_alpha: 0.95  # CRITICAL: Keep 95% of old memory to prevent forgetting
+  sam_time_decay: 0.999     # Slower decay
 
   # --- Walk Sampler Parameters ---
-  walk_length_short: 5           # was 3
-  walk_length_long: 12             # was 8
-  walk_length_tawr: 8            # was 6
+  walk_length_short: 5           # was 3/5
+  walk_length_long: 15            # was 8/10/15
+  walk_length_tawr: 10            # was 6/10
   num_walks_short: 5              # was 5
-  num_walks_long: 3               # was 3
-  num_walks_tawr: 3               # was 3
+  num_walks_long: 5               # was 3
+  num_walks_tawr: 5               # was 3
   walk_temperature: 0.1
   walk_time_noise_std: 0.05   # Enable temporal noise
   walk_mask_prob: 0.05        # Enable masking augmentation
@@ -35,62 +40,64 @@ model:
   
   
   
-  # --- HCT Parameters ---
-  hct_d_model: 172           # Matched to hidden_dim
+  # === HCT Parameters ===
+  use_hct: True
+  hct_d_model: 256
   hct_nhead: 2
   hct_num_intra_layers: 2
   hct_num_inter_layers: 2
   hct_cooccurrence_sigma: 2.0
-  hct_drop_path: 0.1          # Stochastic depth for stability
+  hct_drop_path: 0.2
   
   
-  # --- ST-ODE Parameters ---
-  use_st_ode: false
-  ode_method: 'euler'           # 'dopri5' (adaptive) or 'rk4' (fixed)
-  ode_step_size: 1.0          # 500 was too large for rk4. Use 0.1-1.0.
-  mu: 0.1                     # Spectral reg strength
+  # === ST-ODE Parameters ===
+  use_st_ode: True        # Set True if you have GPU memory
+  ode_method: 'rk4'       # rk4, ode_step_size: 2, dopri5 ode_step_size: 1, euler ode_step_size: 1.0
+  ode_step_size: 2.0
+  mu: 0.1
   adaptive_mu: True
   use_gru_ode: True
   adjoint: true
-  st_ode_update_interval: 10  # Update ODE every 10 batches
+  st_ode_update_interval: 10
   
   
-  # --- Hard Negative Mining ---
-  neg_sample_ratio: 5
-  hard_neg_threshold: 0.7
+ 
+  # === Hard Negative Mining ===
+  use_hard_negative_mining: True   # NEW: Explicit enable/disable
+  neg_sample_ratio: 3              # Increased from 1 for better negatives
+  hard_neg_threshold: 0.8          # Lowered from 0.95
   label_smoothing: 0.1
 
   # === ABLATION FLAGS (NEW & CRITICAL) ===
-  # Set these to False via CLI or here to disable specific components
-  ablation_sam_prototypes: True       # False -> Disables prototype attention (uses raw memory)
-  ablation_hct_hierarchical: True     # False -> Disables co-occurrence matrix & inter-walk transformer
-  ablation_mrp_gating: True           # False -> Replaces gated refiner with simple concat
-  ablation_walk_multi_scale: True     # False -> Uses only short walks (single scale)
-
+  # True = Use advanced feature (full model)
+  # False = Use simple baseline (ablation mode)
+  use_prototype_attention: True     # True = 8 prototypes, False = 1 prototype
+  use_hct_hierarchical: True         # True = full HCT, False = simple pooling
+  use_gated_refinement: True        # True = gated refiner, False = concat+linear
+  use_multi_scale_walks: True       # True = short/long/TAWR, False = single scale
 
 
 # Training parameters
 training:
-  batch_size: 256 # 200 
-  learning_rate: 0.0001
-  weight_decay: 0.00001
-  max_epochs: 100
-  patience: 5 # 3/5/10
+  batch_size: 256
+  learning_rate: 0.0001      #  No quotes!
+  weight_decay: 0.00001      #  No quotes!
+  max_epochs: 50
+  patience: 10
   val_check_interval: 0.5
-  # check_val_every_n_epoch: 5
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.5
   gradient_clip_algorithm: "norm"
   log_every_n_steps: 10
-  lr_scheduler: "reduce_on_plateau"
-  lr_patience: 3
-  lr_factor: 0.5
-  continuous_time: true  
+  lr_scheduler: "cosine"
+  warmup_epochs: 0.1
+  min_lr_ratio: 0.01
+  continuous_time: True
   
   
 # Data parameters
 data:
   dataset: "wikipedia"
-  shuffle: false
+  shuffle: False
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
@@ -98,7 +105,7 @@ data:
   evaluation_type: "transductive"
   negative_sampling_strategy: "random"
   unseen_ratio: 0.1
-  validate_batches: true
+  validate_batches: True
   
 # Experiment parameters
 experiment:
@@ -107,7 +114,7 @@ experiment:
   seed: 42  
   device: "auto"  # auto, cpu, cuda
   precision: 32
-  debug: False
+  debug: True
   
 # Logging
 logging:
@@ -126,8 +133,9 @@ profiling:
   enabled: true
   profile_type: 'pytorch'
 
+
 # Hardware
 hardware:
   gpus: 1  # null for CPU, number for GPU count
   num_workers: 4
-  pin_memory: false
+  pin_memory: False

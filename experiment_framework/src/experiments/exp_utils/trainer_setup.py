@@ -33,8 +33,7 @@ class TrainerSetup:
                 mode=config['logging']['mode'],
                 verbose=True,
             ),
-            LearningRateMonitor(logging_interval='epoch'),
-            AnalysisCollector(),
+            LearningRateMonitor(logging_interval='epoch'),           
             # ReduceLROnPlateau(monitor='val_ap', mode='max', patience=10, factor=0.5)
         ]
 
@@ -85,7 +84,7 @@ class TrainerSetup:
             max_epochs=config['training']['max_epochs'],
             accelerator=accelerator,
             devices=devices,
-            callbacks=callbacks,
+            callbacks=all_callbacks,
             logger=loggers,
             precision=config['experiment']['precision'],
             gradient_clip_val=config['training']['gradient_clip_val'],
