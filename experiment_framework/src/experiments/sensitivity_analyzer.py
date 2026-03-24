@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import copy
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from copy import deepcopy
@@ -52,8 +53,6 @@ class SensitivityAnalyzer:
         
         self._raw_data_cache = None
 
-        
-        
 
     def _validate_and_fix_config(self):
         """Ensure config has all required sections and keys with defaults."""
@@ -134,7 +133,8 @@ class SensitivityAnalyzer:
                     
                     # Set main parameter
                     self._set_nested_param(config, param_path, val)
-                    
+
+                                        
                     # Apply overrides
                     if fixed_overrides and val in fixed_overrides:
                         for k, v in fixed_overrides[val].items():
@@ -243,26 +243,53 @@ class SensitivityAnalyzer:
             curr = curr[k]
         return curr
 
-    def _get_raw_data(self):
-        if self._raw_data_cache is None:
-            pipeline = (DataPipeline(self.base_config)
-                .load()
-                .build_neighbor_finder()
-                .build_samplers()
-                .build_datasets())
-            self._raw_data_cache = pipeline
-        return self._raw_data_cache
+    def _get_raw_data(self, config: Dict):
+        # if self._raw_data_cache is None:
+        #     pipeline = (DataPipeline(self.base_config)
+        #         .load()
+        #         .build_neighbor_finder()
+        #         .build_samplers()
+        #         .build_datasets())
+        #     self._raw_data_cache = pipeline
+        # return self._raw_data_cache
+        """
+        Get raw data pipeline. 
+        We do NOT cache the full pipeline because config (batch_size) changes per run.
+        We only cache the heavy data loading part if possible, but for safety, we rebuild.
+        """
+        # Create a fresh pipeline for THIS specific config to ensure batch_size/lr are correct
+        pipeline = (DataPipeline(config)
+            .load()
+            .build_neighbor_finder()
+            .build_samplers()
+            .build_datasets())
+        
+        # Do NOT cache the whole pipeline object as it holds state. 
+        # Just return it. The deep copy in _run_single_experiment handles isolation.
+        return pipeline
 
     def _run_single_experiment(self, config: Dict, seed: int) -> Dict:
         torch.manual_seed(seed)
         np.random.seed(seed)
         
-        raw_pipeline = self._get_raw_data()
-        import copy
+        raw_pipeline = self._get_raw_data(config)
+        
         pipeline = copy.deepcopy(raw_pipeline)
+
+        # FORCE UPDATE batch size in pipeline if it doesn't re-read config
+        if hasattr(pipeline, 'config'):            
+            pipeline.config['training']['batch_size'] = config['training']['batch_size']
+
         pipeline.build_loaders()
         
         features = pipeline.get_features()
+
+        # Inject unique checkpoint dir to avoid collisions
+        unique_id = f"{config['experiment'].get('name', 'sens')}_{seed}"
+        orig_checkpoint_dir = config['logging']['checkpoint_dir']
+        config['logging']['checkpoint_dir'] = os.path.join(orig_checkpoint_dir, unique_id)
+
+
         model = ModelFactory.create(config, features)
         model.set_raw_features(features['node_features'], features['edge_features'])
         model.set_neighbor_finder(pipeline.neighbor_finder)
@@ -274,7 +301,12 @@ class SensitivityAnalyzer:
         trainer = TrainerSetup.create(config, callbacks=[analysis_cb])
         
         trainer.fit(model, pipeline.loaders['train'], pipeline.loaders['val'])
+        
+        # Restore checkpoint dir for next run (optional, since we use deepcopy of config)
+        config['logging']['checkpoint_dir'] = orig_checkpoint_dir
+        
         results = trainer.test(model, pipeline.loaders['test'], ckpt_path='best')
+        
         return results[0] if results else {}
 
     def _save_and_plot(self, df: pd.DataFrame, param_name: str):
