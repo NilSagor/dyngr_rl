@@ -1,0 +1,196 @@
+# sensitivity_config.yaml
+# Aligned with hicost_config.v2.yaml (HiCoSTv3)
+
+model:
+  name: "HiCoSTv3"
+  # Base dimensions (will be overridden by studies)
+  hidden_dim: 256
+  memory_dim: 256
+  time_dim: 256
+  hct_d_model: 256
+
+  # Defaults for other params (will be overridden by studies)
+  dropout: 0.3
+  num_prototypes: 8
+  walk_length_short: 5
+  walk_length_long: 15
+  walk_length_tawr: 10
+  num_walks_short: 5
+  num_walks_long: 5
+  num_walks_tawr: 5
+  use_st_ode: False
+  ode_method: "rk4"
+  ode_step_size: 2.0
+  st_ode_update_interval: 10
+  hard_neg_threshold: 0.8
+  neg_sample_ratio: 5
+
+
+  # === ABLATION FLAGS (NEW & CRITICAL) ===
+  # True = Use advanced feature (full model)
+  # False = Use simple baseline (ablation mode)
+  use_prototype_attention: True     # True = 8 prototypes, False = 1 prototype
+  use_hct_hierarchical: True         # True = full HCT, False = simple pooling
+  use_gated_refinement: True        # True = gated refiner, False = concat+linear
+  use_multi_scale_walks: True       # True = short/long/TAWR, False = single scale
+
+
+
+# Training parameters
+training:
+  batch_size: 256
+  learning_rate: 0.0001      #  No quotes!
+  weight_decay: 0.00001      #  No quotes!
+  max_epochs: 50
+  patience: 10
+  val_check_interval: 0.5
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: "norm"
+  log_every_n_steps: 10
+  lr_scheduler: "cosine"
+  warmup_epochs: 0.1
+  min_lr_ratio: 0.01
+  continuous_time: True
+
+# Data parameters
+data:
+  dataset: "wikipedia"
+  shuffle: False
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  max_neighbors: 20
+  evaluation_type: "transductive"
+  negative_sampling_strategy: "random"
+  unseen_ratio: 0.1
+  validate_batches: True
+
+
+experiment:
+  seed: 42
+  device: "auto"
+  precision: 32
+
+# Logging
+logging:
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  save_top_k: 3
+  monitor: "val_ap"
+  mode: "max"
+
+profiling:
+  enabled: true
+  profile_type: 'pytorch'
+
+hardware:
+  gpus: 1  # null for CPU, number for GPU count
+  num_workers: 4
+  pin_memory: False
+
+
+
+sensitivity_studies:
+  
+  # === 1. ODE Solver Sensitivity (Method + Step Size Coupled) ===
+  ode_method_study:
+    parameter: "model.ode_method"
+    values: ["euler", "rk4", "dopri5"]
+    description: "Compare solvers with their optimal default step sizes"
+    fixed_overrides:
+      euler:
+        ode_step_size: 1.0
+        adjoint: false
+      rk4:
+        ode_step_size: 2.0
+        adjoint: true
+      dopri5:
+        ode_step_size: null  # Adaptive ignores this
+        adjoint: true
+  
+  # === 2. ODE Existence (Ablation) ===
+  use_st_ode:
+    parameter: "model.use_st_ode"
+    values: [true, false]
+    description: "Measure impact of adding ST-ODE module"
+    fixed_overrides:
+      true:
+        st_ode_update_interval: 10
+      false:
+        # When disabled, interval doesn't matter, but good to set default
+        st_ode_update_interval: 10
+
+  # === 3. ODE Update Frequency (Only when enabled) ===
+  st_ode_update_interval:
+    parameter: "model.st_ode_update_interval"
+    values: [1, 5, 10, 20, 50]
+    condition: "model.use_st_ode == true"
+    fixed_params:
+      ode_method: "rk4"
+      ode_step_size: 2.0
+
+  # === 4. Batch Size + LR Scaling ===
+  batch_size:
+    parameter: "training.batch_size"
+    values: [64, 128, 256, 512]
+    lr_scaling: "sqrt"  # Automatically scales LR in the analyzer
+  
+  # === 5. Memory/Hidden Dimension (Coupled) ===
+  memory_dim:
+    parameter: "model.memory_dim"
+    values: [64, 128, 256, 512]
+    coupled_params:
+      hidden_dim: "${model.memory_dim}"
+      time_dim: "${model.memory_dim}"
+      hct_d_model: "${model.memory_dim}"
+  
+  # === 6. SAM Prototypes (Ablation Flag) ===
+  use_prototype_attention:
+    parameter: "model.use_prototype_attention"
+    values: [true, false]
+    description: "True=8 prototypes, False=1 prototype (raw memory)"
+    fixed_overrides:
+      true:
+        num_prototypes: 8
+      false:
+        num_prototypes: 1
+
+  # === 7. Walk Length Sensitivity ===
+  walk_length_short:
+    parameter: "model.walk_length_short"
+    values: [2, 5, 10, 15]
+    # Keep long/tawr proportional or fixed? Let's fix others to isolate short
+    fixed_params:
+      walk_length_long: 15
+      walk_length_tawr: 10
+
+  # === 8. Walk Distribution (Explicit Configs) ===
+  # Replaces the complex 'computed' type with explicit configurations
+  walk_distribution:
+    type: "explicit_configs"
+    description: "Test different allocations of walk budget"
+    configs:
+      - { name: "short_only", num_walks_short: 15, num_walks_long: 0, num_walks_tawr: 0 }
+      - { name: "balanced", num_walks_short: 5, num_walks_long: 5, num_walks_tawr: 5 }
+      - { name: "long_heavy", num_walks_short: 3, num_walks_long: 10, num_walks_tawr: 2 }
+      - { name: "tawr_heavy", num_walks_short: 3, num_walks_long: 2, num_walks_tawr: 10 }
+
+  # === 9. Learning Rate ===
+  learning_rate:
+    parameter: "training.learning_rate"
+    values: [1e-5, 5e-5, 1e-4, 5e-4]
+    log_scale: true
+  
+  # === 10. Dropout ===
+  dropout:
+    parameter: "model.dropout"
+    values: [0.0, 0.1, 0.3, 0.5]
+  
+  # === 11. Hard Negative Mining Threshold ===
+  hard_neg_threshold:
+    parameter: "model.hard_neg_threshold"
+    values: [0.5, 0.7, 0.8, 0.9]
+    fixed_params:
+      neg_sample_ratio: 3 # Keep ratio constant while sweeping threshold
+
+ 
