@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 from copy import deepcopy
 from loguru import logger
+import traceback
 
 from src.datasets.continue_temporal.data_con_pipeline import DataPipeline
 from src.experiments.exp_utils.model_factory import ModelFactory
@@ -385,14 +386,29 @@ class SensitivityAnalyzer:
                 
                 metrics = self._run_single_experiment(config, seed)
                 res = SensitivityResult(name, str(config_overrides), metrics, 0, config.get('model', {}))
-                self.results.append(res.__dict__)
+                result_dict = res.__dict__
+                result_dict['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self.results.append(result_dict)
+                self._save_master_summary() 
                 
             except Exception as e:
                 logger.error(f"Failed {name} seed {seed}: {e}")
-                self.results.append({
-                    'param_name': name, 'param_value': str(config_overrides), 'seed': seed,
-                    'test_ap': np.nan, 'training_time': -1, 'error': str(e)
-                })
+                logger.error(traceback.format_exc())
+                error_dict = {
+                    'param_name': name, 
+                    'param_value': str(config_overrides),
+                    'seed': seed,
+                    'test_ap': np.nan, 
+                    'test_auc': np.nan, 
+                    'test_accuracy': np.nan,
+                    'training_time': -1, 
+                    'error': str(e),
+                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                self.results.append(error_dict)
+                self._save_master_summary()
+                
+                
     
     def _validate_and_fix_config(self):
         """Ensure config has all required sections and keys."""

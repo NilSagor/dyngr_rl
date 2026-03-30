@@ -353,7 +353,7 @@ class HiCoSTv3(L.LightningModule):
             dst_simple = w_sum[batch_size:]
             return src_simple, dst_simple, walk_data
         
-        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        # Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
         types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
         combined_walks = {}
         for wt in types:
@@ -489,7 +489,7 @@ class HiCoSTv3(L.LightningModule):
     def _prepare_ode_observations(self, walk_data, memory, batch_size) -> Optional[Dict]:
         device = memory.device
         
-        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        #  Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
         key = 'short' if not self.use_multi_scale_walks else 'short'
         
         src_nodes = walk_data['source'][key]['nodes'].view(batch_size, -1)
@@ -579,40 +579,100 @@ class HiCoSTv3(L.LightningModule):
         }
 
     def _extract_per_type_embeds(self, side_data, memory) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # CRITICAL FIX: Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+        # Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
         types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
+        
         embeds = []
         masks = []
-        max_w = max(self.hparams.num_walks_short, self.hparams.num_walks_long, self.hparams.num_walks_tawr)
+
+        # Calculate max_w based on AVAILABLE walks in this specific run
+        # We look at the config hparams, but clamp to 0 if the sampler didn't generate them
+        try:
+            max_w = max(
+                self.hparams.num_walks_short if self.hparams.num_walks_short > 0 else 0,
+                self.hparams.num_walks_long if self.hparams.num_walks_long > 0 else 0,
+                self.hparams.num_walks_tawr if self.hparams.num_walks_tawr > 0 else 0
+            )
+        except AttributeError:
+            # Fallback if hparams not accessible yet
+            max_w = 5 
+
+        # max_w = max(self.hparams.num_walks_short, self.hparams.num_walks_long, self.hparams.num_walks_tawr)
         
-        B = side_data['short']['nodes'].size(0)
+        if max_w == 0:
+            # Edge case: no walks at all
+            return None, None
+        
+        B = side_data['short']['nodes'].size(0) if 'short' in side_data else 0
+        if B == 0:
+            return None, None
+        
         D = memory.size(-1)
         device = memory.device
         
         for t in types:
-            nodes = side_data[t]['nodes']
-            m = side_data[t]['masks']
-            W, L = nodes.shape[1], nodes.shape[2]
-            
-            flat_n = nodes.view(-1)
-            flat_f = memory[flat_n].view(B, W, L, D)
-            
-            m_sum = m.sum(dim=-1, keepdim=True).clamp(min=1)
-            pooled = (flat_f * m.unsqueeze(-1)).sum(dim=2) / m_sum
-            
-            if W < max_w:
-                pad = max_w - W
-                pooled = F.pad(pooled, (0,0,0,pad))
-                m_valid = m.any(dim=-1)
-                m_valid = F.pad(m_valid, (0, pad), value=False)
+            # SAFETY CHECK: Does this type exist in side_data?
+            if t not in side_data:
+                logger.warning(f"Walk type '{t}' missing from side_data. Creating zero placeholders.")
+                # Create zero tensors for missing types
+                dummy_nodes = torch.zeros(B, 1, 1, dtype=torch.long, device=device)
+                dummy_masks = torch.zeros(B, 1, 1, dtype=torch.float32, device=device)
+                # Process dummy to match expected shape [B, 1, D] after pooling
+                flat_f = memory[dummy_nodes.view(-1)].view(B, 1, 1, D)
+                pooled = torch.zeros(B, 1, D, device=device) # Explicit zero pool
+                m_valid = torch.zeros(B, 1, dtype=torch.bool, device=device)
             else:
-                pooled = pooled[:, :max_w]
-                m_valid = m.any(dim=-1)[:, :max_w]
+                data_t = side_data[t]
                 
+                # SAFETY CHECK: Does 'masks' key exist?
+                if 'masks' not in data_t or 'nodes' not in data_t:
+                    logger.warning(f"Walk type '{t}' missing 'masks' or 'nodes'. Creating zero placeholders.")
+                    dummy_nodes = torch.zeros(B, 1, 1, dtype=torch.long, device=device)
+                    dummy_masks = torch.zeros(B, 1, 1, dtype=torch.float32, device=device)
+                    flat_f = memory[dummy_nodes.view(-1)].view(B, 1, 1, D)
+                    pooled = torch.zeros(B, 1, D, device=device)
+                    m_valid = torch.zeros(B, 1, dtype=torch.bool, device=device)
+                else:
+                    nodes = data_t['nodes']
+                    m = data_t['masks']
+                    
+                    # Handle case where num_walks=0 results in empty tensor dim 1
+                    if nodes.size(1) == 0:
+                        # Create dummy single walk to avoid reshape errors downstream
+                        dummy_nodes = torch.zeros(B, 1, 1, dtype=torch.long, device=device)
+                        dummy_masks = torch.zeros(B, 1, 1, dtype=torch.float32, device=device)
+                        flat_f = memory[dummy_nodes.view(-1)].view(B, 1, 1, D)
+                        pooled = torch.zeros(B, 1, D, device=device)
+                        m_valid = torch.zeros(B, 1, dtype=torch.bool, device=device)
+                    else:
+                        W, L = nodes.shape[1], nodes.shape[2]
+                        
+                        flat_n = nodes.view(-1)
+                        # Clamp indices just in case
+                        flat_n = torch.clamp(flat_n, 0, memory.size(0)-1)
+                        flat_f = memory[flat_n].view(B, W, L, D)
+                        
+                        m_sum = m.sum(dim=-1, keepdim=True).clamp(min=1)
+                        pooled = (flat_f * m.unsqueeze(-1)).sum(dim=2) / m_sum
+                        
+                        # Pad/Trim to max_w
+                        if W < max_w:
+                            pad = max_w - W
+                            pooled = F.pad(pooled, (0,0,0,pad))
+                            m_valid = m.any(dim=-1)
+                            m_valid = F.pad(m_valid, (0, pad), value=False)
+                        else:
+                            pooled = pooled[:, :max_w]
+                            m_valid = m.any(dim=-1)[:, :max_w]
+
             embeds.append(pooled)
             masks.append(m_valid)
             
-        return torch.stack(embeds, dim=1), torch.stack(masks, dim=1)
+        # Stack only if we have valid data
+        if len(embeds) > 0:
+            return torch.stack(embeds, dim=1), torch.stack(masks, dim=1)
+        else:
+            return None, None
 
     def forward(self, batch: Dict, return_probs: bool = False) -> torch.Tensor:
         src_nodes = batch['src_nodes']

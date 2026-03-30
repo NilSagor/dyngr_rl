@@ -41,8 +41,8 @@ training:
   batch_size: 256
   learning_rate: 0.0001      #  No quotes!
   weight_decay: 0.00001      #  No quotes!
-  max_epochs: 50
-  patience: 10
+  max_epochs: 25
+  patience: 5
   val_check_interval: 0.5
   gradient_clip_val: 0.5
   gradient_clip_algorithm: "norm"
@@ -170,7 +170,7 @@ sensitivity_studies:
     type: "explicit_configs"
     description: "Test different allocations of walk budget"
     configs:
-      - { name: "short_only", num_walks_short: 15, num_walks_long: 0, num_walks_tawr: 0 }
+      - { name: "short_dominant", num_walks_short: 15, num_walks_long: 1, num_walks_tawr: 1 } 
       - { name: "balanced", num_walks_short: 5, num_walks_long: 5, num_walks_tawr: 5 }
       - { name: "long_heavy", num_walks_short: 3, num_walks_long: 10, num_walks_tawr: 2 }
       - { name: "tawr_heavy", num_walks_short: 3, num_walks_long: 2, num_walks_tawr: 10 }

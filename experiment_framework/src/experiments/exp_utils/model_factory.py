@@ -56,31 +56,7 @@ class ModelFactory:
         
         model_class = MODEL_REGISTRY[model_name]
         
-        # Prepare arguments
-        # model_args = {
-        #     'num_nodes': data_info['num_nodes'],
-        #     'node_features': data_info.get('node_feat_dim', 0),
-        #     'hidden_dim': model_config.get('hidden_dim', 172),
-        #     'time_encoding_dim': model_config.get('time_encoding_dim', 32),
-        #     'memory_dim': model_config.get('memory_dim', 172),
-        #     'message_dim': model_config.get('message_dim', 172),
-        #     'edge_features_dim': data_info.get('edge_feat_dim', 172),
-        #     'num_layers': model_config.get('num_layers', 1),
-        #     'dropout': model_config.get('dropout', 0.1),
-        #     'learning_rate': model_config.get('learning_rate', 1e-4),
-        #     'weight_decay': model_config.get('weight_decay', 1e-5),
-        #     'n_heads': model_config.get('n_heads', 2),
-        #     'n_neighbors': model_config.get('n_neighbors', 10),
-        #     'use_memory': model_config.get('use_memory', True),
-        #     'embedding_module_type': model_config.get('embedding_module_type', 'graph_attention'),
-        # }
-        # model_args.update({
-        #     'use_hct': model_config.get('use_hct', True),
-        #     'use_st_ode': model_config.get('use_st_ode', True),
-        #     # Add any other TGNv6‑specific parameters here
-        # })
-        
-        
+  
         # Base arguments from data (always required)
         model_args = {
             'num_nodes': data_info['num_nodes'],
