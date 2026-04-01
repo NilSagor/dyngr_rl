@@ -31,15 +31,7 @@ def _get_nested_param(config: dict, path: str):
 def get_top_configs_from_results(results_path: Path, study_name: str, metric: str = 'test_ap', top_k: int = 2):
     """
     Automatically select top-k configs from previous results.
-    
-    Args:
-        results_path: Path to sensitivity_summary.csv
-        study_name: Name of the study (e.g., 'walk_distribution')
-        metric: Metric to rank by (default: 'test_ap')
-        top_k: Number of top configs to select
-    
-    Returns:
-        List of config names to run
+    For explicit config studies, param_name IS the config name.
     """
     if not results_path.exists():
         logger.warning(f"No existing results found at {results_path}")
@@ -47,46 +39,49 @@ def get_top_configs_from_results(results_path: Path, study_name: str, metric: st
     
     df = pd.read_csv(results_path)
     
-    # Filter for this study and successful runs (no errors)
-    study_df = df[
-        (df['param_name'] == study_name) & 
-        (df['error'].isna()) & 
-        (df[metric].notna())
-    ]
+    # DEBUG: Show what we have
+    logger.info(f"CSV columns: {df.columns.tolist()}")
+    logger.info(f"Total rows: {len(df)}")
+    logger.info(f"Unique configs: {df['param_name'].unique().tolist()}")
     
-    if study_df.empty():
-        logger.warning(f"No valid results found for study '{study_name}'")
+    # For explicit config studies, param_name contains the config name directly
+    # Filter successful runs (no error or error is NaN/empty)
+    study_df = df.copy()
+    
+    if 'error' in study_df.columns:
+        study_df = study_df[study_df['error'].isna() | (study_df['error'] == '')]
+    
+    # Filter valid metric values
+    study_df = study_df[study_df[metric].notna()]
+    
+    if study_df.empty:
+        logger.warning(f"No valid results with metric '{metric}'")
         return None
     
-    # Group by config and get mean performance across seeds
-    grouped = study_df.groupby('param_value')[metric].agg(['mean', 'std', 'count'])
+    # Group by config name (param_name) and calculate mean performance
+    grouped = study_df.groupby('param_name')[metric].agg(['mean', 'std', 'count'])
     grouped = grouped.sort_values('mean', ascending=False)
     
-    logger.info(f"Top configurations by {metric}:")
-    for idx, (config, row) in enumerate(grouped.head(top_k).iterrows(), 1):
-        logger.info(f"  {idx}. {config}: {row['mean']:.4f} ± {row.get('std', 0):.4f} (n={row['count']})")
+    logger.info(f"\nAll configurations ranked by {metric}:")
+    for idx, (config_name, row) in enumerate(grouped.iterrows(), 1):
+        std_val = row.get('std', 0) if pd.notna(row.get('std', 0)) else 0
+        count = int(row['count'])
+        marker = " ★" if idx <= top_k else ""
+        logger.info(f"  {idx}. {config_name}: {row['mean']:.4f} ± {std_val:.4f} (n={count}){marker}")
     
-    # Extract config names from param_value strings
-    top_configs = []
-    for config_str in grouped.head(top_k).index:
-        # Parse config name from string representation
-        if 'name=' in config_str:
-            # Extract name from dict string: "{'name': 'balanced', ...}"
-            import ast
-            try:
-                config_dict = ast.literal_eval(config_str)
-                top_configs.append(config_dict.get('name', config_str))
-            except:
-                top_configs.append(config_str)
-        else:
-            top_configs.append(config_str)
+    # Return top-k config names
+    top_configs = grouped.head(top_k).index.tolist()
+    logger.info(f"\nSelected top-{top_k}: {top_configs}")
     
     return top_configs
 
 def main():
     parser = argparse.ArgumentParser(description="Run Sensitivity Analysis")
     parser.add_argument("--config", type=str, required=True, help="Path to sensitivity_config.yaml")
-    parser.add_argument("--study", type=str, required=True, choices=["all", "ode_method", "batch_size", "memory_dim", "walk_length", "walk_distribution"], help="Which study to run")
+    parser.add_argument("--study", type=str, 
+                        required=True, 
+                        choices=["all", "ode_method", "batch_size", "memory_dim", "walk_length", "walk_distribution"], 
+                        help="Which study to run")
     parser.add_argument("--seeds", type=int, nargs='+', default=[42], help="Seeds for averaging")
     parser.add_argument("--output", type=str, default="results/sensitivity_full", help="Output directory")
     # parser.add_argument("--filter", type=str, nargs='+', default=None, 
@@ -118,9 +113,10 @@ def main():
 
     if args.top_k:
         summary_path = output_dir / "sensitivity_summary.csv"
+        
         auto_filter = get_top_configs_from_results(
             summary_path, 
-            study_name=args.study,
+            study_name=args.study,  # Not used for matching, just for logging
             metric=args.metric,
             top_k=args.top_k
         )
@@ -128,21 +124,24 @@ def main():
             config_filter = auto_filter
         else:
             logger.warning("Could not auto-select top configs, running all")
+    
 
-    # Performance threshold filtering (applied after loading results)
+    # Performance threshold filtering
     performance_filter = None
     if args.min_performance or args.max_performance:
         summary_path = output_dir / "sensitivity_summary.csv"
         if summary_path.exists():
             df = pd.read_csv(summary_path)
-            study_df = df[
-                (df['param_name'] == args.study) & 
-                (df['error'].isna()) & 
-                (df[args.metric].notna())
-            ]
+            study_df = df[df['param_name'] == args.study].copy()
+            
+            # Handle missing 'error' column
+            if 'error' in study_df.columns:
+                study_df = study_df[study_df['error'].isna()]
+            
+            study_df = study_df[study_df[args.metric].notna()]
             
             # Apply thresholds
-            mask = True
+            mask = pd.Series([True] * len(study_df), index=study_df.index)
             if args.min_performance:
                 mask = mask & (study_df[args.metric] >= args.min_performance)
             if args.max_performance:
@@ -152,7 +151,6 @@ def main():
             if not filtered.empty:
                 performance_filter = filtered['param_value'].unique().tolist()
                 logger.info(f"Performance filter: {len(performance_filter)} configs meet criteria")
-
     
     # DEBUG PRINT
     print("=== CONFIG STRUCTURE DEBUG ===")
