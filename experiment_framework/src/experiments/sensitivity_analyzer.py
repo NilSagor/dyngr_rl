@@ -342,21 +342,30 @@ class SensitivityAnalyzer:
         plt.close()
         logger.info(f"Plot saved: {plot_path}")
 
-    def run_study_from_spec(self, name: str, spec: Dict, seeds: List[int], config_filter: Optional[List[str]] = None):
+    def run_study_from_spec(self, name: str, spec: Dict, seeds: List[int], 
+                           config_filter: Optional[List[str]] = None,
+                           performance_filter: Optional[List[str]] = None):
         """Wrapper to handle special study types defined in YAML."""
         
         if 'configs' in spec:
             logger.info(f"Running explicit config study: {name}")
+            
             for cfg_option in spec['configs']:
                 run_name = cfg_option.get('name', f"{name}_{len(self.results)}")
                 
-                # Apply filter if specified
+                # Apply name-based filter
                 if config_filter:
-                    # Check if any filter keyword matches the config name (case-insensitive)
                     if not any(f.lower() in run_name.lower() for f in config_filter):
-                        logger.debug(f"Skipping config '{run_name}' (does not match filter: {config_filter})")
+                        logger.debug(f"Skipping '{run_name}' (name filter)")
                         continue
                     logger.info(f"Including config: {run_name}")
+                
+                # Apply performance-based filter
+                if performance_filter:
+                    config_str = str(cfg_option)
+                    if not any(pf in config_str for pf in performance_filter):
+                        logger.debug(f"Skipping '{run_name}' (performance filter)")
+                        continue
                 
                 self._run_custom_config_study(run_name, cfg_option, seeds)
             return
