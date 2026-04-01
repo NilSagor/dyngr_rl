@@ -342,13 +342,22 @@ class SensitivityAnalyzer:
         plt.close()
         logger.info(f"Plot saved: {plot_path}")
 
-    def run_study_from_spec(self, name: str, spec: Dict, seeds: List[int]):
+    def run_study_from_spec(self, name: str, spec: Dict, seeds: List[int], config_filter: Optional[List[str]] = None):
         """Wrapper to handle special study types defined in YAML."""
         
         if 'configs' in spec:
             logger.info(f"Running explicit config study: {name}")
             for cfg_option in spec['configs']:
                 run_name = cfg_option.get('name', f"{name}_{len(self.results)}")
+                
+                # Apply filter if specified
+                if config_filter:
+                    # Check if any filter keyword matches the config name (case-insensitive)
+                    if not any(f.lower() in run_name.lower() for f in config_filter):
+                        logger.debug(f"Skipping config '{run_name}' (does not match filter: {config_filter})")
+                        continue
+                    logger.info(f"Including config: {run_name}")
+                
                 self._run_custom_config_study(run_name, cfg_option, seeds)
             return
 

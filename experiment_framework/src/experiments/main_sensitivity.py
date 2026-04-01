@@ -33,11 +33,14 @@ def main():
     parser.add_argument("--study", type=str, required=True, choices=["all", "ode_method", "batch_size", "memory_dim", "walk_length", "walk_distribution"], help="Which study to run")
     parser.add_argument("--seeds", type=int, nargs='+', default=[42], help="Seeds for averaging")
     parser.add_argument("--output", type=str, default="results/sensitivity_full", help="Output directory")
-    
+    parser.add_argument("--filter", type=str, nargs='+', default=None, 
+                        help="Filter specific configs by name (e.g., --filter balanced tawr_heavy). Only applies to studies with 'configs'")
+
     args = parser.parse_args()
     
     full_config = load_config(args.config)
 
+    
     # DEBUG PRINT
     print("=== CONFIG STRUCTURE DEBUG ===")
     print(f"Top keys: {list(full_config.keys())}")
@@ -58,6 +61,8 @@ def main():
     analyzer = SensitivityAnalyzer(full_config, output_dir=args.output)
     
     logger.info(f"Starting Sensitivity Analysis: {args.study}")
+    if args.filter:
+        logger.info(f"Filtering configs: {args.filter}")
     
     if args.study == "all":
         for name, spec in studies.items():
