@@ -3,13 +3,13 @@
 
 model:
   name: "HiCoSTv3"
-  # Base dimensions (will be overridden by studies)
+  # Base dimensions 
   hidden_dim: 256
   memory_dim: 256
   time_dim: 256
   hct_d_model: 256
 
-  # Defaults for other params (will be overridden by studies)
+  # Defaults for other params 
   dropout: 0.3
   num_prototypes: 8
   walk_length_short: 5
@@ -26,7 +26,7 @@ model:
   neg_sample_ratio: 5
 
 
-  # === ABLATION FLAGS (NEW & CRITICAL) ===
+  # === ABLATION 
   # True = Use advanced feature (full model)
   # False = Use simple baseline (ablation mode)
   use_prototype_attention: True     # True = 8 prototypes, False = 1 prototype
@@ -39,8 +39,8 @@ model:
 # Training parameters
 training:
   batch_size: 256
-  learning_rate: 0.0001      #  No quotes!
-  weight_decay: 0.00001      #  No quotes!
+  learning_rate: 0.0001      
+  weight_decay: 0.00001      
   max_epochs: 25
   patience: 5
   val_check_interval: 0.5
@@ -108,7 +108,7 @@ sensitivity_studies:
         ode_step_size: null  # Adaptive ignores this
         adjoint: true
   
-  # === 2. ODE Existence (Ablation) ===
+  # 2. ODE Existence (Ablation)
   use_st_ode:
     parameter: "model.use_st_ode"
     values: [true, false]
@@ -120,7 +120,7 @@ sensitivity_studies:
         # When disabled, interval doesn't matter, but good to set default
         st_ode_update_interval: 10
 
-  # === 3. ODE Update Frequency (Only when enabled) ===
+  # 3. ODE Update Frequency (Only when enabled)
   st_ode_update_interval:
     parameter: "model.st_ode_update_interval"
     values: [1, 5, 10, 20, 50]
@@ -129,22 +129,23 @@ sensitivity_studies:
       ode_method: "rk4"
       ode_step_size: 2.0
 
-  # === 4. Batch Size + LR Scaling ===
+  # 4. Batch Size + LR Scaling
   batch_size:
     parameter: "training.batch_size"
     values: [64, 128, 256, 512]
-    lr_scaling: "sqrt"  # Automatically scales LR in the analyzer
+    lr_scaling: "sqrt" 
   
-  # === 5. Memory/Hidden Dimension (Coupled) ===
+  # === 5. Memory/Hidden Dimension (Coupled)
   memory_dim:
     parameter: "model.memory_dim"
     values: [64, 128, 256, 512]
-    coupled_params:
-      hidden_dim: "${model.memory_dim}"
-      time_dim: "${model.memory_dim}"
-      hct_d_model: "${model.memory_dim}"
+    fixed_overrides:
+      64: { hidden_dim: 64, time_dim: 64, hct_d_model: 64 }
+      128: { hidden_dim: 128, time_dim: 128, hct_d_model: 128 }
+      256: { hidden_dim: 256, time_dim: 256, hct_d_model: 256 }
+      512: { hidden_dim: 512, time_dim: 512, hct_d_model: 512 }
   
-  # === 6. SAM Prototypes (Ablation Flag) ===
+  # === 6. SAM Prototypes (Ablation Flag)
   use_prototype_attention:
     parameter: "model.use_prototype_attention"
     values: [true, false]
@@ -155,17 +156,15 @@ sensitivity_studies:
       false:
         num_prototypes: 1
 
-  # === 7. Walk Length Sensitivity ===
+  # === 7. Walk Length Sensitivity
   walk_length_short:
     parameter: "model.walk_length_short"
-    values: [2, 5, 10, 15]
-    # Keep long/tawr proportional or fixed? Let's fix others to isolate short
+    values: [2, 5, 10, 15]    
     fixed_params:
       walk_length_long: 15
       walk_length_tawr: 10
 
-  # === 8. Walk Distribution (Explicit Configs) ===
-  # Replaces the complex 'computed' type with explicit configurations
+  # === 8. Walk Distribution 
   walk_distribution:
     type: "explicit_configs"
     description: "Test different allocations of walk budget"
@@ -175,22 +174,22 @@ sensitivity_studies:
       - { name: "long_heavy", num_walks_short: 3, num_walks_long: 10, num_walks_tawr: 2 }
       - { name: "tawr_heavy", num_walks_short: 3, num_walks_long: 2, num_walks_tawr: 10 }
 
-  # === 9. Learning Rate ===
+  # === 9. Learning Rate
   learning_rate:
     parameter: "training.learning_rate"
     values: [1e-5, 5e-5, 1e-4, 5e-4]
     log_scale: true
   
-  # === 10. Dropout ===
+  # === 10. Dropout
   dropout:
     parameter: "model.dropout"
     values: [0.0, 0.1, 0.3, 0.5]
   
-  # === 11. Hard Negative Mining Threshold ===
+  # === 11. Hard Negative Mining Threshold
   hard_neg_threshold:
     parameter: "model.hard_neg_threshold"
     values: [0.5, 0.7, 0.8, 0.9]
     fixed_params:
-      neg_sample_ratio: 3 # Keep ratio constant while sweeping threshold
+      neg_sample_ratio: 3 
 
  
