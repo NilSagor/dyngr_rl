@@ -347,7 +347,7 @@ class StabilizedIntegrator(nn.Module):
         H_current = h0
         
         for b in range(B):
-            t_start = t_spans[b, 0].item()  # .item() to free graph
+            t_start = t_spans[b, 0].item()  
             t_end = t_spans[b, 1].item()
             
             if abs(t_end - t_start) < 1e-7:
@@ -538,9 +538,8 @@ class NumericallyStabilizedSTODE(nn.Module):
         # Register training progress buffer (updated by trainer)
         self.register_buffer('training_progress', torch.tensor(0.0))
 
-    def set_training_progress(self, progress: float):
-        """Call this at start of each epoch: 0.0 -> 1.0"""
-        self.training_progress.fill_(progress)
+    def set_training_progress(self, progress: float):        
+        self.training_progress = self.training_progress.new_full((1,), progress)
 
     def _prepare_observations_vectorized(
         self,
@@ -615,13 +614,12 @@ class NumericallyStabilizedSTODE(nn.Module):
         # Flat index for [T, N] -> T*N
         flat_idx = inverse * N + valid_n
         
+        obs_tensor = obs_tensor.clone()
+        counts = counts.clone()
+
         # Add encodings
-        obs_tensor_view = obs_tensor.view(-1, H)
-        obs_tensor_view.index_add_(0, flat_idx, valid_enc)
-        
-        # Count
-        counts_view = counts.view(-1)
-        counts_view.index_add_(0, flat_idx, torch.ones_like(valid_n, dtype=torch.float))
+        obs_tensor.view(-1, H).index_add_(0, flat_idx, valid_enc)
+        counts.view(-1).index_add_(0, flat_idx, torch.ones_like(valid_n, dtype=torch.float))
         
         # Normalize
         mask_counts = counts.clamp(min=1.0).unsqueeze(-1)

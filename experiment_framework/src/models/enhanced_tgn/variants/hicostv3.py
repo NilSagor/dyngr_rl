@@ -10,6 +10,9 @@ from typing import Dict, Optional, Tuple, List
 from loguru import logger
 from sklearn.metrics import roc_auc_score, average_precision_score
 import lightning as L
+import gc
+
+from ..component.hicost_config import HiCoSTConfig
 
 from ..component.time_encoder import TimeEncoder
 from ..component.sam_modulev2 import RobustStabilityAugmentedMemory
@@ -20,210 +23,118 @@ from ..component.mrp_modulev2 import GatedMutualRefinementPooling
 from ..component.hardnegative_modulev2 import HardNegativeMiner, _DummyHardNegativeMiner
 from ..component.transformer_encoder import MergeLayer
 
-def parse_bool(value):
-    if isinstance(value, bool): 
-        return value
-    if isinstance(value, str): 
-        return value.lower() in ('true', '1', 'yes', 'on', 'enabled')
-    return bool(value)
 
-def parse_float(value):
-    """Parse float from string or number."""
-    if isinstance(value, str):
-        return float(value)
-    return float(value)
+from src.utils.hicost_utils import parse_bool, parse_float
 
+
+# === HiCoST v3  ===
 class HiCoSTv3(L.LightningModule):
-    """
-    HiCoST: Hierarchical Co-occurrence Spatio-Temporal Network (Production Version)
-    """
-    
-    def __init__(
-        self,
-        num_nodes: int,
-        node_feat_dim: int = 0,
-        edge_feat_dim: int = 64,
-        edge_features_dim: int = 64,
-        hidden_dim: int = 172,
-        time_dim: int = 64,
-        memory_dim: int = 172,
-        # Learning Params
-        learning_rate: float = 1e-4,
-        weight_decay: float = 1e-5,
-        warmup_epochs: float = 0.1,
-        min_lr_ratio: float = 0.01,
-        # SAM Params
-        num_prototypes: int = 5,
-        sam_residual_alpha: float = 0.8,
-        sam_time_decay: float = 0.99,
-        use_sam: bool = True,             
-        similarity_metric: str = "cosine",  
-        # Walk Sampler Params
-        debug_simple_walk: bool = False,
-        walk_length_short: int = 3,
-        walk_length_long: int = 10,
-        walk_length_tawr: int = 8,
-        num_walks_short: int = 5,
-        num_walks_long: int = 3,
-        num_walks_tawr: int = 3,
-        walk_temperature: float = 0.1,
-        walk_time_noise_std: float = 0.0,
-        walk_mask_prob: float = 0.05,
-        walk_adaptive_factor: float = 0.5,
-        # HCT Params
-        use_hct: bool = True,
-        hct_d_model: int = 128,
-        hct_nhead: int = 2,
-        hct_num_layers: int = 1,
-        hct_num_intra_layers: int = 2,
-        hct_num_inter_layers: int = 2,        
-        hct_drop_path: float = 0.1,
-        hct_sigma_time: float = 5.0,
-        hct_cooccurrence_sigma: float = 2.0,  
-        # ST-ODE Params
-        use_st_ode: bool = True,
-        ode_method: str = "dopri5",
-        ode_mu: float = 0.1,                 
-        mu: float = 0.1,                      
-        adaptive_mu: bool = True,            
-        ode_num_eig: int = 10,
-        ode_velocity_gate_thresh: float = 5.0,
-        st_ode_update_interval: int = 10,
-        ode_step_size: float = 1.0,          
-        use_gru_ode: bool = True,           
-        adjoint: bool = True,                
-        # Hard Negative Mining
-        use_hard_negative_mining: bool = True,
-        neg_sample_ratio: int = 5,
-        hard_neg_threshold: float = 0.7,
-        label_smoothing: float = 0.1,
-        dropout: float = 0.1,
-        # Ablation Flags (NEW CONVENTION: True = USE advanced feature)
-        use_prototype_attention: bool = True,
-        use_hct_hierarchical: bool = True,
-        use_gated_refinement: bool = True,
-        use_multi_scale_walks: bool = True,
-        **kwargs
-    ):
-        # --- Handle alternative naming from config ---
-        if 'node_features_dim' in kwargs and node_feat_dim == 0:
-            node_feat_dim = kwargs['node_features_dim']
-        if 'edge_features_dim' in kwargs:
-            edge_feat_dim = kwargs['edge_features_dim']
-        if 'node_feat_dim' in kwargs:
-            node_feat_dim = kwargs['node_feat_dim']
-            
-        # --- CRITICAL FIX: Convert string values to proper types ---
-        # Handle weight_decay that might come as string from YAML
-        if isinstance(weight_decay, str):
-            weight_decay = float(weight_decay)
-        if isinstance(learning_rate, str):
-            learning_rate = float(learning_rate)
-        if isinstance(dropout, str):
-            dropout = float(dropout)
-            
+    def __init__(self, config: HiCoSTConfig):
         super().__init__()
-        torch.autograd.set_detect_anomaly(True)
+        torch.autograd.set_detect_anomaly(True)        
+        
         self.save_hyperparameters()
+        self.config = config  
         
-        self.num_nodes = num_nodes
-        self.hidden_dim = hidden_dim
-        self.memory_dim = memory_dim
-        self.time_dim = time_dim
-        self.edge_feat_dim = edge_feat_dim
-        self.use_st_ode = parse_bool(use_st_ode)
-        self.st_ode_update_interval = st_ode_update_interval
-        self.use_hct = use_hct
-        self.debug_simple_walk = debug_simple_walk
+        # Extract all values from config 
+        self.num_nodes = config.num_nodes
+        self.hidden_dim = config.hidden_dim
+        self.memory_dim = config.memory_dim
+        self.time_dim = config.time_dim
+        self.edge_feat_dim = config.edge_feat_dim
+        self.dropout = config.dropout
+
+        # === Projection layers for dimension alignment
+        if config.memory_dim != config.hidden_dim:
+            self.mem_to_hidden = nn.Linear(config.memory_dim, config.hidden_dim)
+            logger.info(f"Added projection: memory_dim({config.memory_dim}) → hidden_dim({config.hidden_dim})")
+        else:
+            self.mem_to_hidden = nn.Identity()
         
-        # Handle parameter aliases
-        if edge_features_dim != 64 and edge_feat_dim == 64:
-            edge_feat_dim = edge_features_dim
-        if mu != 0.1 and ode_mu == 0.1:
-            ode_mu = mu
-        if hct_cooccurrence_sigma != 2.0 and hct_sigma_time == 5.0:
-            hct_sigma_time = hct_cooccurrence_sigma
+        # YAML may load as strings
+        self.use_st_ode = parse_bool(config.use_st_ode)
+        self.use_hct = parse_bool(config.use_hct)
+        self.use_gated_refinement = parse_bool(config.use_gated_refinement)
+        self.use_multi_scale_walks = parse_bool(config.use_multi_scale_walks)
+        self.use_prototype_attention = parse_bool(config.use_prototype_attention)
+        self.use_hard_negative_mining = parse_bool(config.use_hard_negative_mining)
+        self.use_hct_hierarchical = parse_bool(config.use_hct_hierarchical)
         
-        # State Tracking
+        self.st_ode_update_interval = int(config.st_ode_update_interval)
+        self.debug_simple_walk = parse_bool(config.debug_simple_walk)
+        
+        
+        edge_feat_dim = config.edge_features_dim if config.edge_feat_dim == 64 else config.edge_feat_dim
+        
+        
         self.register_buffer('last_ode_update_time', torch.tensor(0.0))
         self._ode_batch_counter = 0
-        self._sam_epoch_backup = None
-
-        # Store feature flags
-        self.use_prototype_attention = use_prototype_attention
-        self.use_hct_hierarchical = use_hct_hierarchical
-        self.use_gated_refinement = use_gated_refinement
-        self.use_multi_scale_walks = use_multi_scale_walks
-        self.use_hard_negative_mining = use_hard_negative_mining
-
+        
         # === 1. Time Encoder ===
-        self.time_encoder = TimeEncoder(time_dim)
+        self.time_encoder = TimeEncoder(config.time_dim)
         
         # === 2. SAM Module ===
-        effective_prototypes = num_prototypes if use_prototype_attention else 1
+        effective_prototypes = config.num_prototypes if self.use_prototype_attention else 1
         self.sam_module = RobustStabilityAugmentedMemory(
-            num_nodes=num_nodes,
-            memory_dim=memory_dim,
-            node_feat_dim=node_feat_dim,
+            num_nodes=config.num_nodes,
+            memory_dim=config.memory_dim,
+            node_feat_dim=config.node_feat_dim,
             edge_feat_dim=edge_feat_dim,
-            time_dim=time_dim,
+            time_dim=config.time_dim,
             num_prototypes=effective_prototypes,
-            residual_alpha=sam_residual_alpha,
-            time_decay_factor=sam_time_decay,
-            dropout=dropout,            
+            residual_alpha=config.sam_residual_alpha,
+            time_decay_factor=config.sam_time_decay,
+            dropout=config.dropout,
         )
         logger.info(f"SAM: Using {effective_prototypes} prototype(s) "
-                   f"({'attention' if use_prototype_attention else 'single'})")
+                   f"({'attention' if self.use_prototype_attention else 'single'})")
 
         # === 3. Walk Sampler ===
-        if use_multi_scale_walks:
-            logger.info("Walk Sampler: Multi-scale enabled (short/long/TAWR)")
-            w_len_short = walk_length_short
-            w_num_short = num_walks_short
-            w_len_long = walk_length_long
-            w_num_long = num_walks_long
-            w_len_tawr = walk_length_tawr
-            w_num_tawr = num_walks_tawr
-        else:            
-            logger.info("Walk Sampler: Single scale only (ablation mode)")
-            w_len_short = walk_length_short
-            w_num_short = num_walks_short + num_walks_long + num_walks_tawr
-            w_len_long = 0
-            w_num_long = 0
-            w_len_tawr = 0
-            w_num_tawr = 0
+        if self.use_multi_scale_walks:
+            w_len_short = config.walk_length_short
+            w_num_short = config.num_walks_short
+            w_len_long = config.walk_length_long
+            w_num_long = config.num_walks_long
+            w_len_tawr = config.walk_length_tawr
+            w_num_tawr = config.num_walks_tawr
+        else:
+            # Ablation: single scale only
+            w_len_short = config.walk_length_short
+            w_num_short = config.num_walks_short + config.num_walks_long + config.num_walks_tawr
+            w_len_long = w_len_tawr = 0
+            w_num_long = w_num_tawr = 0
         
         self.walk_sampler = MultiScaleWalkSampler(
-            num_nodes=num_nodes,
+            num_nodes=config.num_nodes,
             walk_length_short=w_len_short,
             walk_length_long=w_len_long if w_len_long > 0 else 1,
             walk_length_tawr=w_len_tawr if w_len_tawr > 0 else 1,
             num_walks_short=w_num_short,
             num_walks_long=w_num_long,
             num_walks_tawr=w_num_tawr,
-            temperature=walk_temperature,
-            memory_dim=memory_dim,
-            time_dim=time_dim,
-            time_noise_std=walk_time_noise_std,
-            mask_prob=walk_mask_prob,
-            adaptive_length_factor=walk_adaptive_factor if use_multi_scale_walks else 0.0
+            temperature=config.walk_temperature,
+            memory_dim=config.memory_dim,
+            time_dim=config.time_dim,
+            time_noise_std=config.walk_time_noise_std,
+            mask_prob=config.walk_mask_prob,
+            adaptive_length_factor=config.walk_adaptive_factor if self.use_multi_scale_walks else 0.0
         )
         
         # === 4. HCT Module ===
-        if use_hct_hierarchical:
+        if self.use_hct_hierarchical:
             self.hct = StabilizedHCT(
-                d_model=hct_d_model,
-                memory_dim=memory_dim,
-                nhead=hct_nhead,
-                num_intra_layers=hct_num_layers,
-                num_inter_layers=hct_num_layers,
-                dim_feedforward=hct_d_model * 4,
-                dropout=dropout,
-                drop_path_rate=hct_drop_path,
+                d_model=config.hct_d_model,
+                memory_dim=config.memory_dim,
+                nhead=config.hct_nhead,
+                num_intra_layers=config.hct_num_intra_layers,
+                num_inter_layers=config.hct_num_inter_layers,
+                dim_feedforward=config.hct_d_model * 4,
+                dropout=config.dropout,
+                drop_path_rate=config.hct_drop_path,
                 max_walk_length=max(w_len_short, w_len_long, w_len_tawr),
-                cooccurrence_sigma_time=hct_sigma_time
+                cooccurrence_sigma_time=config.hct_sigma_time
             )
-            self.hct_proj = nn.Linear(hct_d_model, hidden_dim) if hct_d_model != hidden_dim else nn.Identity()
+            self.hct_proj = nn.Linear(config.hct_d_model, config.hidden_dim) if config.hct_d_model != config.hidden_dim else nn.Identity()
             logger.info("HCT: Full hierarchical co-occurrence enabled")
         else:
             self.hct = None
@@ -233,64 +144,68 @@ class HiCoSTv3(L.LightningModule):
         # === 5. ST-ODE ===
         if self.use_st_ode:
             self.st_ode = NumericallyStabilizedSTODE(
-                hidden_dim=memory_dim,
-                num_nodes=num_nodes,
-                num_eigenvectors=ode_num_eig,
-                mu=ode_mu,
-                adaptive_mu=True,
-                use_gru_ode=True,
-                ode_method=ode_method,
-                ode_step_size=1.0,               
-                adjoint=True,                    
-                dropout=dropout
+                hidden_dim=config.memory_dim,
+                num_nodes=config.num_nodes,
+                num_eigenvectors=config.ode_num_eig,
+                mu=config.ode_mu,
+                adaptive_mu=config.adaptive_mu,
+                use_gru_ode=config.use_gru_ode,
+                ode_method=config.ode_method,
+                ode_step_size=config.ode_step_size,
+                adjoint=config.adjoint,
+                dropout=config.dropout
             )
-            logger.info("ST-ODE: Enabled")
+            logger.info(f"ST-ODE: Enabled (method={config.ode_method})")
         else:
             self.st_ode = None
             logger.info("ST-ODE: Disabled")
             
-        # === 6. Refiner ===
+        # === 6. Refiner (MRP) ===
         max_walks = max(w_num_short, w_num_long, w_num_tawr)
-        if use_gated_refinement:
+        if self.use_gated_refinement:
             self.refiner = GatedMutualRefinementPooling(
-                d_model=hidden_dim,
-                nhead=4,
-                dropout=dropout,
-                num_walk_types=3 if use_multi_scale_walks else 1,
-                max_walks_per_type=max_walks,
-                modalities=3
+                d_model=config.hidden_dim,
+                nhead=config.mrp_nhead,
+                dropout=config.dropout,
+                num_walk_types=3 if self.use_multi_scale_walks else 1,
+                modalities=config.mrp_modalities,
+                fusion_mode=config.mrp_fusion_mode,
+                pool_attn_heads=config.mrp_pool_attn_heads,
             )
-            logger.info("Refiner: Gated mutual refinement enabled")
+            logger.info(f"Refiner: Gated mutual refinement enabled "
+                       f"(fusion={config.mrp_fusion_mode}, pool_heads={config.mrp_pool_attn_heads})")
         else:
             self.refiner = nn.Sequential(
-                nn.Linear(hidden_dim * 3, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
+                nn.Linear(config.hidden_dim * 3, config.hidden_dim * 2), 
+                nn.LayerNorm(config.hidden_dim * 2),
                 nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 2, hidden_dim)
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_dim * 2, config.hidden_dim) 
             )
             logger.info("Refiner: Simple concat fusion (ablation mode)")
         
+                
+        
         # === 7. Link Predictor ===
         self.link_predictor = MergeLayer(
-            input_dim1=hidden_dim,
-            input_dim2=hidden_dim,
-            hidden_dim=hidden_dim,
+            input_dim1=config.hidden_dim,
+            input_dim2=config.hidden_dim,
+            hidden_dim=config.hidden_dim,
             output_dim=1,
-            dropout=dropout,
+            dropout=config.dropout,
             use_temperature=True
         )
         
         # === 8. Hard Negative Miner ===
-        if use_hard_negative_mining and neg_sample_ratio > 0:
+        if self.use_hard_negative_mining and config.neg_sample_ratio > 0:
             self.hard_neg_miner = HardNegativeMiner(
-                neg_sample_ratio=neg_sample_ratio,
-                hard_neg_threshold=hard_neg_threshold,
-                label_smoothing=label_smoothing
+                neg_sample_ratio=config.neg_sample_ratio,
+                hard_neg_threshold=config.hard_neg_threshold,
+                label_smoothing=config.label_smoothing
             )
-            logger.info(f"Hard Negative Mining: Enabled (ratio={neg_sample_ratio})")
+            logger.info(f"Hard Negative Mining: Enabled (ratio={config.neg_sample_ratio})")
         else:
-            self.hard_neg_miner = _DummyHardNegativeMiner(label_smoothing)
+            self.hard_neg_miner = _DummyHardNegativeMiner(config.label_smoothing)
             logger.info("Hard Negative Mining: Disabled")
         
         # Buffers for graph data
@@ -300,14 +215,16 @@ class HiCoSTv3(L.LightningModule):
         self.edge_raw_features = None
         self.validation_step_outputs = []
         
+        # Log final config summary
         logger.info(f"HiCoSTv3 Initialized: "
-                   f"SAM-proto={use_prototype_attention}, "
-                   f"HCT-hier={use_hct_hierarchical}, "
-                   f"Gated-refine={use_gated_refinement}, "
-                   f"Multi-scale={use_multi_scale_walks}, "
+                   f"hidden_dim={config.hidden_dim}, memory_dim={config.memory_dim}, "
+                   f"SAM-proto={self.use_prototype_attention}, "
+                   f"HCT-hier={self.use_hct_hierarchical}, "
+                   f"Gated-refine={self.use_gated_refinement}, "
+                   f"Multi-scale={self.use_multi_scale_walks}, "
                    f"ST-ODE={self.use_st_ode}, "
-                   f"HNM={use_hard_negative_mining}")
-        
+                   f"HNM={self.use_hard_negative_mining}"
+                )
 
     def set_graph(self, edge_index: torch.Tensor, edge_time: torch.Tensor):
         self.edge_index = edge_index
@@ -351,36 +268,63 @@ class HiCoSTv3(L.LightningModule):
             
             src_simple = w_sum[:batch_size]
             dst_simple = w_sum[batch_size:]
+            
+            # CRITICAL FIX: Project to hidden_dim if memory_dim != hidden_dim
+            if src_simple.size(-1) != self.hidden_dim:
+                # Create projection on the fly or use mem_to_hidden
+                src_simple = self.mem_to_hidden(src_simple)
+                dst_simple = self.mem_to_hidden(dst_simple)
+            
             return src_simple, dst_simple, walk_data
+    
+    # def _get_hct_embeddings(self, walk_data: Dict, node_memory: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    #     device = node_memory.device
         
-        # Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
-        types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
-        combined_walks = {}
-        for wt in types:
-            if wt not in walk_data['source']: continue
-            combined_walks[wt] = {
-                'nodes': torch.cat([walk_data['source'][wt]['nodes'], walk_data['target'][wt]['nodes']], dim=0),
-                'nodes_anon': torch.cat([walk_data['source'][wt]['nodes_anon'], walk_data['target'][wt]['nodes_anon']], dim=0),
-                'masks': torch.cat([walk_data['source'][wt]['masks'], walk_data['target'][wt]['masks']], dim=0),
-                'times': torch.cat([walk_data['source'][wt]['times'], walk_data['target'][wt]['times']], dim=0)
-            }
-            if 'restart_flags' in walk_data['source'][wt]:
-                combined_walks[wt]['restart_flags'] = torch.cat([
-                    walk_data['source'][wt]['restart_flags'],
-                    walk_data['target'][wt]['restart_flags']
-                ], dim=0)
+    #     if self.hct is None:
+    #         # Simple pooling logic for ablation
+    #         all_nodes = torch.cat([walk_data['source']['short']['nodes'], walk_data['target']['short']['nodes']], dim=0)
+    #         all_masks = torch.cat([walk_data['source']['short']['masks'], walk_data['target']['short']['masks']], dim=0)
+            
+    #         B_total = all_nodes.size(0)
+    #         flat_n = all_nodes.view(-1)
+    #         flat_f = node_memory[flat_n].view(B_total, all_nodes.size(1), all_nodes.size(2), -1)
+            
+    #         m_sum = all_masks.sum(dim=-1, keepdim=True).clamp(min=1)
+    #         pooled = (flat_f * all_masks.unsqueeze(-1)).sum(dim=2) / m_sum
+    #         w_sum = pooled.sum(dim=1) / pooled.size(1)
+            
+    #         src_simple = w_sum[:batch_size]
+    #         dst_simple = w_sum[batch_size:]
+    #         return src_simple, dst_simple, walk_data
         
-        hct_out = self.hct(
-            walks_dict=combined_walks,
-            node_memory=node_memory,
-            return_all=False
-        )
-        hct_out = self.hct_proj(hct_out)
+    #     # Use self.use_multi_scale_walks instead of self.ablation_walk_multi_scale
+    #     types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
+    #     combined_walks = {}
+    #     for wt in types:
+    #         if wt not in walk_data['source']: continue
+    #         combined_walks[wt] = {
+    #             'nodes': torch.cat([walk_data['source'][wt]['nodes'], walk_data['target'][wt]['nodes']], dim=0),
+    #             'nodes_anon': torch.cat([walk_data['source'][wt]['nodes_anon'], walk_data['target'][wt]['nodes_anon']], dim=0),
+    #             'masks': torch.cat([walk_data['source'][wt]['masks'], walk_data['target'][wt]['masks']], dim=0),
+    #             'times': torch.cat([walk_data['source'][wt]['times'], walk_data['target'][wt]['times']], dim=0)
+    #         }
+    #         if 'restart_flags' in walk_data['source'][wt]:
+    #             combined_walks[wt]['restart_flags'] = torch.cat([
+    #                 walk_data['source'][wt]['restart_flags'],
+    #                 walk_data['target'][wt]['restart_flags']
+    #             ], dim=0)
         
-        src_hct = hct_out[:batch_size]
-        dst_hct = hct_out[batch_size:]
+    #     hct_out = self.hct(
+    #         walks_dict=combined_walks,
+    #         node_memory=node_memory,
+    #         return_all=False
+    #     )
+    #     hct_out = self.hct_proj(hct_out)
         
-        return src_hct, dst_hct, combined_walks
+    #     src_hct = hct_out[:batch_size]
+    #     dst_hct = hct_out[batch_size:]
+        
+    #     return src_hct, dst_hct, combined_walks
 
     def compute_temporal_embeddings(
         self,
@@ -392,31 +336,41 @@ class HiCoSTv3(L.LightningModule):
         device = src_nodes.device
         batch_size = src_nodes.size(0)
         
-        current_memory = self.sam_module.raw_memory.detach()
+        logger.debug("[CTE-1] Getting current memory")
+        # CRITICAL: Deep clone with no gradient connection to buffer
+        with torch.no_grad():
+            current_memory_snapshot = self.sam_module.raw_memory.clone()
         
         src_tensor = src_nodes.to(device).long()
         dst_tensor = dst_nodes.to(device).long()
         ts_tensor = timestamps.to(device).float()
 
         if ts_tensor.size(0) != batch_size:
-            raise RuntimeError(f"Internal Error: Timestamps ({ts_tensor.size(0)}) do not match nodes ({batch_size})")
+            raise RuntimeError(f"Timestamps ({ts_tensor.size(0)}) do not match nodes ({batch_size})")
         
         # 2. Sample Multi-Scale Walks
+        logger.debug("[CTE-2] Sampling walks")
         walk_data = self.walk_sampler(
             source_nodes=src_tensor,
             target_nodes=dst_tensor,
             current_times=ts_tensor,
-            memory_states=current_memory,
+            memory_states=current_memory_snapshot,
             edge_index=self.edge_index,
             edge_time=self.edge_time
         )
         
         # 3. Encode Walks (HCT)
-        src_hct, dst_hct, combined_walks = self._get_hct_embeddings(walk_data, current_memory, batch_size)
+        logger.debug("[CTE-3] Encoding walks (HCT)")
+        src_hct, dst_hct, combined_walks = self._get_hct_embeddings(
+            walk_data, current_memory_snapshot, batch_size
+        )
         
-        # 4. Evolve Memory (ST-ODE)
-        src_stode = current_memory[src_nodes]
-        dst_stode = current_memory[dst_nodes]
+        # 4. ST-ODE Memory Evolution (COMPLETELY DETACHED)
+        logger.debug("[CTE-4] ST-ODE evolution")
+        
+        # Default: use snapshot (no ST-ODE update)
+        src_memory_out = current_memory_snapshot[src_nodes].clone()
+        dst_memory_out = current_memory_snapshot[dst_nodes].clone()
         
         if self.use_st_ode and self.training and self.st_ode is not None:
             self._ode_batch_counter += 1
@@ -427,64 +381,240 @@ class HiCoSTv3(L.LightningModule):
                 self._ode_batch_counter = 0
                 
                 free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-                if free_memory < 2 * 1024**3:
-                    logger.warning(f"Skipping ST-ODE due to low memory ({free_memory/1024**3:.2f} GB free)")
-                else:
-                    obs_encodings = self._prepare_ode_observations(walk_data, current_memory, batch_size)
+                if free_memory >= 2 * 1024**3:
+                    obs_encodings = self._prepare_ode_observations(
+                        walk_data, current_memory_snapshot, batch_size
+                    )
                 
-                if obs_encodings is not None:
-                    observed_nodes = obs_encodings['node_map']
-                    observed_memory = current_memory[observed_nodes]
-                    try:
-                        evolved_observed = self.st_ode(
-                            node_states=observed_memory,
-                            walk_encodings=obs_encodings['encodings'],
-                            walk_times=obs_encodings['times'],
-                            walk_masks=obs_encodings['masks'],
-                            adj_matrix=obs_encodings['adj']
-                        )
+                    if obs_encodings is not None:
+                        observed_nodes = obs_encodings['node_map']
                         
-                        with torch.no_grad():
-                            self.sam_module.raw_memory.data[observed_nodes] = \
-                                0.9 * self.sam_module.raw_memory.data[observed_nodes] + \
-                                0.1 * evolved_observed
+                        # ST-ODE computation in its own scope
+                        try:
+                            with torch.no_grad():
+                                observed_input = current_memory_snapshot[observed_nodes]
                             
-                        self.last_ode_update_time = t_max
+                            # Forward through ST-ODE (may have gradients)
+                            evolved_observed = self.st_ode(
+                                node_states=observed_input,
+                                walk_encodings=obs_encodings['encodings'],
+                                walk_times=obs_encodings['times'],
+                                walk_masks=obs_encodings['masks'],
+                                adj_matrix=obs_encodings['adj']
+                            )
+                            
+                            # CRITICAL: Update raw_memory with NO gradient tracking
+                            # and NO view relationship to evolved_observed
+                            with torch.no_grad():
+                                evolved_detached = evolved_observed.detach().clone()
+                                # Create completely new tensor for update
+                                update_values = 0.9 * self.sam_module.raw_memory[observed_nodes] + 0.1 * evolved_detached
+                                # Use scatter-like update instead of indexing assignment
+                                indices = observed_nodes.unsqueeze(-1).expand(-1, self.memory_dim)
+                                self.sam_module.raw_memory.scatter_(0, indices, update_values)
+                                
+                            self.last_ode_update_time = t_max
+                            
+                            # Get fresh read from updated memory (detached)
+                            with torch.no_grad():
+                                src_memory_out = self.sam_module.raw_memory[src_nodes].clone()
+                                dst_memory_out = self.sam_module.raw_memory[dst_nodes].clone()
+                            
+                        except RuntimeError as e:
+                            logger.warning(f"ST-ODE failed: {e}")
+                            # Keep defaults
                         
-                        src_stode = self.sam_module.raw_memory[src_nodes]
-                        dst_stode = self.sam_module.raw_memory[dst_nodes]
-                    except RuntimeError as e:
-                        logger.warning(f"ST-ODE failed: {e}")
-                        src_stode = current_memory[src_nodes]
-                        dst_stode = current_memory[dst_nodes]
-                    
-                    del obs_encodings
-                    torch.cuda.empty_cache()
-
-        # 5. Get SAM Memory Embeddings
-        src_sam = current_memory[src_nodes]
-        dst_sam = current_memory[dst_nodes]
+                        del obs_encodings
+                        torch.cuda.empty_cache()
+        
+        # 5. Prepare embeddings for refiner
+        logger.debug("[CTE-5] Projecting to hidden_dim")
+        
+        # These are all fresh clones, no view relationships
+        src_sam = src_memory_out.clone()
+        dst_sam = dst_memory_out.clone()
+        src_stode = src_memory_out.clone()  # Same as sam when stode doesn't run, or fresh read
+        dst_stode = dst_memory_out.clone()
+        
+        # Project to hidden_dim
+        src_sam_proj = self.mem_to_hidden(src_sam)
+        dst_sam_proj = self.mem_to_hidden(dst_sam)
+        src_stode_proj = self.mem_to_hidden(src_stode)
+        dst_stode_proj = self.mem_to_hidden(dst_stode)
+        
+        # Extract per-type embeddings
+        src_per_type, src_masks = self._extract_per_type_embeds(
+            walk_data['source'], current_memory_snapshot
+        )
+        dst_per_type, dst_masks = self._extract_per_type_embeds(
+            walk_data['target'], current_memory_snapshot
+        )
         
         # 6. Gated Mutual Refinement
-        src_per_type, src_masks = self._extract_per_type_embeds(walk_data['source'], current_memory)
-        dst_per_type, dst_masks = self._extract_per_type_embeds(walk_data['target'], current_memory)
-        
-        # CRITICAL FIX: Use self.use_gated_refinement instead of self.ablation_mrp_gating
+        logger.debug("[CTE-6] Calling refiner")
         if self.use_gated_refinement:
-            final_src, final_dst = self.refiner(
-                src_hct=src_hct, dst_hct=dst_hct,
-                src_sam=src_sam, dst_sam=dst_sam,
-                src_stode=src_stode, dst_stode=dst_stode,
-                src_per_type=src_per_type, dst_per_type=dst_per_type,
-                src_masks=src_masks, dst_masks=dst_masks
+            final_src, final_dst, _ = self.refiner(
+                src_hct=src_hct.clone(),         
+                dst_hct=dst_hct.clone(),
+                src_sam=src_sam_proj.clone(),    
+                dst_sam=dst_sam_proj.clone(),
+                src_stode=src_stode_proj.clone(), 
+                dst_stode=dst_stode_proj.clone(),
+                src_per_type=src_per_type.clone() if src_per_type is not None else None,
+                dst_per_type=dst_per_type.clone() if dst_per_type is not None else None,
+                src_masks=src_masks,
+                dst_masks=dst_masks
             )
         else:
-            stacked_src = torch.cat([src_sam, src_hct, src_stode], dim=-1)
-            stacked_dst = torch.cat([dst_sam, dst_hct, dst_stode], dim=-1)
+            stacked_src = torch.cat([src_sam_proj, src_hct, src_stode_proj], dim=-1)
+            stacked_dst = torch.cat([dst_sam_proj, dst_hct, dst_stode_proj], dim=-1)
             final_src = self.refiner(stacked_src)
             final_dst = self.refiner(stacked_dst)
         
         return final_src, final_dst
+    
+    
+    # def compute_temporal_embeddings(
+    #     self,
+    #     src_nodes: torch.Tensor,
+    #     dst_nodes: torch.Tensor,
+    #     timestamps: torch.Tensor,
+    #     batch: Optional[Dict] = None
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     device = src_nodes.device
+    #     batch_size = src_nodes.size(0)
+        
+    #     logger.debug("[CTE-1] Getting current memory")
+    #     current_memory = self.sam_module.raw_memory.detach().clone()
+        
+    #     src_tensor = src_nodes.to(device).long()
+    #     dst_tensor = dst_nodes.to(device).long()
+    #     ts_tensor = timestamps.to(device).float()
+
+    #     if ts_tensor.size(0) != batch_size:
+    #         raise RuntimeError(f"Internal Error: Timestamps ({ts_tensor.size(0)}) do not match nodes ({batch_size})")
+        
+    #     # 2. Sample Multi-Scale Walks
+    #     logger.debug("[CTE-2] Sampling walks")
+    #     walk_data = self.walk_sampler(
+    #         source_nodes=src_tensor,
+    #         target_nodes=dst_tensor,
+    #         current_times=ts_tensor,
+    #         memory_states=current_memory,
+    #         edge_index=self.edge_index,
+    #         edge_time=self.edge_time
+    #     )
+        
+    #     # 3. Encode Walks (HCT)
+    #     logger.debug("[CTE-3] Encoding walks (HCT)")
+    #     src_hct, dst_hct, combined_walks = self._get_hct_embeddings(
+    #         walk_data, current_memory, batch_size
+    #     )
+        
+    #     # 4. Get SAM Memory Embeddings
+    #     logger.debug("[CTE-4] Getting SAM embeddings")         
+    #     src_sam = current_memory[src_nodes]
+    #     dst_sam = current_memory[dst_nodes]
+        
+        
+    #     # 5. Evolve Memory (ST-ODE)
+    #     logger.debug("[CTE-5] ST-ODE evolution")
+    #     src_stode, dst_stode = None, None
+    #     # src_stode = current_memory[src_nodes]
+    #     # dst_stode = current_memory[dst_nodes]
+        
+    #     if self.use_st_ode and self.training and self.st_ode is not None:
+    #         self._ode_batch_counter += 1
+    #         t_max = timestamps.max()
+    #         dt = t_max - self.last_ode_update_time
+            
+    #         if self._ode_batch_counter >= self.st_ode_update_interval or dt > 100.0:
+    #             self._ode_batch_counter = 0
+                
+    #             free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+    #             if free_memory < 2 * 1024**3:
+    #                 logger.warning(f"Skipping ST-ODE due to low memory ({free_memory/1024**3:.2f} GB free)")
+    #                 src_stode = current_memory[src_nodes].clone()
+    #                 dst_stode = current_memory[dst_nodes].clone()
+    #             else:
+    #                 obs_encodings = self._prepare_ode_observations(walk_data, current_memory, batch_size)
+                
+    #                 if obs_encodings is not None:
+    #                     observed_nodes = obs_encodings['node_map']
+    #                     observed_memory = current_memory[observed_nodes]
+    #                     try:
+    #                         evolved_observed = self.st_ode(
+    #                             node_states=observed_memory,
+    #                             walk_encodings=obs_encodings['encodings'],
+    #                             walk_times=obs_encodings['times'],
+    #                             walk_masks=obs_encodings['masks'],
+    #                             adj_matrix=obs_encodings['adj']
+    #                         )
+                            
+    #                         with torch.no_grad():
+    #                             evolved_detached = evolved_observed.detach()
+    #                             self.sam_module.raw_memory.data[observed_nodes] = \
+    #                                 0.9 * self.sam_module.raw_memory.data[observed_nodes] + \
+    #                                 0.1 * evolved_detached
+                                
+    #                         self.last_ode_update_time = t_max
+                            
+    #                         src_stode = self.sam_module.raw_memory[src_nodes].clone().detach()
+    #                         dst_stode = self.sam_module.raw_memory[dst_nodes].clone().detach()
+    #                     except RuntimeError as e:
+    #                         logger.warning(f"ST-ODE failed: {e}")
+    #                         src_stode = current_memory[src_nodes]
+    #                         dst_stode = current_memory[dst_nodes]
+                        
+    #                     del obs_encodings
+    #                     torch.cuda.empty_cache()
+
+       
+        
+    #     # 6. Gated Mutual Refinement
+    #     src_per_type, src_masks = self._extract_per_type_embeds(walk_data['source'], current_memory)
+    #     dst_per_type, dst_masks = self._extract_per_type_embeds(walk_data['target'], current_memory)
+        
+    #     logger.debug("[CTE-5] Projecting to hidden_dim")
+    #     src_sam_proj = self.mem_to_hidden(src_sam)
+    #     dst_sam_proj = self.mem_to_hidden(dst_sam)
+    #     src_stode_proj = self.mem_to_hidden(src_stode)
+    #     dst_stode_proj = self.mem_to_hidden(dst_stode)
+        
+        
+        
+    #     # Use self.use_gated_refinement instead of self.ablation_mrp_gating
+    #     # if self.use_gated_refinement:
+    #     #     final_src, final_dst = self.refiner(
+    #     #         src_hct=src_hct, dst_hct=dst_hct,
+    #     #         src_sam=src_sam, dst_sam=dst_sam,
+    #     #         src_stode=src_stode, dst_stode=dst_stode,
+    #     #         src_per_type=src_per_type, dst_per_type=dst_per_type,
+    #     #         src_masks=src_masks, dst_masks=dst_masks
+    #     #     )
+        
+    #     # Use projected versions for refiner
+    #     logger.debug("[CTE-6] Calling refiner")
+    #     if self.use_gated_refinement:
+    #         final_src, final_dst, _ = self.refiner(
+    #             src_hct=src_hct,         
+    #             dst_hct=dst_hct,
+    #             src_sam=src_sam_proj,    
+    #             dst_sam=dst_sam_proj,
+    #             src_stode=src_stode_proj, 
+    #             dst_stode=dst_stode_proj,
+    #             src_per_type=src_per_type,
+    #             dst_per_type=dst_per_type,
+    #             src_masks=src_masks,
+    #             dst_masks=dst_masks
+    #         )
+    #     else:
+    #         stacked_src = torch.cat([src_sam, src_hct, src_stode], dim=-1)
+    #         stacked_dst = torch.cat([dst_sam, dst_hct, dst_stode], dim=-1)
+    #         final_src = self.refiner(stacked_src)
+    #         final_dst = self.refiner(stacked_dst)
+        
+    #     return final_src, final_dst
 
     def _prepare_ode_observations(self, walk_data, memory, batch_size) -> Optional[Dict]:
         device = memory.device
@@ -587,17 +717,23 @@ class HiCoSTv3(L.LightningModule):
 
         # Calculate max_w based on AVAILABLE walks in this specific run
         # We look at the config hparams, but clamp to 0 if the sampler didn't generate them
-        try:
-            max_w = max(
-                self.hparams.num_walks_short if self.hparams.num_walks_short > 0 else 0,
-                self.hparams.num_walks_long if self.hparams.num_walks_long > 0 else 0,
-                self.hparams.num_walks_tawr if self.hparams.num_walks_tawr > 0 else 0
-            )
-        except AttributeError:
-            # Fallback if hparams not accessible yet
-            max_w = 5 
+        # try:
+        #     max_w = max(
+        #         self.config.num_walks_short if self.config.num_walks_short > 0 else 0,
+        #         self.config.num_walks_long if self.config.num_walks_long > 0 else 0,
+        #         self.config.num_walks_tawr if self.config.num_walks_tawr > 0 else 0
+        #     )
+        # except AttributeError:
+        #     # Fallback if hparams not accessible yet
+        #     max_w = 5 
+        
+        max_w = max(
+            self.config.num_walks_short if self.config.num_walks_short > 0 else 0,
+            self.config.num_walks_long if self.config.num_walks_long > 0 else 0,
+            self.config.num_walks_tawr if self.config.num_walks_tawr > 0 else 0,
+        )
 
-        # max_w = max(self.hparams.num_walks_short, self.hparams.num_walks_long, self.hparams.num_walks_tawr)
+        # max_w = max(self.config.num_walks_short, self.config.num_walks_long, self.config.num_walks_tawr)
         
         if max_w == 0:
             # Edge case: no walks at all
@@ -610,8 +746,7 @@ class HiCoSTv3(L.LightningModule):
         D = memory.size(-1)
         device = memory.device
         
-        for t in types:
-            # SAFETY CHECK: Does this type exist in side_data?
+        for t in types:            
             if t not in side_data:
                 logger.warning(f"Walk type '{t}' missing from side_data. Creating zero placeholders.")
                 # Create zero tensors for missing types
@@ -619,12 +754,12 @@ class HiCoSTv3(L.LightningModule):
                 dummy_masks = torch.zeros(B, 1, 1, dtype=torch.float32, device=device)
                 # Process dummy to match expected shape [B, 1, D] after pooling
                 flat_f = memory[dummy_nodes.view(-1)].view(B, 1, 1, D)
-                pooled = torch.zeros(B, 1, D, device=device) # Explicit zero pool
+                pooled = torch.zeros(B, 1, D, device=device)
                 m_valid = torch.zeros(B, 1, dtype=torch.bool, device=device)
             else:
                 data_t = side_data[t]
                 
-                # SAFETY CHECK: Does 'masks' key exist?
+                #  Does 'masks' key exist
                 if 'masks' not in data_t or 'nodes' not in data_t:
                     logger.warning(f"Walk type '{t}' missing 'masks' or 'nodes'. Creating zero placeholders.")
                     dummy_nodes = torch.zeros(B, 1, 1, dtype=torch.long, device=device)
@@ -670,7 +805,18 @@ class HiCoSTv3(L.LightningModule):
             
         # Stack only if we have valid data
         if len(embeds) > 0:
-            return torch.stack(embeds, dim=1), torch.stack(masks, dim=1)
+            pooled_embeds = torch.stack(embeds, dim=1) 
+            mask_stack = torch.stack(masks, dim=1)            
+            
+            # Project if needed
+            if hasattr(self, 'mem_to_hidden') and not isinstance(self.mem_to_hidden, nn.Identity):
+                B, T, W, D_mem = pooled_embeds.shape
+                flat = pooled_embeds.reshape(-1, D_mem)
+                projected = self.mem_to_hidden(flat)
+                pooled_embeds = projected.view(B, T, W, -1)
+            
+            # CRITICAL: Clone to ensure no shared memory
+            return pooled_embeds.clone(), mask_stack.clone()
         else:
             return None, None
 
@@ -703,37 +849,63 @@ class HiCoSTv3(L.LightningModule):
         logits = self(aug_batch)
         loss = F.binary_cross_entropy_with_logits(logits, aug_batch['labels'])
         
+        # Aggressive cleanup every N steps
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()  # import gc at top
+        
         self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self.training:
-            src = batch['src_nodes']
-            dst = batch['dst_nodes']
-            ts = batch['timestamps']
-            edge_feat = batch.get('edge_features', torch.zeros(len(src), self.edge_feat_dim, device=self.device))
+        # if self.training:
+        #     src = batch['src_nodes']
+        #     dst = batch['dst_nodes']
+        #     ts = batch['timestamps']
+        #     edge_feat = batch.get('edge_features', torch.zeros(len(src), self.edge_feat_dim, device=self.device))
             
-            with torch.no_grad():
-                self.sam_module.update_memory_batch(
-                    source_nodes=src.detach(),
-                    target_nodes=dst.detach(),
-                    edge_features=edge_feat.detach(),
-                    current_time=ts.detach(),
-                    node_features=self.node_raw_features.detach() if self.node_raw_features is not None else None
-                )
+        #     with torch.no_grad():
+        #         self.sam_module.update_memory_batch(
+        #             source_nodes=src.detach(),
+        #             target_nodes=dst.detach(),
+        #             edge_features=edge_feat.detach(),
+        #             current_time=ts.detach(),
+        #             node_features=self.node_raw_features.detach() if self.node_raw_features is not None else None
+        #         )
                 
-                all_nodes = torch.unique(torch.cat([src, dst]))
-                self.sam_module.reset_prototypes_if_needed(all_nodes)
+        #         all_nodes = torch.unique(torch.cat([src, dst]))
+        #         self.sam_module.reset_prototypes_if_needed(all_nodes)
+        pass
 
-    def configure_optimizers(self):
-        # CRITICAL FIX: Ensure weight_decay is float
-        weight_decay = self.hparams.weight_decay
+    def configure_optimizers(self):        
+        logger.debug(f"self.hparams type: {type(self.hparams)}")
+        logger.debug(f"self.hparams keys: {list(self.hparams.keys()) if hasattr(self.hparams, 'keys') else 'N/A'}")
+        logger.debug(f"self.config type: {type(self.config)}")
+        logger.debug(f"self.config keys: {[k for k in dir(self.config) if not k.startswith('_')][:10]}")
+        
+        # Try accessing warmup_epochs
+        try:
+            we = self.hparams.warmup_epochs
+            logger.debug(f"self.hparams.warmup_epochs = {we}")
+        except AttributeError as e:
+            logger.error(f"❌ self.hparams.warmup_epochs failed: {e}")
+        
+        try:
+            we = self.config.warmup_epochs
+            logger.debug(f"✓ self.config.warmup_epochs = {we}")
+        except AttributeError as e:
+            logger.error(f"❌ self.config.warmup_epochs failed: {e}")
+        
+        
+        
+        
+        weight_decay = self.config.weight_decay
         if isinstance(weight_decay, str):
             weight_decay = float(weight_decay)
             
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=self.hparams.learning_rate,
+            lr=self.config.learning_rate,
             weight_decay=weight_decay
         )
         
@@ -765,8 +937,8 @@ class HiCoSTv3(L.LightningModule):
             optimizer,
             num_epochs=self.trainer.max_epochs,
             steps_per_epoch=steps_per_epoch,
-            warmup_epochs=self.hparams.warmup_epochs,
-            min_lr_ratio=self.hparams.min_lr_ratio
+            warmup_epochs=self.config.warmup_epochs,
+            min_lr_ratio=self.config.min_lr_ratio
         )
         
         return {
@@ -819,35 +991,82 @@ class HiCoSTv3(L.LightningModule):
         return {"loss": loss, **metrics}
     
     def on_validation_epoch_start(self):
-        if hasattr(self, 'training') and self.training:
-            self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
-            if self.use_st_ode and hasattr(self, 'st_ode') and self.st_ode is not None:
-                if hasattr(self.st_ode, 'node_states'):
-                    self._stode_val_backup = self.st_ode.node_states.clone().detach()
-                else:
-                    self._stode_val_backup = None
+        """Safely backup memory states before validation."""
+        # if hasattr(self, 'training') and self.training:
+        #     self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
+        #     if self.use_st_ode and hasattr(self, 'st_ode') and self.st_ode is not None:
+        #         if hasattr(self.st_ode, 'node_states'):
+        #             self._stode_val_backup = self.st_ode.node_states.clone().detach()
+        #         else:
+        #             self._stode_val_backup = None
+        # else:
+        #     self._sam_val_backup = None
+        #     self._stode_val_backup = None
+        if self.training and hasattr(self, 'sam_module') and self.sam_module is not None:
+            raw_mem = getattr(self.sam_module, 'raw_memory', None)
+            if raw_mem is not None:
+                try:
+                    self._sam_val_backup = raw_mem.clone().detach()
+                except (AttributeError, RuntimeError) as e:
+                    logger.warning(f"Could not backup SAM memory: {e}")
+                    self._sam_val_backup = None
+            else:
+                self._sam_val_backup = None
         else:
             self._sam_val_backup = None
+        
+        # Backup ST-ODE states if enabled
+        if (self.use_st_ode and 
+            hasattr(self, 'st_ode') and self.st_ode is not None):
+            node_states = getattr(self.st_ode, 'node_states', None)
+            if node_states is not None:
+                try:
+                    self._stode_val_backup = node_states.clone().detach()
+                except (AttributeError, RuntimeError) as e:
+                    logger.warning(f"Could not backup ST-ODE states: {e}")
+                    self._stode_val_backup = None
+            else:
+                self._stode_val_backup = None
+        else:
             self._stode_val_backup = None
     
     def on_validation_epoch_end(self):
-        if hasattr(self, '_sam_val_backup') and self._sam_val_backup is not None:
-            self.sam_module.raw_memory.data.copy_(self._sam_val_backup)
+        """Safely restore memory states after validation."""
+        # Restore SAM memory
+        with torch.no_grad():
+            
+            if hasattr(self, '_sam_val_backup') and self._sam_val_backup is not None:
+                if hasattr(self, 'sam_module') and self.sam_module is not None:
+                    raw_mem = getattr(self.sam_module, 'raw_memory', None)
+                    if raw_mem is not None and hasattr(raw_mem, 'data') and raw_mem.data is not None:
+                        try:
+                            raw_mem.data.copy_(self._sam_val_backup)
+                        except (AttributeError, RuntimeError) as e:
+                            logger.warning(f"Could not restore SAM memory: {e}")
+            
+            # Restore ST-ODE states
+            if (self.use_st_ode and 
+                hasattr(self, '_stode_val_backup') and self._stode_val_backup is not None and
+                hasattr(self, 'st_ode') and self.st_ode is not None):
+                node_states = getattr(self.st_ode, 'node_states', None)
+                if node_states is not None and hasattr(node_states, 'data') and node_states.data is not None:
+                    try:
+                        node_states.data.copy_(self._stode_val_backup)
+                    except (AttributeError, RuntimeError) as e:
+                        logger.warning(f"Could not restore ST-ODE states: {e}")
         
-        if (self.use_st_ode and 
-            hasattr(self, '_stode_val_backup') and 
-            self._stode_val_backup is not None and 
-            hasattr(self, 'st_ode') and 
-            self.st_ode is not None and
-            hasattr(self.st_ode, 'node_states')):
-            self.st_ode.node_states.data.copy_(self._stode_val_backup)
-        
-        if hasattr(self, '_sam_val_backup'):
-            delattr(self, '_sam_val_backup')
-        
-        if hasattr(self, '_stode_val_backup'):
-            delattr(self, '_stode_val_backup')
+        # Clean up backup attributes (outside no_grad is fine)
+        for attr in ['_sam_val_backup', '_stode_val_backup']:
+            if hasattr(self, attr):
+                delattr(self, attr)
 
     def on_test_epoch_end(self):
         if hasattr(self, 'test_step_outputs'):
             self.test_step_outputs.clear()
+
+    def _ensure_dim(self, tensor, expected_dim, name):
+        if tensor.size(-1) != expected_dim:
+            logger.warning(f"{name} has wrong dim: {tensor.size(-1)}, expected {expected_dim}")
+            # Project using mem_to_hidden
+            return self.mem_to_hidden(tensor)
+        return tensor

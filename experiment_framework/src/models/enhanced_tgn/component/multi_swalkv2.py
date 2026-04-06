@@ -9,14 +9,11 @@ from .time_encoder import TimeEncoder
 
 class MultiScaleWalkSampler(nn.Module):
     """
-    Enhanced Multi-scale temporal walk sampler with:
-    - Temporal bias sampling 
-    - TAWR walks with learnable restart probabilities
-    - Vectorized GPU sampling for efficiency
-    - Walk anonymization for privacy
-    - Dynamic temporal noise injection
-    - Temporal masking for augmentation
-    - Adaptive walk lengths based on time gaps
+    Multi-scale temporal walk sampler for HiCoST.
+    TAWR walks with learnable restart
+    Temporal bias (exp decay)
+     Adaptive lengths: longer walks for older timestamps
+    Node ID remapping for reproducible walk generation.
     """    
     def __init__(
             self,
@@ -70,6 +67,13 @@ class MultiScaleWalkSampler(nn.Module):
         self.register_buffer('global_min_time', torch.tensor(0.0))
         self.register_buffer('global_max_time', torch.tensor(0.0))
 
+        # check attributes exist 
+        required_attrs = ['temperature', 'safe_temperature', 'time_noise_std', 'mask_prob']
+        for attr in required_attrs:
+            assert hasattr(self, attr), f"MultiScaleWalkSampler.__init__ must set self.{attr}"
+        
+        logger.debug(f"MultiScaleWalkSampler initialized: temperature={self.temperature}")
+
     def _get_device(self) -> torch.device:
         for buf in self.buffers():
             return buf.device
@@ -108,8 +112,8 @@ class MultiScaleWalkSampler(nn.Module):
         self._dense_tables_built = False
 
         if edge_time.numel() > 0:
-            self.global_min_time.fill_(edge_time.min().item())
-            self.global_max_time.fill_(edge_time.max().item())
+            self.global_min_time = self.global_min_time.new_full((1,), edge_time.min().item())
+            self.global_max_time = self.global_max_time.new_full((1,), edge_time.max().item())
 
         for attr in ['dense_neighbor_ids', 'dense_neighbor_times', 'dense_neighbor_counts']:
             if hasattr(self, attr):
@@ -143,7 +147,7 @@ class MultiScaleWalkSampler(nn.Module):
         for buf in module.buffers():
             if buf.device != target_device:
                 return module.to(target_device)
-        for param in self.parameters():
+        for param in module.parameters():
             if param.device != target_device:
                 return module.to(target_device)
         return module
@@ -159,7 +163,9 @@ class MultiScaleWalkSampler(nn.Module):
         
         device = memory_state.device
         node_idx = torch.clamp(torch.tensor(node, device=device), 0, memory_state.size(0) - 1)
-        self.time_encoder = self._ensure_module_device(self.time_encoder, device)
+        # self.time_encoder = self._ensure_module_device(self.time_encoder, device)
+        if self.time_encoder.device != device:
+            self.time_encoder = self.time_encoder.to(device)
 
         time_tensor = torch.tensor([current_time], device=device, dtype=torch.float32)
         time_enc = self.time_encoder(time_tensor)
@@ -207,9 +213,10 @@ class MultiScaleWalkSampler(nn.Module):
             self.register_buffer('dense_neighbor_times', neighbor_times, persistent=False)
             self.register_buffer('dense_neighbor_counts', neighbor_counts, persistent=False)
         else:
-            self.dense_neighbor_ids.copy_(neighbor_ids)
-            self.dense_neighbor_times.copy_(neighbor_times)
-            self.dense_neighbor_counts.copy_(neighbor_counts)
+            with torch.no_grad():
+                self.dense_neighbor_ids.copy_(neighbor_ids)
+                self.dense_neighbor_times.copy_(neighbor_times)
+                self.dense_neighbor_counts.copy_(neighbor_counts)
         
         self._dense_tables_built = True
         logger.info(f"Built dense neighbor table: max_degree={max_degree}")
@@ -291,7 +298,8 @@ class MultiScaleWalkSampler(nn.Module):
         if not hasattr(self, 'dense_neighbor_ids'):
             self.build_dense_neighbor_table()
         
-        safe_temp = max(self.temperature, 1e-6)
+        # safe_temp = max(self.temperature, 1e-6)
+        safe_temp = self.temperature
         max_deg = self.dense_neighbor_ids.size(1)
         eps = 1e-8
 
@@ -435,7 +443,7 @@ class MultiScaleWalkSampler(nn.Module):
         if not hasattr(self, 'dense_neighbor_ids'):
             self.build_dense_neighbor_table()
         
-        safe_temp = max(self.temperature, 1e-6)
+        safe_temp = self.temperature
         max_deg = self.dense_neighbor_ids.size(1)
         eps = 1e-8
 

@@ -314,8 +314,10 @@ class TemporalCooccurrenceMatrix(nn.Module):
             
             try:
                 contrib = torch.bincount(flat_idx, weights=weights, minlength=W*W)
-            except RuntimeError:
-                continue
+            except RuntimeError as e:
+                logger.error(f"bincount failed for batch {b}: {e}")
+                logger.error(f"flat_idx range: [{flat_idx.min()}, {flat_idx.max()}], expected < {W*W}")
+                raise
                 
             cooccurrence[b] += contrib.view(W, W).nan_to_num(nan=0.0)
         
@@ -500,8 +502,11 @@ class StabilizedHCT(nn.Module):
         scores = self.pooling(all_walks).squeeze(-1)
         all_masked = (all_masks == 0).all(dim=-1)
         
-        scores = scores.masked_fill(all_masks == 0, -1e4)
-        weights = F.softmax(scores, dim=-1)
+        scores_for_softmax = scores.clone()
+        scores_for_softmax = scores_for_softmax.masked_fill(all_masks == 0, -1e4)
+
+        weights = F.softmax(scores_for_softmax, dim=-1)
+        
         
         if all_masked.any():
             weights = weights.clone()
