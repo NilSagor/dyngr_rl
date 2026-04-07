@@ -620,3 +620,94 @@ model:
 Your implementation is **robust and scientifically sound**. The sensitivity analyzer successfully identified a sub-optimal default configuration and discovered a superior hyperparameter set (**TAWR Heavy**) that pushes your model closer to the **90% AP** goal.
 
 **Immediate Action:** Update your base config to the **TAWR Heavy** distribution and run a full training sweep to confirm the final Test AP.
+
+Based on your sensitivity results showing **tawr_heavy (0.807 AP)** and **balanced (0.801 AP)** as top performers, here's my recommendation:
+
+---
+
+## ✅ Yes, Update Base Config with Best Settings
+
+After sensitivity analysis identifies optimal hyperparameters, you should **update your base model config** to use these defaults. This ensures:
+
+| Benefit | Explanation |
+|---------|-------------|
+| **Reproducibility** | Future runs use validated best settings |
+| **Clean baselines** | Comparison models start from optimal point |
+| **Efficiency** | No need to re-tune for every experiment |
+
+---
+
+## What to Update in `hicost_config.v2.yaml`
+
+Based on your walk_distribution results:
+
+```yaml
+# hicost_config.v2.yaml - UPDATED with sensitivity findings
+
+model:
+  # Walk distribution: tawr_heavy performed best (0.807 AP)
+  # Option A: Use tawr_heavy as default
+  num_walks_short: 3
+  num_walks_long: 2
+  num_walks_tawr: 10
+  
+  # Option B: Use balanced as default (more intuitive, nearly as good: 0.801 AP)
+  # num_walks_short: 5
+  # num_walks_long: 5
+  # num_walks_tawr: 5
+  
+  # Also update other sensitivity-optimized params:
+  batch_size: 256          # If batch_size study confirmed 256 is best
+  learning_rate: 0.0001    # If LR study confirmed this
+  max_epochs: 50           # Keep full training for production
+  patience: 10             # Keep full patience for production
+```
+
+---
+
+## Should You Re-Run the Base Model?
+
+| Scenario | Action | Rationale |
+|----------|--------|-----------|
+| **Final paper results** | ✅ **Yes, re-run** | Ensure all numbers use consistent optimal settings |
+| **Just sensitivity validation** | ❌ No need | You already validated tawr_heavy/balanced with multiple seeds |
+| **Comparing to prior work** | ✅ **Yes, re-run** | Fair comparison requires your best config |
+| **Ablation studies** | ✅ **Yes, re-run** | Ablations should start from optimal point |
+
+---
+
+## Recommended Workflow
+
+```bash
+# Step 1: Update base config with sensitivity findings
+# (Edit hicost_config.v2.yaml with best walk distribution)
+
+# Step 2: Run full training with optimal settings
+python main_experiment.py --config hicost_config.v2.yaml --dataset wikipedia --seeds 42 43 44
+
+# Step 3: Validate on other datasets (Reddit, Enron) with same config
+python main_experiment.py --config hicost_config.v2.yaml --dataset reddit --seeds 42
+python main_experiment.py --config hicost_config.v2.yaml --dataset enron --seeds 42
+```
+
+---
+
+## Critical: Document the Update
+
+In your paper/methodology section:
+
+> "Based on sensitivity analysis (Section X), we identified tawr_heavy walk distribution (short=3, long=2, tawr=10) as optimal, achieving 0.807 ± 0.012 Test AP versus 0.686 for short-dominant. We updated our base configuration with these parameters for all subsequent experiments."
+
+---
+
+## Summary Table: What to Change
+
+| Parameter | Old Default | Sensitivity Best | New Default |
+|-----------|-------------|------------------|-------------|
+| `num_walks_short` | 5 | 3 (tawr_heavy) | **3** |
+| `num_walks_long` | 5 | 2 (tawr_heavy) | **2** |
+| `num_walks_tawr` | 5 | 10 (tawr_heavy) | **10** |
+| `max_epochs` | 50 | 25 (sensitivity) | **50** (keep full) |
+| `patience` | 10 | 5 (sensitivity) | **10** (keep full) |
+
+**Bottom line**: Update base config with walk distribution findings, keep full training settings for production runs, and re-run final experiments for publication.

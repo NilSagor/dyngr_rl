@@ -1,4 +1,4 @@
-# Dynamic Graph Representation Learning
+# HiCoST: Hierarchical Co-occurrence Spatio-Temporal Network
 
 <!-- python experiment_framework/src/experiments/train.py --config experiment_framework/configs/dygformer_config.yaml -->
 

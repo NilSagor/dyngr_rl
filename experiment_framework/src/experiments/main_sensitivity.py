@@ -28,24 +28,18 @@ def _get_nested_param(config: dict, path: str):
         curr = curr[k]
     return curr
 
-def get_top_configs_from_results(results_path: Path, study_name: str, metric: str = 'test_ap', top_k: int = 2):
-    """
-    Automatically select top-k configs from previous results.
-    For explicit config studies, param_name IS the config name.
-    """
+def get_top_configs_from_results(results_path: Path, study_name: str, metric: str = 'test_ap', top_k: int = 2):    
     if not results_path.exists():
         logger.warning(f"No existing results found at {results_path}")
         return None
     
     df = pd.read_csv(results_path)
     
-    # DEBUG: Show what we have
+    # checking csv 
     logger.info(f"CSV columns: {df.columns.tolist()}")
     logger.info(f"Total rows: {len(df)}")
     logger.info(f"Unique configs: {df['param_name'].unique().tolist()}")
-    
-    # For explicit config studies, param_name contains the config name directly
-    # Filter successful runs (no error or error is NaN/empty)
+        
     study_df = df.copy()
     
     if 'error' in study_df.columns:
