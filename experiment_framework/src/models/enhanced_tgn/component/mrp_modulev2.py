@@ -110,10 +110,12 @@ class GatedMutualRefinementPooling(nn.Module):
         # CRITICAL: Clone ALL inputs to break any view relationships
         src_hct = src_hct.clone()
         dst_hct = dst_hct.clone()
-        src_sam = src_hct.clone() if src_sam is None else src_sam.clone()
-        dst_sam = dst_hct.clone() if dst_sam is None else dst_sam.clone()
-        src_stode = src_hct.clone() if src_stode is None else src_stode.clone()
-        dst_stode = dst_hct.clone() if dst_stode is None else dst_stode.clone()
+        src_sam = src_sam.clone() if src_sam is not None else src_hct
+        dst_sam = dst_sam.clone() if dst_sam is not None else dst_hct
+        src_stode = src_stode.clone() if src_stode is not None else src_hct
+        dst_stode = dst_stode.clone() if dst_stode is not None else dst_hct
+        src_per_type = src_per_type.clone() if src_per_type is not None else None
+        dst_per_type = dst_per_type.clone() if dst_per_type is not None else None
 
         intermediates = {} 
 
