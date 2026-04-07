@@ -75,7 +75,7 @@ class DropPath(nn.Module):
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
+        random_tensor =random_tensor.floor()
         output = x.div(keep_prob) * random_tensor
         return output
 
@@ -183,7 +183,7 @@ class CausalIntraWalkEncoder(nn.Module):
         full_mask = causal_expanded | pad_mask_2d
         
         attn_bias = torch.zeros_like(full_mask, dtype=torch.float)
-        attn_bias.masked_fill_(full_mask, -1e9)
+        attn_bias = attn_bias.masked_fill(full_mask, -1e9)
         
         x = self.pos_encoder(x)
         x = self.dropout(x)
@@ -502,15 +502,15 @@ class StabilizedHCT(nn.Module):
         scores = self.pooling(all_walks).squeeze(-1)
         all_masked = (all_masks == 0).all(dim=-1)
         
-        scores_for_softmax = scores.clone()
-        scores_for_softmax = scores_for_softmax.masked_fill(all_masks == 0, -1e4)
+        # scores_for_softmax = scores.clone()
+        scores_for_softmax = scores.masked_fill(all_masks == 0, -1e4)
 
         weights = F.softmax(scores_for_softmax, dim=-1)
         
         
         if all_masked.any():
-            weights = weights.clone()
-            weights[all_masked] = 1.0 / total_walks
+            uniform_weights = torch.full_like(weights, 1.0 / total_walks)
+            weights = torch.where(all_masked.unsqueeze(-1), uniform_weights, weights)
             
         weights = weights.unsqueeze(-1)
         

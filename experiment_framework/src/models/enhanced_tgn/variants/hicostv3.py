@@ -253,8 +253,8 @@ class HiCoSTv3(L.LightningModule):
     def _get_hct_embeddings(self, walk_data: Dict, node_memory: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         device = node_memory.device
         
-        if self.hct is None:
-            # Simple pooling logic for ablation
+        if self.hct is None or not self.use_hct_hierarchical:
+             # === Simple pooling for ablation mode ===
             all_nodes = torch.cat([walk_data['source']['short']['nodes'], walk_data['target']['short']['nodes']], dim=0)
             all_masks = torch.cat([walk_data['source']['short']['masks'], walk_data['target']['short']['masks']], dim=0)
             
@@ -269,13 +269,42 @@ class HiCoSTv3(L.LightningModule):
             src_simple = w_sum[:batch_size]
             dst_simple = w_sum[batch_size:]
             
-            # CRITICAL FIX: Project to hidden_dim if memory_dim != hidden_dim
+            # Project to hidden_dim if needed
             if src_simple.size(-1) != self.hidden_dim:
-                # Create projection on the fly or use mem_to_hidden
                 src_simple = self.mem_to_hidden(src_simple)
                 dst_simple = self.mem_to_hidden(dst_simple)
             
             return src_simple, dst_simple, walk_data
+        # === Full HCT hierarchical mode ===
+        types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
+        combined_walks = {}
+        
+        for wt in types:
+            if wt not in walk_data['source']: 
+                continue
+            combined_walks[wt] = {
+                'nodes': torch.cat([walk_data['source'][wt]['nodes'], walk_data['target'][wt]['nodes']], dim=0),
+                'nodes_anon': torch.cat([walk_data['source'][wt]['nodes_anon'], walk_data['target'][wt]['nodes_anon']], dim=0),
+                'masks': torch.cat([walk_data['source'][wt]['masks'], walk_data['target'][wt]['masks']], dim=0),
+                'times': torch.cat([walk_data['source'][wt]['times'], walk_data['target'][wt]['times']], dim=0)
+            }
+            if 'restart_flags' in walk_data['source'][wt]:
+                combined_walks[wt]['restart_flags'] = torch.cat([
+                    walk_data['source'][wt]['restart_flags'],
+                    walk_data['target'][wt]['restart_flags']
+                ], dim=0)
+        
+        hct_out = self.hct(
+            walks_dict=combined_walks,
+            node_memory=node_memory,
+            return_all=False
+        )
+        hct_out = self.hct_proj(hct_out)
+        
+        src_hct = hct_out[:batch_size]
+        dst_hct = hct_out[batch_size:]
+        
+        return src_hct, dst_hct, combined_walks
     
     # def _get_hct_embeddings(self, walk_data: Dict, node_memory: torch.Tensor, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
     #     device = node_memory.device
@@ -336,8 +365,8 @@ class HiCoSTv3(L.LightningModule):
         device = src_nodes.device
         batch_size = src_nodes.size(0)
         
-        logger.debug("[CTE-1] Getting current memory")
-        # CRITICAL: Deep clone with no gradient connection to buffer
+        # logger.debug("[CTE-1] Getting current memory")
+        
         with torch.no_grad():
             current_memory_snapshot = self.sam_module.raw_memory.clone()
         
@@ -349,7 +378,7 @@ class HiCoSTv3(L.LightningModule):
             raise RuntimeError(f"Timestamps ({ts_tensor.size(0)}) do not match nodes ({batch_size})")
         
         # 2. Sample Multi-Scale Walks
-        logger.debug("[CTE-2] Sampling walks")
+        # logger.debug("[CTE-2] Sampling walks")
         walk_data = self.walk_sampler(
             source_nodes=src_tensor,
             target_nodes=dst_tensor,
@@ -360,13 +389,14 @@ class HiCoSTv3(L.LightningModule):
         )
         
         # 3. Encode Walks (HCT)
-        logger.debug("[CTE-3] Encoding walks (HCT)")
-        src_hct, dst_hct, combined_walks = self._get_hct_embeddings(
-            walk_data, current_memory_snapshot, batch_size
-        )
+        # logger.debug("[CTE-3] Encoding walks (HCT)")
+        with torch.autograd.set_detect_anomaly(True):
+            src_hct, dst_hct, combined_walks = self._get_hct_embeddings(
+                walk_data, current_memory_snapshot, batch_size
+            )
         
         # 4. ST-ODE Memory Evolution (COMPLETELY DETACHED)
-        logger.debug("[CTE-4] ST-ODE evolution")
+        # logger.debug("[CTE-4] ST-ODE evolution")
         
         # Default: use snapshot (no ST-ODE update)
         src_memory_out = current_memory_snapshot[src_nodes].clone()
@@ -428,7 +458,7 @@ class HiCoSTv3(L.LightningModule):
                         torch.cuda.empty_cache()
         
         # 5. Prepare embeddings for refiner
-        logger.debug("[CTE-5] Projecting to hidden_dim")
+        # logger.debug("[CTE-5] Projecting to hidden_dim")
         
         # These are all fresh clones, no view relationships
         src_sam = src_memory_out.clone()
@@ -451,7 +481,7 @@ class HiCoSTv3(L.LightningModule):
         )
         
         # 6. Gated Mutual Refinement
-        logger.debug("[CTE-6] Calling refiner")
+        # logger.debug("[CTE-6] Calling refiner")
         if self.use_gated_refinement:
             final_src, final_dst, _ = self.refiner(
                 src_hct=src_hct.clone(),         
@@ -815,7 +845,7 @@ class HiCoSTv3(L.LightningModule):
                 projected = self.mem_to_hidden(flat)
                 pooled_embeds = projected.view(B, T, W, -1)
             
-            # CRITICAL: Clone to ensure no shared memory
+            # Clone to ensure no shared memory
             return pooled_embeds.clone(), mask_stack.clone()
         else:
             return None, None
@@ -992,16 +1022,7 @@ class HiCoSTv3(L.LightningModule):
     
     def on_validation_epoch_start(self):
         """Safely backup memory states before validation."""
-        # if hasattr(self, 'training') and self.training:
-        #     self._sam_val_backup = self.sam_module.raw_memory.clone().detach()
-        #     if self.use_st_ode and hasattr(self, 'st_ode') and self.st_ode is not None:
-        #         if hasattr(self.st_ode, 'node_states'):
-        #             self._stode_val_backup = self.st_ode.node_states.clone().detach()
-        #         else:
-        #             self._stode_val_backup = None
-        # else:
-        #     self._sam_val_backup = None
-        #     self._stode_val_backup = None
+       
         if self.training and hasattr(self, 'sam_module') and self.sam_module is not None:
             raw_mem = getattr(self.sam_module, 'raw_memory', None)
             if raw_mem is not None:
