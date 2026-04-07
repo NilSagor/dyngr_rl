@@ -907,28 +907,9 @@ class HiCoSTv3(L.LightningModule):
         #         self.sam_module.reset_prototypes_if_needed(all_nodes)
         pass
 
-    def configure_optimizers(self):        
-        logger.debug(f"self.hparams type: {type(self.hparams)}")
-        logger.debug(f"self.hparams keys: {list(self.hparams.keys()) if hasattr(self.hparams, 'keys') else 'N/A'}")
-        logger.debug(f"self.config type: {type(self.config)}")
-        logger.debug(f"self.config keys: {[k for k in dir(self.config) if not k.startswith('_')][:10]}")
+    def configure_optimizers(self):       
         
-        # Try accessing warmup_epochs
-        try:
-            we = self.hparams.warmup_epochs
-            logger.debug(f"self.hparams.warmup_epochs = {we}")
-        except AttributeError as e:
-            logger.error(f"❌ self.hparams.warmup_epochs failed: {e}")
-        
-        try:
-            we = self.config.warmup_epochs
-            logger.debug(f"✓ self.config.warmup_epochs = {we}")
-        except AttributeError as e:
-            logger.error(f"❌ self.config.warmup_epochs failed: {e}")
-        
-        
-        
-        
+       
         weight_decay = self.config.weight_decay
         if isinstance(weight_decay, str):
             weight_decay = float(weight_decay)

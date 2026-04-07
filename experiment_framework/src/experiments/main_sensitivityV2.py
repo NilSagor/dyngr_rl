@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 from pathlib import Path
 from loguru import logger
-
+import torch 
 
 # Add project root
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -14,6 +14,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from src.experiments.sensitivity_analyzerV2 import SensitivityAnalyzerV2
+
+
+torch.backends.cuda.enable_flash_sdp(True)      # Flash Attention
+torch.backends.cuda.enable_mem_efficient_sdp(True)  # Memory Efficient Attention
+torch.backends.cuda.enable_math_sdp(True)         # Fallback
+
+# Prefer memory efficient for variable length sequences
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def load_config(path: str) -> dict:

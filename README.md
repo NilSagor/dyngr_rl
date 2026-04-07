@@ -19,28 +19,30 @@ Quick Debug run
 
 
 # Run only specific configs from walk_distribution
-python main_sensitivity.py --config configs/sensitivity_config.yaml --study walk_distribution --seeds 42 43 44 --filter balanced tawr_heavy
+
 
 # Run only the short_heavy config
-python main_sensitivity.py --config configs/sensitivity_config.yaml --study walk_distribution --seeds 42 --filter short_heavy
+
 
 # Run all configs (no filter)
-python main_sensitivity.py --config configs/sensitivity_config.yaml --study walk_distribution --seeds 42 43 44
+python experiment_framework/src/experiments/main_sensitivityV2.py --config experiment_framework/configs/sensitivity_config.yaml --study walk_distribution --seeds 42 43 44
 
 # Filter works with partial matches (case-insensitive)
-python main_sensitivity.py --config configs/sensitivity_config.yaml --study walk_distribution --filter balanced  # Matches "balanced_v2" too
+python experiment_framework/src/experiments/main_sensitivityV2.py --config experiment_framework/configs/sensitivity_config.yaml --study walk_distribution --filter balanced  # Matches "balanced_v2" too
 
 # Auto-select top 2 configs (will pick: tawr_heavy, balanced)
-python main_sensitivity.py --config configs/sensitivity_config.yaml \
+python experiment_framework/src/experiments/main_sensitivityV2.py --config experiment_framework/configs/sensitivity_config.yaml \
   --study walk_distribution \
   --top-k 2 \
   --seeds 42 43 44 45 46
 
 # Or manually specify
-python main_sensitivity.py --config configs/sensitivity_config.yaml \
+python experiment_framework/src/experiments/main_sensitivityV2.py --config experiment_framework/configs/sensitivity_config.yaml \
   --study walk_distribution \
   --filter balanced tawr_heavy \
   --seeds 42 43 44 45 46
+
+python experiment_framework/src/experiments/main_sensitivityV2.py --config experiment_framework/configs/sensitivity_config.yaml --study memory_dim   --seeds 42 --filter 64
 
 
 # PHASE 1: Transductive baseline (2 strategies × 10 datasets × 3 seeds = 60 runs)
