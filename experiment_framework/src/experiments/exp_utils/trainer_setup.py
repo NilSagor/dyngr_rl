@@ -86,7 +86,7 @@ class TrainerSetup:
             devices=devices,
             callbacks=all_callbacks,
             logger=loggers,
-            precision=config['experiment']['precision'],
+            precision=config['experiment']['precision'],            
             gradient_clip_val=config['training']['gradient_clip_val'],
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
