@@ -4,10 +4,11 @@
 model:
   name: "HiCoSTv3"
   # Base dimensions 
-  hidden_dim: 256
-  memory_dim: 256
-  time_dim: 256
-  hct_d_model: 256
+  hidden_dim: 128 # 256
+  memory_dim: 64 # 256 
+  time_dim: 64 # 256
+  hct_d_model: 128 # 256
+  walk_sampler: {}
 
   # Defaults for other params 
   dropout: 0.3
@@ -29,7 +30,7 @@ model:
   # === ABLATION 
   # True = Use advanced feature (full model)
   # False = Use simple baseline (ablation mode)
-  use_prototype_attention: True     # True = 8 prototypes, False = 1 prototype
+  use_prototype_attention: True   # True = 8 prototypes, False = 1 prototype
   use_hct_hierarchical: True         # True = full HCT, False = simple pooling
   use_gated_refinement: True        # True = gated refiner, False = concat+linear
   use_multi_scale_walks: True       # True = short/long/TAWR, False = single scale
@@ -51,6 +52,7 @@ training:
   warmup_epochs: 0.1
   min_lr_ratio: 0.01
   continuous_time: True
+  accumulate_grad_batches: 4
 
 # Data parameters
 data:
@@ -67,9 +69,11 @@ data:
 
 
 experiment:
+  name: "sensitivity_default"  
   seed: 42
   device: "auto"
   precision: 32
+  # precision: "16-mixed" 
 
 # Logging
 logging:
@@ -140,10 +144,22 @@ sensitivity_studies:
     parameter: "model.memory_dim"
     values: [64, 128, 256, 512]
     fixed_overrides:
-      64: { hidden_dim: 64, time_dim: 64, hct_d_model: 64 }
-      128: { hidden_dim: 128, time_dim: 128, hct_d_model: 128 }
-      256: { hidden_dim: 256, time_dim: 256, hct_d_model: 256 }
-      512: { hidden_dim: 512, time_dim: 512, hct_d_model: 512 }
+      64:
+        hidden_dim: 64
+        time_dim: 64
+        hct_d_model: 64
+      128:
+        hidden_dim: 128
+        time_dim: 128
+        hct_d_model: 128
+      256:
+        hidden_dim: 256
+        time_dim: 256
+        hct_d_model: 256
+      512:
+        hidden_dim: 512
+        time_dim: 512
+        hct_d_model: 512
   
   # === 6. SAM Prototypes (Ablation Flag)
   use_prototype_attention:

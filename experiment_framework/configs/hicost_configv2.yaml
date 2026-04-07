@@ -30,9 +30,12 @@ model:
   walk_length_short: 5           # was 3/5
   walk_length_long: 15            # was 8/10/15
   walk_length_tawr: 10            # was 6/10
-  num_walks_short: 5              # was 5
-  num_walks_long: 5               # was 3
-  num_walks_tawr: 5               # was 3
+  num_walks_short: 3              # was 5 tawr_heavy ap: 0.807
+  num_walks_long: 2               # was 3
+  num_walks_tawr: 10               # was 3
+  # num_walks_short: 5              # was 5 balaned ap: 0.801
+  # num_walks_long: 5               # was 3
+  # num_walks_tawr: 5               # was 3
   walk_temperature: 0.1
   walk_time_noise_std: 0.05   # Enable temporal noise
   walk_mask_prob: 0.05        # Enable masking augmentation
