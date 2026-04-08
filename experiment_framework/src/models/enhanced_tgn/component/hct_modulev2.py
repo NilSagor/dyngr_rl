@@ -27,8 +27,8 @@ def _sanitize_node_indices(nodes: torch.Tensor, max_nodes: int) -> torch.Tensor:
     nodes = torch.where(torch.isfinite(nodes.float()), nodes, torch.zeros_like(nodes).long())
     return nodes.long()
 
+
 class SpectralLinear(nn.Linear):
-    """Linear layer with Spectral Normalization for gradient stability."""
     def __init__(self, in_features, out_features, bias=True, n_power_iterations=1, eps=1e-12):
         super().__init__(in_features, out_features, bias=bias)
         self.n_power_iterations = n_power_iterations
@@ -36,32 +36,58 @@ class SpectralLinear(nn.Linear):
         if self.weight.dim() > 1:
             nn.init.xavier_uniform_(self.weight, gain=0.1)
             self.register_buffer('weight_u', torch.empty(out_features).normal_(0, 0.02))
-            self._update_weight_u()
-
-    def _update_weight_u(self):
-        if not hasattr(self, 'weight_u'): 
-            return
-        with torch.no_grad():
-            weight = self.weight.detach()
-            u = self.weight_u.detach()
-            for _ in range(self.n_power_iterations):
-                v = torch.mv(weight.t(), u)
-                v = F.normalize(v, dim=-1, eps=self.eps)
-                u = torch.mv(weight, v)
-                u = F.normalize(u, dim=-1, eps=self.eps)
-            self.weight_u.copy_(u)
 
     def forward(self, input):
-        if self.training and hasattr(self, 'weight_u'):
+        if self.training and hasattr(self, 'weight_u'):            
+            u = self.weight_u.detach()
             with torch.no_grad():
-                self._update_weight_u()
-            u = self.weight_u
-            v = torch.mv(self.weight.t(), u)
-            v = F.normalize(v, dim=-1, eps=self.eps)
-            sigma = torch.dot(u, torch.mv(self.weight, v))
+                for _ in range(self.n_power_iterations):
+                    v = torch.mv(self.weight.t(), u)
+                    v = F.normalize(v, dim=-1, eps=self.eps)
+                    u = torch.mv(self.weight, v)
+                    u = F.normalize(u, dim=-1, eps=self.eps)
+                sigma = torch.dot(u, torch.mv(self.weight, v))            
+            self.weight_u.copy_(u)           
             weight_norm = self.weight / (sigma + self.eps)
             return F.linear(input, weight_norm, self.bias)
         return super().forward(input)
+
+## ==== cause In-place operator due to large graph
+# class SpectralLinear(nn.Linear):
+#     """Linear layer with Spectral Normalization for gradient stability."""
+#     def __init__(self, in_features, out_features, bias=True, n_power_iterations=1, eps=1e-12):
+#         super().__init__(in_features, out_features, bias=bias)
+#         self.n_power_iterations = n_power_iterations
+#         self.eps = eps
+#         if self.weight.dim() > 1:
+#             nn.init.xavier_uniform_(self.weight, gain=0.1)
+#             self.register_buffer('weight_u', torch.empty(out_features).normal_(0, 0.02))
+#             self._update_weight_u()
+
+#     def _update_weight_u(self):
+#         if not hasattr(self, 'weight_u'): 
+#             return
+#         with torch.no_grad():
+#             weight = self.weight.detach()
+#             u = self.weight_u.detach()
+#             for _ in range(self.n_power_iterations):
+#                 v = torch.mv(weight.t(), u)
+#                 v = F.normalize(v, dim=-1, eps=self.eps)
+#                 u = torch.mv(weight, v)
+#                 u = F.normalize(u, dim=-1, eps=self.eps)
+#             self.weight_u.copy_(u)
+
+#     def forward(self, input):
+#         if self.training and hasattr(self, 'weight_u'):
+#             with torch.no_grad():
+#                 self._update_weight_u()
+#             u = self.weight_u
+#             v = torch.mv(self.weight.t(), u)
+#             v = F.normalize(v, dim=-1, eps=self.eps)
+#             sigma = torch.dot(u, torch.mv(self.weight, v))
+#             weight_norm = self.weight / (sigma + self.eps)
+#             return F.linear(input, weight_norm, self.bias)
+#         return super().forward(input)
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample."""
