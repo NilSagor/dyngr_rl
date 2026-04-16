@@ -55,8 +55,8 @@ model:
   
   # === ST-ODE Parameters ===
   use_st_ode: True        # Set True if you have GPU memory
-  ode_method: 'rk4'       # rk4, ode_step_size: 2, dopri5 ode_step_size: 1, euler ode_step_size: 1.0
-  ode_step_size: 2.0
+  ode_method: 'euler'       # rk4, ode_step_size: 2, dopri5 ode_step_size: 1, euler ode_step_size: 1.0
+  ode_step_size: 1.0
   mu: 0.1
   adaptive_mu: True
   use_gru_ode: True
@@ -82,7 +82,7 @@ model:
 
 # Training parameters
 training:
-  batch_size: 128
+  batch_size: 256
   learning_rate: 0.0001      #  No quotes!
   weight_decay: 0.00001      #  No quotes!
   max_epochs: 50
