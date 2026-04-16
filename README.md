@@ -2,6 +2,9 @@
 
 <!-- python experiment_framework/src/experiments/train.py --config experiment_framework/configs/dygformer_config.yaml -->
 
+## Run HiCoST V3 training
+python experiment_framework/src/experiments/train_v4.py --config experiment_framework/configs/hicost_configv2.yaml  --seeds 42
+
 Quick Debug run
 
 ```bash
