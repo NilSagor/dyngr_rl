@@ -35,6 +35,7 @@ from src.experiments.exp_utils.model_factory import ModelFactory
 from src.experiments.exp_utils.experiment_logger import ExperimentLogger
 from src.experiments.exp_utils.trainer_setup import TrainerSetup
 from src.experiments.exp_utils.analysis_callback import AnalysisCollector
+from src.experiments.exp_utils.flops_calculator import FLOPsCalculator
 
 import torch
 torch.autograd.set_detect_anomaly(True)
@@ -218,16 +219,34 @@ def train_single_run(config: Dict) -> Dict[str, Any]:
     if model.walk_sampler:
         logger.info(f"Walk sampler has edge_index: {hasattr(model.walk_sampler, 'edge_index')}")
     logger.info(f"================================")
-                  
-                   
-                  
-                   
-                   
-                  
-       
+
+
+    # Calculate FLOPs with dummy input
+    if config['experiment'].get('debug', False):
+        dummy_batch = {
+            'src': torch.zeros(2, 128, dtype=torch.long),  # batch_size=128
+            'dst': torch.zeros(2, 128, dtype=torch.long),
+            'time': torch.zeros(128, dtype=torch.float),
+            'edge_attr': torch.zeros(128, 172),  # edge_features_dim
+            'n_id': torch.arange(128),
+            'src_ptr': torch.arange(129),  # For batched graphs
+            'dst_ptr': torch.arange(129),
+        }
         
-    
-    
+        # Move to GPU if available
+        if torch.cuda.is_available():
+            dummy_batch = {k: v.cuda() if isinstance(v, torch.Tensor) else v 
+                          for k, v in dummy_batch.items()}
+            model = model.cuda()
+            
+        stats = FLOPsCalculator.print_summary(model, dummy_batch)
+        
+        # Log to tensorboard
+        if hasattr(model, 'logger'):
+            model.logger.experiment.add_scalar('model/total_gflops', stats['total_gflops'], 0)
+            model.logger.experiment.add_scalar('model/total_params', 
+                sum(p.numel() for p in model.parameters()), 0)              
+
     
     # Create analysis collector to retrieve data after training
     analysis_collector = AnalysisCollector()
