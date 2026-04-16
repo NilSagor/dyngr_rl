@@ -8,7 +8,7 @@ model:
   memory_dim: 64 # 256 
   time_dim: 64 # 256
   hct_d_model: 64 # 256
-  walk_sampler: {}
+
 
   # Defaults for other params 
   dropout: 0.3
@@ -19,7 +19,7 @@ model:
   num_walks_short: 5
   num_walks_long: 5
   num_walks_tawr: 5
-  use_st_ode: False
+  use_st_ode: True
   ode_method: "rk4"
   ode_step_size: 2.0
   st_ode_update_interval: 10
@@ -95,84 +95,53 @@ hardware:
 
 
 sensitivity_studies:
-  
-  # === 1. ODE Solver Sensitivity (Method + Step Size Coupled) ===
-  ode_method_study:
-    parameter: "model.ode_method"
-    values: ["euler", "rk4", "dopri5"]
-    description: "Compare solvers with their optimal default step sizes"
-    fixed_overrides:
-      euler:
-        ode_step_size: 1.0
-        adjoint: false
-      rk4:
-        ode_step_size: 2.0
-        adjoint: true
-      dopri5:
-        ode_step_size: null  # Adaptive ignores this
-        adjoint: true
-  
-  # 2. ODE Existence (Ablation)
-  use_st_ode:
-    parameter: "model.use_st_ode"
-    values: [true, false]
-    description: "Measure impact of adding ST-ODE module"
-    fixed_overrides:
-      true:
-        st_ode_update_interval: 10
-      false:
-        # When disabled, interval doesn't matter, but good to set default
-        st_ode_update_interval: 10
-
-  # 3. ODE Update Frequency (Only when enabled)
-  st_ode_update_interval:
-    parameter: "model.st_ode_update_interval"
-    values: [1, 5, 10, 20, 50]
-    condition: "model.use_st_ode == true"
-    fixed_params:
-      ode_method: "rk4"
-      ode_step_size: 2.0
-
-  # 4. Batch Size + LR Scaling
+   
+  # === 1. Batch Size + LR Scaling
   batch_size:
     parameter: "training.batch_size"
     values: [64, 128, 256, 512]
     lr_scaling: "sqrt" 
   
-  # === 5. Memory/Hidden Dimension (Coupled)
+  # === 2. Memory/Hidden Dimension (Coupled)
   memory_dim:
     parameter: "model.memory_dim"
     values: [64, 128, 256, 512]
     fixed_overrides:
       64:
-        hidden_dim: 64
-        time_dim: 64
-        hct_d_model: 64
+        model.hidden_dim: 64
+        model.time_dim: 64
+        model.hct_d_model: 64
+        training.batch_size: 256
       128:
-        hidden_dim: 128
-        time_dim: 128
-        hct_d_model: 128
+        model.hidden_dim: 128
+        model.time_dim: 128
+        model.hct_d_model: 128
+        training.batch_size: 128
       256:
-        hidden_dim: 256
-        time_dim: 256
-        hct_d_model: 256
+        model.hidden_dim: 256
+        model.time_dim: 256
+        model.hct_d_model: 256
+        training.batch_size: 64
       512:
-        hidden_dim: 512
-        time_dim: 512
-        hct_d_model: 512
+        model.hidden_dim: 512
+        model.time_dim: 512
+        model.hct_d_model: 512
+        training.batch_size: 32
   
-  # === 6. SAM Prototypes (Ablation Flag)
+  # === 3. SAM Prototypes (Ablation Flag)
   use_prototype_attention:
     parameter: "model.use_prototype_attention"
     values: [true, false]
-    description: "True=8 prototypes, False=1 prototype (raw memory)"
+    description: "True=8 prototypes, False=1 prototype"
     fixed_overrides:
       true:
-        num_prototypes: 8
+        model.num_prototypes: 8
       false:
-        num_prototypes: 1
+        model.num_prototypes: 1
 
-  # === 7. Walk Length Sensitivity
+  
+
+  # === 4. Walk Length Sensitivity
   walk_length_short:
     parameter: "model.walk_length_short"
     values: [2, 5, 10, 15]    
@@ -180,7 +149,9 @@ sensitivity_studies:
       walk_length_long: 15
       walk_length_tawr: 10
 
-  # === 8. Walk Distribution 
+  
+
+  # === 5. Walk Distribution 
   walk_distribution:
     type: "explicit_configs"
     description: "Test different allocations of walk budget"
@@ -189,23 +160,94 @@ sensitivity_studies:
       - { name: "balanced", num_walks_short: 5, num_walks_long: 5, num_walks_tawr: 5 }
       - { name: "long_heavy", num_walks_short: 3, num_walks_long: 10, num_walks_tawr: 2 }
       - { name: "tawr_heavy", num_walks_short: 3, num_walks_long: 2, num_walks_tawr: 10 }
-
-  # === 9. Learning Rate
+  
+  
+  
+  
+  # === 6. Learning Rate
   learning_rate:
     parameter: "training.learning_rate"
     values: [1e-5, 5e-5, 1e-4, 5e-4]
     log_scale: true
   
-  # === 10. Dropout
+  # === 7. Dropout
   dropout:
     parameter: "model.dropout"
     values: [0.0, 0.1, 0.3, 0.5]
   
-  # === 11. Hard Negative Mining Threshold
+  # === 8. Hard Negative Mining Threshold
   hard_neg_threshold:
     parameter: "model.hard_neg_threshold"
     values: [0.5, 0.7, 0.8, 0.9]
     fixed_params:
-      neg_sample_ratio: 3 
+      model.neg_sample_ratio: 3
+
+  # === 9. ODE Solver Sensitivity (Method + Step Size Coupled) ===
+  ode_method_study:
+    parameter: "model.ode_method"
+    values: ["euler", "rk4", "dopri5"]
+    description: "Compare solvers with their optimal default step sizes"
+    fixed_overrides:
+      euler:
+        model.ode_step_size: 1.0
+        model.adjoint: false
+      rk4:
+        model.ode_step_size: 2.0
+        model.adjoint: true
+      dopri5:
+        model.ode_step_size: null
+        model.adjoint: true
+  
+  # 10. ODE Existence (Ablation)
+  use_st_ode:
+    parameter: "model.use_st_ode"
+    values: [true, false]
+    description: "Measure impact of adding ST-ODE module"
+    fixed_overrides:
+      true:
+        model.st_ode_update_interval: 10
+      false:
+        model.st_ode_update_interval: 10
+
+  # 11. ODE Update Frequency (Only when enabled)
+  st_ode_update_interval:
+    parameter: "model.st_ode_update_interval"
+    values: [1, 5, 10, 20, 50]
+    condition: "model.use_st_ode == true"
+    fixed_params:
+      model.ode_method: "rk4"
+      model.ode_step_size: 2.0 
+
 
  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
