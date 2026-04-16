@@ -8,6 +8,8 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Learning
 from src.experiments.exp_utils.analysis_callback import AnalysisCollector
 from src.experiments.exp_utils.model_profile import ModelProfiler
 
+from lightning.pytorch.strategies import DDPStrategy
+
 # ============================================================================
 # TRAINING
 # ============================================================================
@@ -68,6 +70,27 @@ class TrainerSetup:
         accelerator = 'gpu' if config['hardware']['gpus'] else 'cpu'
         devices = config['hardware']['gpus'] if config['hardware']['gpus'] else 'auto'
         
+        # Detect multi-GPU and set strategy
+        strategy = "auto"  # Default for single GPU
+        if isinstance(devices, int) and devices > 1:
+            # For 2x RTX 5090
+            strategy = DDPStrategy(
+                find_unused_parameters=False,  # Set True if you have unused params in graph
+                gradient_as_bucket_view=True,   # Saves memory
+                static_graph=True               # Optimizes DDP for static graphs
+            )
+            print(f"Using DDP strategy with {devices} GPUs")
+        elif isinstance(devices, list) and len(devices) > 1:
+            strategy = "ddp"
+        
+        # Mixed precision for RTX 5090 (FP16/BF16)
+        precision = config['experiment'].get('precision', 32)
+        if torch.cuda.is_available():
+            if "RTX 40" in torch.cuda.get_device_name(0) or "RTX 50" in torch.cuda.get_device_name(0):
+                print("Detected RTX 40/50 series - enabling TF32 for faster training")
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+        
         # profiler = None
         # if config.get('profiling', {}).get('enabled', False):
         #     profiler = ModelProfiler(
@@ -84,12 +107,14 @@ class TrainerSetup:
             max_epochs=config['training']['max_epochs'],
             accelerator=accelerator,
             devices=devices,
+            strategy=strategy,
             callbacks=all_callbacks,
             logger=loggers,
             precision=config['experiment']['precision'],            
             gradient_clip_val=config['training']['gradient_clip_val'],
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
-            enable_progress_bar=True,            
+            enable_progress_bar=True,
+            compile=True,            
             # profiler=profiler,
         )

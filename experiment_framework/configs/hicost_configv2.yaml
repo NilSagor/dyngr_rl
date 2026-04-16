@@ -139,6 +139,6 @@ profiling:
 
 # Hardware
 hardware:
-  gpus: 1  # null for CPU, number for GPU count
-  num_workers: 4
+  gpus: 1  # null for CPU, number for GPU count, 2 for 5090
+  num_workers: 4 # scale with gpus count if gpus 2, workers 8
   pin_memory: False
