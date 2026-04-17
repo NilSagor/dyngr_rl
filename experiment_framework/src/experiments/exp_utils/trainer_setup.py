@@ -116,6 +116,6 @@ class TrainerSetup:
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
             enable_progress_bar=True,
-            compile=True,            
+            # compile=True,            
             # profiler=profiler,
         )

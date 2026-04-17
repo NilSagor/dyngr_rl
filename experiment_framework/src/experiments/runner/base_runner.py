@@ -56,6 +56,15 @@ class BaseRunner(ABC):
         """Collect model-specific analysis artifacts for logging."""
         return {}
 
+    def _profile_model(self, model: torch.nn.Module, pipeline) -> None:
+        """Optional profiling hook called after model setup if debug is enabled.
+        
+        Subclasses can override to compute FLOPs, parameter counts, etc.
+        """
+        pass
+    
+    
+    
     def run(self) -> Dict[str, Any]:
         """Execute the full training and evaluation pipeline."""
         self.start_time = datetime.now()
@@ -84,6 +93,10 @@ class BaseRunner(ABC):
         if hasattr(model, 'neighbor_finder'):
             assert model.neighbor_finder is not None, "Neighbor finder not set"
 
+        # 4. Optional profiling (before training)
+        if self.config['experiment'].get('debug', False):
+            self._profile_model(model, pipeline)
+        
         # 4. Analysis collector
         self.analysis_collector = AnalysisCollector()
 

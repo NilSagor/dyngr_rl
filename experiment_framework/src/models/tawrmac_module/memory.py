@@ -3,7 +3,7 @@ from torch import nn
 import numpy as np
 from collections import defaultdict
 from copy import deepcopy
-from model.temporal_attention import TemporalAttentionLayer
+from src.models.tawrmac_module.temporal_attention import TemporalAttentionLayer
 
 
 class Memory(nn.Module):

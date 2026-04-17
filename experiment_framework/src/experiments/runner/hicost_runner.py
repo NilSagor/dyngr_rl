@@ -1,4 +1,4 @@
-
+from typing import Dict, Any
 from loguru import logger
 from src.experiments.runner.tgn_runner import TGNRunner
 

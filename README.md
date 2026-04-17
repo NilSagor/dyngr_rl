@@ -5,7 +5,18 @@
 ## Run HiCoST V3 training
 python experiment_framework/src/experiments/train_v4.py --config experiment_framework/configs/hicost_configv2.yaml  --seeds 42
 
-Quick Debug run
+## TAWRMAC training
+python experiment_framework/src/experiments/train_v5.py \
+    --config experiment_framework/configs/tawrmac_config.yaml \
+    --seeds 42
+
+### multiple seed
+python src/experiments/train_v5.py \
+    --config configs/tawrmac_config.yaml \
+    --seeds 42 123 456
+
+
+### Quick Debug run
 
 ```bash
     python experiment_framework/src/experiments/train.py \

@@ -8,12 +8,12 @@ import lightning as L
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tawrmac_module.time_encoding import TimeEncode
-from tawrmac_module.memory import Memory, GRUMemoryUpdater, LastMessageAggregator, IdentityMessageFunction, GraphAttentionEmbedding
-from tawrmac_module.walk import WalkEncoder, PositionEncoder
-from tawrmac_module.cooccurrence import NeighborCooccurrenceEncoder
-from tawrmac_module.merg_layer import AffinityMergeLayer
-from tawrmac_module.mlp_module import RestartMLP
+from src.models.tawrmac_module.time_encoding import TimeEncode
+from src.models.tawrmac_module.memory import Memory, GRUMemoryUpdater, LastMessageAggregator, IdentityMessageFunction, GraphAttentionEmbedding
+from src.models.tawrmac_module.walk import WalkEncoder, PositionEncoder
+from src.models.tawrmac_module.cooccurrence import NeighborCooccurrenceEncoder
+from src.models.tawrmac_module.merg_layer import AffinityMergeLayer
+from src.models.tawrmac_module.mlp_module import RestartMLP
 
 
 from .tawrmac_config import TAWRMACConfig
