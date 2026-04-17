@@ -20,6 +20,10 @@ from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
 from src.models.enhanced_tgn.variants.hicostv3 import HiCoSTv3
 
 
+from src.models.tawrmac_module.tawrmac_variants.tawrmac_v1 import TAWRMACv1
+from src.models.tawrmac_module.tawrmac_variants.tawrmac_config import TAWRMACConfig
+
+
 # Constants
 MODEL_REGISTRY = {
     "DyGFormer": DyGFormer,
@@ -33,6 +37,7 @@ MODEL_REGISTRY = {
     "HiCoST": HiCoST,
     "HiCoSTv2": HiCoSTv2,
     "HiCoSTv3": HiCoSTv3,
+    "TAWRMACv1": TAWRMACv1,
 }
 
 
@@ -43,53 +48,7 @@ MODEL_REGISTRY = {
 
 class ModelFactory:
     """Factory for creating and validating models."""
-    
-    # @staticmethod
-    # def create(config: Dict, data_info: Dict) -> torch.nn.Module:
-    #     """Create model with proper parameter handling."""
-    #     model_config = config['model'].copy()
-    #     model_name = model_config.pop('name')
-    #     print()
-
-    #     # variant = config["model"].pop('variant', None)
-        
-    #     if model_name not in MODEL_REGISTRY:
-    #         raise ValueError(f"Unknown model: {model_name}")
-        
-    #     model_class = MODEL_REGISTRY[model_name]
-        
-  
-    #     # Base arguments from data (always required)
-    #     model_args = {
-    #         'num_nodes': data_info['num_nodes'],
-    #         'node_features': data_info.get('node_feat_dim', 0),
-    #         'edge_features_dim': data_info.get('edge_feat_dim', 172),
-    #     }
-        
-    #     # Get the model's constructor signature
-    #     sig = inspect.signature(model_class.__init__)
-    #     valid_params = set(sig.parameters.keys()) - {'self'}
-        
-        
-    #     # Add any keys from model_config that are valid
-    #     for key, value in model_config.items():
-    #         if key in valid_params:
-    #             model_args[key] = value
-    #         else:
-    #             logger.warning(f"Key '{key}' in config is not accepted by {model_name}.__init__ and will be ignored.")
-        
-        
-    #     print(f"Model args: {model_args}")
-    #     model = model_class(**model_args)
-        
-    #     # Validation
-    #     ModelFactory.validate(model, data_info)
-        
-    #     num_params = sum(p.numel() for p in model.parameters())
-    #     logger.info(f"Created {model_name}: {num_params:,} parameters")
-        
-    #     return model
-    
+            
     @staticmethod
     def create(config: Dict, data_info: Dict) -> torch.nn.Module:
         """Create model with proper parameter handling."""
@@ -104,6 +63,8 @@ class ModelFactory:
         #  HiCoSTv3 uses config dataclass
         if model_name == "HiCoSTv3":
             model = ModelFactory._create_hicostv3(model_config, data_info, config)
+        elif model_name == "TAWRMACv1":
+            model = ModelFactory._create_tawrmacv1(model_config, data_info, config)
         else:
             # === Legacy path for all other models ===
             model_args = ModelFactory._build_legacy_args(model_class, model_config, data_info)
@@ -215,6 +176,42 @@ class ModelFactory:
         return MODEL_REGISTRY["HiCoSTv3"](config=hicost_config)
     
     @staticmethod
+    def _create_tawrmacv1(model_config: Dict, data_info: Dict, full_config: Dict):     
+
+        training_cfg = full_config.get('training', {})
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Build config object
+        tawrmac_cfg = TAWRMACConfig(
+            neighbor_finder=None,  # Will be set later via set_neighbor_finder
+            node_features=data_info.get('node_features'),
+            edge_features=data_info.get('edge_features'),
+            device=device,
+            n_layers=model_config.get('n_layers', 2),
+            n_heads=model_config.get('n_heads', 2),
+            dropout=model_config.get('dropout', 0.1),
+            use_memory=model_config.get('use_memory', False),
+            memory_update_at_start=model_config.get('memory_update_at_start', True),
+            memory_dimension=model_config.get('memory_dim', 500),
+            n_neighbors=model_config.get('n_neighbors', None),
+            enable_walk=model_config.get('enable_walk', False),
+            enable_restart=model_config.get('enable_restart', False),
+            pick_new_neighbors=model_config.get('pick_new_neighbors', False),
+            walk_emb_dim=model_config.get('walk_emb_dim', 172),
+            position_feat_dim=model_config.get('position_feat_dim', 100),
+            walk_length=model_config.get('walk_length', 4),
+            num_walks=model_config.get('num_walks', 10),
+            num_walk_heads=model_config.get('num_walk_heads', 4),
+            enable_neighbor_cooc=model_config.get('enable_neighbor_cooc', False),
+            max_input_seq_length=model_config.get('max_input_seq_length', 32),
+            time_dim=model_config.get('time_dim', 172),
+            fixed_time_dim=model_config.get('fixed_time_dim', 20),
+            learning_rate=training_cfg.get('learning_rate', 1e-4),
+            weight_decay=training_cfg.get('weight_decay', 1e-5),
+        )
+        return TAWRMACv1(config=tawrmac_cfg)
+    
+    @staticmethod
     def _build_legacy_args(model_class, model_config: Dict, data_info: Dict) -> Dict:
         """Build kwargs for legacy models using signature inspection."""
         model_args = {
@@ -233,9 +230,7 @@ class ModelFactory:
                 logger.debug(f"Key '{key}' ignored for {model_class.__name__}")
         
         return model_args
-
-    
-    
+ 
     
     @staticmethod
     def validate(model: torch.nn.Module, data_info: Dict):
@@ -260,6 +255,56 @@ class ModelFactory:
                 f"Memory size mismatch: {mem_size} != {num_nodes}"
         
         logger.debug("Model validation passed")
+
+
+
+
+
+    # @staticmethod
+    # def create(config: Dict, data_info: Dict) -> torch.nn.Module:
+    #     """Create model with proper parameter handling."""
+    #     model_config = config['model'].copy()
+    #     model_name = model_config.pop('name')
+    #     print()
+
+    #     # variant = config["model"].pop('variant', None)
+        
+    #     if model_name not in MODEL_REGISTRY:
+    #         raise ValueError(f"Unknown model: {model_name}")
+        
+    #     model_class = MODEL_REGISTRY[model_name]
+        
+  
+    #     # Base arguments from data (always required)
+    #     model_args = {
+    #         'num_nodes': data_info['num_nodes'],
+    #         'node_features': data_info.get('node_feat_dim', 0),
+    #         'edge_features_dim': data_info.get('edge_feat_dim', 172),
+    #     }
+        
+    #     # Get the model's constructor signature
+    #     sig = inspect.signature(model_class.__init__)
+    #     valid_params = set(sig.parameters.keys()) - {'self'}
+        
+        
+    #     # Add any keys from model_config that are valid
+    #     for key, value in model_config.items():
+    #         if key in valid_params:
+    #             model_args[key] = value
+    #         else:
+    #             logger.warning(f"Key '{key}' in config is not accepted by {model_name}.__init__ and will be ignored.")
+        
+        
+    #     print(f"Model args: {model_args}")
+    #     model = model_class(**model_args)
+        
+    #     # Validation
+    #     ModelFactory.validate(model, data_info)
+        
+    #     num_params = sum(p.numel() for p in model.parameters())
+    #     logger.info(f"Created {model_name}: {num_params:,} parameters")
+        
+    #     return model
 
 
 

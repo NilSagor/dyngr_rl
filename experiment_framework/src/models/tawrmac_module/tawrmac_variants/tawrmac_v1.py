@@ -21,103 +21,227 @@ from .tawrmac_config import TAWRMACConfig
 
 
 class TAWRMACv1(L.LightningModule):
-    def __init__(self, config=TAWRMACConfig):
+    def __init__(self, config:TAWRMACConfig):
         super(TAWRMACv1, self).__init__()
 
-        self.n_layers = n_layers
-        self.neighbor_finder = neighbor_finder
-        self.device = device
-        self.logger = logging.getLogger(__name__)
+        self.save_hyperparameters(config)
+        
+        self.n_layers = config.n_layers
+        self.neighbor_finder = config.neighbor_finder
+        self.device = config.device
+        
+        if isinstance(config.node_features, np.ndarray):
+            self.node_raw_features = torch.from_numpy(config.node_features.astype(np.float32)).to(self.device)
+        else:
+            self.node_raw_features = config.node_features.to(self.device)
 
-        self.node_raw_features = torch.from_numpy(node_features.astype(np.float32)).to(device)
-        self.edge_raw_features = torch.from_numpy(edge_features.astype(np.float32)).to(device)
+        if isinstance(config.edge_features, np.ndarray):
+            self.edge_raw_features = torch.from_numpy(config.edge_features.astype(np.float32)).to(self.device)
+        else:
+            self.edge_raw_features = config.edge_features.to(self.device)
+        
+        
+        
+        # self.node_raw_features = torch.from_numpy(config.node_features.astype(np.float32)).to(config.device)
+        # self.edge_raw_features = torch.from_numpy(config.edge_features.astype(np.float32)).to(config.device)
 
         self.n_node_features = self.node_raw_features.shape[1]
         self.n_nodes = self.node_raw_features.shape[0]
         self.n_edge_features = self.edge_raw_features.shape[1]
         self.embedding_dimension = self.n_node_features
-        self.n_neighbors = n_neighbors
+        self.n_neighbors = config.n_neighbors
 
-        self.use_memory = use_memory
-        self.time_feat_dim = time_dim
+        
+        
+        
+        # self.use_memory = use_memory
+        # self.time_feat_dim = time_dim
+        # self.time_encoder = TimeEncode(dimension=self.time_feat_dim)
+        # self.memory = None
+        # self.enable_walk = enable_walk
+        # self.enable_restart = enable_restart
+        # self.pick_new_neighbors = pick_new_neighbors  # True if approach 2 (picks new neighbors in restart)
+        # self.num_walks = num_walks
+        # self.neighbor_cooc = enable_neighbor_cooc
+        # self.fixed_time_encoder = None
+
+        self.use_memory = config.use_memory
+        self.time_feat_dim = config.time_dim
         self.time_encoder = TimeEncode(dimension=self.time_feat_dim)
         self.memory = None
-        self.enable_walk = enable_walk
-        self.enable_restart = enable_restart
-        self.pick_new_neighbors = pick_new_neighbors  # True if approach 2 (picks new neighbors in restart)
-        self.num_walks = num_walks
-        self.neighbor_cooc = enable_neighbor_cooc
+        self.enable_walk = config.enable_walk
+        self.enable_restart = config.enable_restart
+        self.pick_new_neighbors = config.pick_new_neighbors
+        self.num_walks = config.num_walks
+        self.neighbor_cooc = config.enable_neighbor_cooc
         self.fixed_time_encoder = None
+        
+        
+        
+        
+        # if self.neighbor_cooc:
+        #     self.max_input_sequence_length = max_input_seq_length
+        #     self.neighbor_cooc_proj_out = 10
+        #     self.neighbor_co_occurrence_feat_dim = 50
+        #     self.neighbor_cooc_proj = torch.nn.Linear(in_features=self.neighbor_co_occurrence_feat_dim,
+        #                                               out_features=self.neighbor_cooc_proj_out, bias=True)
+        #     self.neighbor_co_occurrence_encoder = NeighborCooccurrenceEncoder(
+        #         neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim, device=device)
 
+         # Co-occurrence setup
         if self.neighbor_cooc:
-            self.max_input_sequence_length = max_input_seq_length
+            self.max_input_sequence_length = config.max_input_seq_length
             self.neighbor_cooc_proj_out = 10
             self.neighbor_co_occurrence_feat_dim = 50
-            self.neighbor_cooc_proj = torch.nn.Linear(in_features=self.neighbor_co_occurrence_feat_dim,
-                                                      out_features=self.neighbor_cooc_proj_out, bias=True)
+            self.neighbor_cooc_proj = torch.nn.Linear(
+                in_features=self.neighbor_co_occurrence_feat_dim,
+                out_features=self.neighbor_cooc_proj_out, bias=True)
             self.neighbor_co_occurrence_encoder = NeighborCooccurrenceEncoder(
-                neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim, device=device)
+                neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim,
+                device=self.device)
 
+
+
+
+        # if self.enable_walk:
+        #     self.walk_emb_dim = walk_emb_dim
+        #     self.position_feat_dim = position_feat_dim
+        #     self.walk_length = walk_length
+        #     self.num_walk_heads = num_walk_heads
+
+
+        #     self.position_encoder = PositionEncoder(position_feat_dim=self.position_feat_dim,
+        #                                             walk_length=self.walk_length,
+        #                                             device=device)
+
+        #     self.walk_encoder = WalkEncoder(
+        #         input_dim=self.n_node_features + self.n_edge_features + self.time_feat_dim + self.position_feat_dim,
+        #         position_feat_dim=self.position_feat_dim, output_dim=self.walk_emb_dim,
+        #         num_walk_heads=self.num_walk_heads,
+        #         dropout=dropout)
+        #     if self.enable_restart:
+        #         self.restart_prob = RestartMLP(dim=self.n_node_features)
+
+        # Walk setup
         if self.enable_walk:
-            self.walk_emb_dim = walk_emb_dim
-            self.position_feat_dim = position_feat_dim
-            self.walk_length = walk_length
-            self.num_walk_heads = num_walk_heads
+            self.walk_emb_dim = config.walk_emb_dim
+            self.position_feat_dim = config.position_feat_dim
+            self.walk_length = config.walk_length
+            self.num_walk_heads = config.num_walk_heads
 
-
-            self.position_encoder = PositionEncoder(position_feat_dim=self.position_feat_dim,
-                                                    walk_length=self.walk_length,
-                                                    device=device)
+            self.position_encoder = PositionEncoder(
+                position_feat_dim=self.position_feat_dim,
+                walk_length=self.walk_length,
+                device=self.device)
 
             self.walk_encoder = WalkEncoder(
                 input_dim=self.n_node_features + self.n_edge_features + self.time_feat_dim + self.position_feat_dim,
-                position_feat_dim=self.position_feat_dim, output_dim=self.walk_emb_dim,
+                position_feat_dim=self.position_feat_dim,
+                output_dim=self.walk_emb_dim,
                 num_walk_heads=self.num_walk_heads,
-                dropout=dropout)
+                dropout=config.dropout)
             if self.enable_restart:
                 self.restart_prob = RestartMLP(dim=self.n_node_features)
+        
+        
+        
+        # if self.use_memory:
+        #     self.fixed_time_dim = fixed_time_dim
+        #     self.fixed_time_encoder = TimeEncode(dimension=self.fixed_time_dim, parameter_requires_grad=False)
 
+        #     self.memory_dimension = self.n_node_features
+        #     self.memory_update_at_start = memory_update_at_start
+        #     raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + \
+        #                             self.time_encoder.dimension
+
+
+        #     message_dimension = raw_message_dimension
+        #     self.memory = Memory(n_nodes=self.n_nodes,
+        #                          memory_dimension=self.memory_dimension,
+        #                          input_dimension=message_dimension,
+        #                          message_dimension=message_dimension,
+        #                          device=device)
+        #     self.message_aggregator = LastMessageAggregator(device=device)
+        #     self.message_function = IdentityMessageFunction()
+        #     self.memory_updater = GRUMemoryUpdater(memory=self.memory,
+        #                                            message_dimension=message_dimension,
+        #                                            memory_dimension=self.memory_dimension,
+        #                                            device=device)
+
+
+        #     self.embedding_module = GraphAttentionEmbedding(node_features=self.node_raw_features,
+        #                                                  edge_features=self.edge_raw_features,
+        #                                                  memory=self.memory,
+        #                                                  neighbor_finder=self.neighbor_finder,
+        #                                                  time_encoder=self.time_encoder,
+        #                                                  fixed_time_encoder=self.fixed_time_encoder,
+        #                                                  n_layers=self.n_layers,
+        #                                                  n_node_features=self.n_node_features,
+        #                                                  n_edge_features=self.n_edge_features,
+        #                                                  n_time_features=self.time_feat_dim,
+        #                                                  embedding_dimension=self.embedding_dimension,
+        #                                                  device=self.device,
+        #                                                  n_heads=n_heads, dropout=dropout,
+        #                                                  use_memory=True,
+        #                                                  n_fixed_time_features=self.fixed_time_dim)
+
+        # Memory setup
         if self.use_memory:
-            self.fixed_time_dim = fixed_time_dim
+            self.fixed_time_dim = config.fixed_time_dim
             self.fixed_time_encoder = TimeEncode(dimension=self.fixed_time_dim, parameter_requires_grad=False)
-
             self.memory_dimension = self.n_node_features
-            self.memory_update_at_start = memory_update_at_start
-            raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + \
-                                    self.time_encoder.dimension
-
-
+            self.memory_update_at_start = config.memory_update_at_start
+            raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + self.time_encoder.dimension
             message_dimension = raw_message_dimension
-            self.memory = Memory(n_nodes=self.n_nodes,
-                                 memory_dimension=self.memory_dimension,
-                                 input_dimension=message_dimension,
-                                 message_dimension=message_dimension,
-                                 device=device)
-            self.message_aggregator = LastMessageAggregator(device=device)
+            self.memory = Memory(
+                n_nodes=self.n_nodes,
+                memory_dimension=self.memory_dimension,
+                input_dimension=message_dimension,
+                message_dimension=message_dimension,
+                device=self.device
+            )
+            self.message_aggregator = LastMessageAggregator(device=self.device)
             self.message_function = IdentityMessageFunction()
-            self.memory_updater = GRUMemoryUpdater(memory=self.memory,
-                                                   message_dimension=message_dimension,
-                                                   memory_dimension=self.memory_dimension,
-                                                   device=device)
+            self.memory_updater = GRUMemoryUpdater(
+                memory=self.memory,
+                message_dimension=message_dimension,
+                memory_dimension=self.memory_dimension,
+                device=self.device
+            )
+
+            self.embedding_module = GraphAttentionEmbedding(
+                node_features=self.node_raw_features,
+                edge_features=self.edge_raw_features,
+                memory=self.memory,
+                neighbor_finder=self.neighbor_finder,
+                time_encoder=self.time_encoder,
+                fixed_time_encoder=self.fixed_time_encoder,
+                n_layers=self.n_layers,
+                n_node_features=self.n_node_features,
+                n_edge_features=self.n_edge_features,
+                n_time_features=self.time_feat_dim,
+                embedding_dimension=self.embedding_dimension,
+                device=self.device,
+                n_heads=config.n_heads,
+                dropout=config.dropout,
+                use_memory=True,
+                n_fixed_time_features=self.fixed_time_dim
+            )
 
 
-            self.embedding_module = GraphAttentionEmbedding(node_features=self.node_raw_features,
-                                                         edge_features=self.edge_raw_features,
-                                                         memory=self.memory,
-                                                         neighbor_finder=self.neighbor_finder,
-                                                         time_encoder=self.time_encoder,
-                                                         fixed_time_encoder=self.fixed_time_encoder,
-                                                         n_layers=self.n_layers,
-                                                         n_node_features=self.n_node_features,
-                                                         n_edge_features=self.n_edge_features,
-                                                         n_time_features=self.time_feat_dim,
-                                                         embedding_dimension=self.embedding_dimension,
-                                                         device=self.device,
-                                                         n_heads=n_heads, dropout=dropout,
-                                                         use_memory=True,
-                                                         n_fixed_time_features=self.fixed_time_dim)
+        # self.final_emb_dim = 0
+        # if self.use_memory:
+        #     self.final_emb_dim += self.n_node_features
+        # if self.enable_walk:
+        #     self.final_emb_dim += self.walk_emb_dim
+        #     if self.enable_restart:
+        #         self.final_emb_dim += 1
+        # if self.neighbor_cooc:
+        #     self.final_emb_dim += (self.max_input_sequence_length + 1) * self.neighbor_cooc_proj_out
+        # self.affinity_score = AffinityMergeLayer(self.final_emb_dim, self.final_emb_dim,
+        #                                          self.n_node_features, 1)
 
-
+        # Final embedding dimension
         self.final_emb_dim = 0
         if self.use_memory:
             self.final_emb_dim += self.n_node_features
@@ -127,9 +251,92 @@ class TAWRMACv1(L.LightningModule):
                 self.final_emb_dim += 1
         if self.neighbor_cooc:
             self.final_emb_dim += (self.max_input_sequence_length + 1) * self.neighbor_cooc_proj_out
-        self.affinity_score = AffinityMergeLayer(self.final_emb_dim, self.final_emb_dim,
-                                                 self.n_node_features, 1)
+        self.affinity_score = AffinityMergeLayer(
+            self.final_emb_dim, 
+            self.final_emb_dim,
+            self.n_node_features, 1
+        )
 
+    def forward(self, sources, destinations, timestamps, edge_idxs, negative_sources=None, negative_destinations=None):
+        """Wrapper for edge probability computation."""
+        return self.compute_edge_probabilities(
+            sources, 
+            destinations, 
+            negative_sources, 
+            negative_destinations,
+            timestamps, 
+            edge_idxs, 
+            self.n_neighbors
+        )
+    
+    
+    def training_step(self, batch, batch_idx):
+        """Process a training batch from TemporalDataset."""
+        # batch is a dict with keys: 'sources', 'destinations', 'timestamps', 'edge_idxs',
+        # 'negative_sources', 'negative_destinations'
+        sources = batch['sources'].cpu().numpy()
+        destinations = batch['destinations'].cpu().numpy()
+        timestamps = batch['timestamps'].cpu().numpy()
+        edge_idxs = batch['edge_idxs'].cpu().numpy()
+        neg_sources = batch['negative_sources'].cpu().numpy()
+        neg_destinations = batch['negative_destinations'].cpu().numpy()
+
+        pos_prob, neg_prob = self.compute_edge_probabilities(
+            sources, destinations, neg_sources, neg_destinations,
+            timestamps, edge_idxs, self.n_neighbors)
+
+        pos_label = torch.ones_like(pos_prob)
+        neg_label = torch.zeros_like(neg_prob)
+        loss = F.binary_cross_entropy(pos_prob, pos_label) + F.binary_cross_entropy(neg_prob, neg_label)
+
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """Process a validation batch."""
+        return self._shared_eval_step(batch, 'val')
+
+    def test_step(self, batch, batch_idx):
+        """Process a test batch."""
+        return self._shared_eval_step(batch, 'test')
+    
+    
+    def _shared_eval_step(self, batch, prefix):
+        sources = batch['sources'].cpu().numpy()
+        destinations = batch['destinations'].cpu().numpy()
+        timestamps = batch['timestamps'].cpu().numpy()
+        edge_idxs = batch['edge_idxs'].cpu().numpy()
+        neg_sources = batch['negative_sources'].cpu().numpy()
+        neg_destinations = batch['negative_destinations'].cpu().numpy()
+
+        pos_prob, neg_prob = self.compute_edge_probabilities(
+            sources, destinations, neg_sources, neg_destinations,
+            timestamps, edge_idxs, self.n_neighbors)
+
+        pos_label = torch.ones_like(pos_prob)
+        neg_label = torch.zeros_like(neg_prob)
+
+        # Compute metrics
+        from torchmetrics import AUROC, AveragePrecision
+        auroc = AUROC(task='binary')
+        ap = AveragePrecision(task='binary')
+
+        # Concatenate predictions and labels for batch metric
+        preds = torch.cat([pos_prob, neg_prob])
+        targets = torch.cat([pos_label, neg_label])
+
+        self.log(f'{prefix}_auc', auroc(preds, targets), on_step=False, on_epoch=True)
+        self.log(f'{prefix}_ap', ap(preds, targets), on_step=False, on_epoch=True)
+        return {'preds': preds, 'targets': targets}
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+        return optimizer
+    
     def get_node_embedding_dim(self):
         return self.final_emb_dim
 
@@ -696,7 +903,25 @@ class TAWRMACv1(L.LightningModule):
         return unique_sources, messages
 
 
+    
+    
+    # def set_neighbor_finder(self, neighbor_finder):
+    #     self.neighbor_finder = neighbor_finder
+    #     if self.use_memory:
+    #         self.embedding_module.neighbor_finder = neighbor_finder
+
     def set_neighbor_finder(self, neighbor_finder):
+        """Called by training pipeline to inject neighbor finder."""
         self.neighbor_finder = neighbor_finder
-        if self.use_memory:
+        if self.use_memory and hasattr(self, 'embedding_module'):
             self.embedding_module.neighbor_finder = neighbor_finder
+
+    def set_graph(self, edge_index, edge_time):
+        """Called by training pipeline; TAWRMAC uses neighbor_finder instead."""
+        # Not needed, neighbor_finder already holds graph info
+        pass
+
+    def set_raw_features(self, node_features, edge_features):
+        """Called by training pipeline to update raw features (optional)."""
+        # Already set during init; can ignore or update if needed
+        pass
