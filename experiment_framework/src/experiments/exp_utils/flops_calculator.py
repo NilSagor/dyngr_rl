@@ -1,5 +1,5 @@
 from fvcore.nn import FlopCountAnalysis, parameter_count_table
-from typing import Dict
+from typing import Dict, Any
 import torch
 
 
