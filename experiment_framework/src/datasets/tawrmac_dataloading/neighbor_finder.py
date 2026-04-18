@@ -354,3 +354,11 @@ class NewNeighborFinder:
     def get_all_first_hop_neighbors(self, node_ids: np.ndarray, node_interact_times: np.ndarray):
 
         return self.all_source_neighbors, self.all_source_edge_idx, self.all_source_edge_times
+    
+    def clear_cache(self):
+        self.all_source_neighbors = []
+        self.all_source_edge_idx = []
+        self.all_source_edge_times = []
+        self.all_node_neighbor_sampled_probabilities = []
+        if self.use_cache:
+            self.cache.clear()

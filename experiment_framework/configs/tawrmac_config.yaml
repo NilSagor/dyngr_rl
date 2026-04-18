@@ -55,7 +55,7 @@ model:
   weight_decay: 0.00001
 
 training:
-  batch_size: 200
+  batch_size: 128   # OOM so reduce from 200 to 128
   max_epochs: 50
   patience: 10
   gradient_clip_val: 1.0

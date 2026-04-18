@@ -15,6 +15,7 @@ from src.experiments.exp_utils.model_factory import ModelFactory
 from src.experiments.exp_utils.experiment_logger import ExperimentLogger
 from src.experiments.exp_utils.trainer_setup import TrainerSetup
 from src.experiments.exp_utils.analysis_callback import AnalysisCollector
+from src.experiments.exp_utils.clear_callback import ClearCacheCallback
 from lightning.pytorch.callbacks import EarlyStopping
 
 
@@ -25,6 +26,7 @@ class BaseRunner(ABC):
         self.config = config
         self.start_time: Optional[datetime] = None
         self.analysis_collector: Optional[AnalysisCollector] = None
+        # self.clear_callback: Optional[ClearCacheCallback] = None
 
     @abstractmethod
     def create_data_pipeline(self):
@@ -101,7 +103,7 @@ class BaseRunner(ABC):
         self.analysis_collector = AnalysisCollector()
 
         # 5. Trainer
-        trainer = TrainerSetup.create(self.config, callbacks=[self.analysis_collector])
+        trainer = TrainerSetup.create(self.config, callbacks=[self.analysis_collector, ClearCacheCallback()])
         logger.info(f"Trainer max_epochs: {trainer.max_epochs}")
 
         # 6. Training

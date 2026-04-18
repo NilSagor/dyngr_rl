@@ -357,6 +357,13 @@ class TAWRMACv1(L.LightningModule):
         )
         return optimizer
     
+    def on_train_epoch_start(self):
+        if self.neighbor_finder is not None:
+            self.neighbor_finder.clear_cache()
+        # Also reinitialize memory if needed
+        if self.use_memory and self.memory is not None:
+            self.memory.__init_memory__()
+    
     def get_node_embedding_dim(self):
         return self.final_emb_dim
 
