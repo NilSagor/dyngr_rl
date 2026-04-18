@@ -14,7 +14,8 @@ from src.models.tawrmac_module.walk import WalkEncoder, PositionEncoder
 from src.models.tawrmac_module.cooccurrence import NeighborCooccurrenceEncoder
 from src.models.tawrmac_module.merg_layer import AffinityMergeLayer
 from src.models.tawrmac_module.mlp_module import RestartMLP
-from torchmetrics.classification import AUROC, AveragePrecision
+from torchmetrics import AUROC, AveragePrecision
+from torchmetrics import Accuracy
 
 from .tawrmac_config import TAWRMACConfig
 from dataclasses import asdict
@@ -262,6 +263,8 @@ class TAWRMACv1(L.LightningModule):
         self.val_ap = AveragePrecision(task='binary')
         self.test_auroc = AUROC(task='binary')
         self.test_ap = AveragePrecision(task='binary')
+        self.val_accuracy = Accuracy(task='binary')
+        self.test_accuracy = Accuracy(task='binary')
 
     def forward(self, sources, destinations, timestamps, edge_idxs, negative_sources=None, negative_destinations=None):
         """Wrapper for edge probability computation."""
@@ -337,15 +340,20 @@ class TAWRMACv1(L.LightningModule):
         if prefix == 'val':
             auroc_metric = self.val_auroc.to(device)
             ap_metric = self.val_ap.to(device)
+            accuracy_metric = self.val_accuracy.to(device)
         else:
             auroc_metric = self.test_auroc.to(device)
             ap_metric = self.test_ap.to(device)
-
+            accuracy_metric = self.test_accuracy.to(device)        
+            
+        
         auc = auroc_metric(preds, targets)
         ap = ap_metric(preds, targets)
+        accuracy = accuracy_metric(preds, targets)
 
         self.log(f'{prefix}_auc', auc, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log(f'{prefix}_ap', ap, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f'{prefix}_accuracy', accuracy, on_step=False, on_epoch=True, batch_size=batch_size)
 
         return {'preds': preds, 'targets': targets}
     
