@@ -14,31 +14,32 @@ from src.models.tawrmac_module.walk import WalkEncoder, PositionEncoder
 from src.models.tawrmac_module.cooccurrence import NeighborCooccurrenceEncoder
 from src.models.tawrmac_module.merg_layer import AffinityMergeLayer
 from src.models.tawrmac_module.mlp_module import RestartMLP
-
+from torchmetrics.classification import AUROC, AveragePrecision
 
 from .tawrmac_config import TAWRMACConfig
-
+from dataclasses import asdict
 
 
 class TAWRMACv1(L.LightningModule):
     def __init__(self, config:TAWRMACConfig):
         super(TAWRMACv1, self).__init__()
-
-        self.save_hyperparameters(config)
+        torch.autograd.set_detect_anomaly(True)
+        self.save_hyperparameters(asdict(config))
+        self.cfg = config
         
         self.n_layers = config.n_layers
         self.neighbor_finder = config.neighbor_finder
-        self.device = config.device
+        self._device = config.device if isinstance(config.device, torch.device) else torch.device(config.device)
         
         if isinstance(config.node_features, np.ndarray):
-            self.node_raw_features = torch.from_numpy(config.node_features.astype(np.float32)).to(self.device)
+            self.node_raw_features = torch.from_numpy(config.node_features.astype(np.float32)).to(self._device)
         else:
-            self.node_raw_features = config.node_features.to(self.device)
+            self.node_raw_features = config.node_features.to(self._device)
 
         if isinstance(config.edge_features, np.ndarray):
-            self.edge_raw_features = torch.from_numpy(config.edge_features.astype(np.float32)).to(self.device)
+            self.edge_raw_features = torch.from_numpy(config.edge_features.astype(np.float32)).to(self._device)
         else:
-            self.edge_raw_features = config.edge_features.to(self.device)
+            self.edge_raw_features = config.edge_features.to(self._device)
         
         
         
@@ -98,7 +99,7 @@ class TAWRMACv1(L.LightningModule):
                 out_features=self.neighbor_cooc_proj_out, bias=True)
             self.neighbor_co_occurrence_encoder = NeighborCooccurrenceEncoder(
                 neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim,
-                device=self.device)
+                device=self._device)
 
 
 
@@ -132,7 +133,7 @@ class TAWRMACv1(L.LightningModule):
             self.position_encoder = PositionEncoder(
                 position_feat_dim=self.position_feat_dim,
                 walk_length=self.walk_length,
-                device=self.device)
+                device=self._device)
 
             self.walk_encoder = WalkEncoder(
                 input_dim=self.n_node_features + self.n_edge_features + self.time_feat_dim + self.position_feat_dim,
@@ -180,7 +181,7 @@ class TAWRMACv1(L.LightningModule):
         #                                                  n_edge_features=self.n_edge_features,
         #                                                  n_time_features=self.time_feat_dim,
         #                                                  embedding_dimension=self.embedding_dimension,
-        #                                                  device=self.device,
+        #                                                  device=self._device,
         #                                                  n_heads=n_heads, dropout=dropout,
         #                                                  use_memory=True,
         #                                                  n_fixed_time_features=self.fixed_time_dim)
@@ -198,15 +199,15 @@ class TAWRMACv1(L.LightningModule):
                 memory_dimension=self.memory_dimension,
                 input_dimension=message_dimension,
                 message_dimension=message_dimension,
-                device=self.device
+                device=self._device
             )
-            self.message_aggregator = LastMessageAggregator(device=self.device)
+            self.message_aggregator = LastMessageAggregator(device=self._device)
             self.message_function = IdentityMessageFunction()
             self.memory_updater = GRUMemoryUpdater(
                 memory=self.memory,
                 message_dimension=message_dimension,
                 memory_dimension=self.memory_dimension,
-                device=self.device
+                device=self._device
             )
 
             self.embedding_module = GraphAttentionEmbedding(
@@ -221,7 +222,7 @@ class TAWRMACv1(L.LightningModule):
                 n_edge_features=self.n_edge_features,
                 n_time_features=self.time_feat_dim,
                 embedding_dimension=self.embedding_dimension,
-                device=self.device,
+                device=self._device,
                 n_heads=config.n_heads,
                 dropout=config.dropout,
                 use_memory=True,
@@ -257,8 +258,14 @@ class TAWRMACv1(L.LightningModule):
             self.n_node_features, 1
         )
 
+        self.val_auroc = AUROC(task='binary')
+        self.val_ap = AveragePrecision(task='binary')
+        self.test_auroc = AUROC(task='binary')
+        self.test_ap = AveragePrecision(task='binary')
+
     def forward(self, sources, destinations, timestamps, edge_idxs, negative_sources=None, negative_destinations=None):
         """Wrapper for edge probability computation."""
+       
         return self.compute_edge_probabilities(
             sources, 
             destinations, 
@@ -271,25 +278,30 @@ class TAWRMACv1(L.LightningModule):
     
     
     def training_step(self, batch, batch_idx):
-        """Process a training batch from TemporalDataset."""
-        # batch is a dict with keys: 'sources', 'destinations', 'timestamps', 'edge_idxs',
-        # 'negative_sources', 'negative_destinations'
-        sources = batch['sources'].cpu().numpy()
-        destinations = batch['destinations'].cpu().numpy()
-        timestamps = batch['timestamps'].cpu().numpy()
-        edge_idxs = batch['edge_idxs'].cpu().numpy()
-        neg_sources = batch['negative_sources'].cpu().numpy()
-        neg_destinations = batch['negative_destinations'].cpu().numpy()
+        sources = batch['sources']
+        destinations = batch['destinations']
+        timestamps = batch['timestamps']
+        edge_idxs = batch['edge_idxs']
+        neg_sources = batch['negative_sources']
+        neg_destinations = batch['negative_destinations']
+
+        batch_size = len(sources)
 
         pos_prob, neg_prob = self.compute_edge_probabilities(
             sources, destinations, neg_sources, neg_destinations,
-            timestamps, edge_idxs, self.n_neighbors)
+            timestamps, edge_idxs, self.n_neighbors
+        )
 
-        pos_label = torch.ones_like(pos_prob)
-        neg_label = torch.zeros_like(neg_prob)
-        loss = F.binary_cross_entropy(pos_prob, pos_label) + F.binary_cross_entropy(neg_prob, neg_label)
-
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        pos_label = torch.ones_like(pos_prob, dtype=torch.long)
+        neg_label = torch.zeros_like(neg_prob, dtype=torch.long)
+        loss = F.binary_cross_entropy(pos_prob, pos_label.float()) + \
+            F.binary_cross_entropy(neg_prob, neg_label.float())
+        
+        if self.use_memory and self.memory is not None:
+            self.memory.detach_memory()
+        
+        
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -302,31 +314,39 @@ class TAWRMACv1(L.LightningModule):
     
     
     def _shared_eval_step(self, batch, prefix):
-        sources = batch['sources'].cpu().numpy()
-        destinations = batch['destinations'].cpu().numpy()
-        timestamps = batch['timestamps'].cpu().numpy()
-        edge_idxs = batch['edge_idxs'].cpu().numpy()
-        neg_sources = batch['negative_sources'].cpu().numpy()
-        neg_destinations = batch['negative_destinations'].cpu().numpy()
+        sources = batch['sources']
+        destinations = batch['destinations']
+        timestamps = batch['timestamps']
+        edge_idxs = batch['edge_idxs']
+        neg_sources = batch['negative_sources']
+        neg_destinations = batch['negative_destinations']
+        batch_size = len(sources)
 
         pos_prob, neg_prob = self.compute_edge_probabilities(
             sources, destinations, neg_sources, neg_destinations,
-            timestamps, edge_idxs, self.n_neighbors)
+            timestamps, edge_idxs, self.n_neighbors
+        )
 
-        pos_label = torch.ones_like(pos_prob)
-        neg_label = torch.zeros_like(neg_prob)
+        pos_label = torch.ones_like(pos_prob, dtype=torch.long)
+        neg_label = torch.zeros_like(neg_prob, dtype=torch.long)
 
-        # Compute metrics
-        from torchmetrics import AUROC, AveragePrecision
-        auroc = AUROC(task='binary')
-        ap = AveragePrecision(task='binary')
-
-        # Concatenate predictions and labels for batch metric
         preds = torch.cat([pos_prob, neg_prob])
         targets = torch.cat([pos_label, neg_label])
 
-        self.log(f'{prefix}_auc', auroc(preds, targets), on_step=False, on_epoch=True)
-        self.log(f'{prefix}_ap', ap(preds, targets), on_step=False, on_epoch=True)
+        device = preds.device
+        if prefix == 'val':
+            auroc_metric = self.val_auroc.to(device)
+            ap_metric = self.val_ap.to(device)
+        else:
+            auroc_metric = self.test_auroc.to(device)
+            ap_metric = self.test_ap.to(device)
+
+        auc = auroc_metric(preds, targets)
+        ap = ap_metric(preds, targets)
+
+        self.log(f'{prefix}_auc', auc, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f'{prefix}_ap', ap, on_step=False, on_epoch=True, batch_size=batch_size)
+
         return {'preds': preds, 'targets': targets}
     
     def configure_optimizers(self):
@@ -411,13 +431,13 @@ class TAWRMACv1(L.LightningModule):
             neg_dst_restart_emb = neg_destination_node_embedding
         else:
             src_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self.device)
+                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
             dst_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self.device)
+                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
             neg_src_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self.device)
+                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
             neg_dst_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self.device)
+                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
 
             # Initialize the tensor with Xavier uniform
             torch.nn.init.xavier_uniform_(src_restart_emb)
@@ -773,6 +793,7 @@ class TAWRMACv1(L.LightningModule):
         # ndarray, shape (batch_size, num_neighbors ** self.walk_length), record the valid length of each walk
         walks_valid_lengths = (nodes_neighbor_ids != 0).sum(axis=-1)
 
+        walks_valid_lengths = np.maximum(walks_valid_lengths, 1)
         # get time features of nodes in the multi-hop graphs
         # check that the time of start node in each walk should be identical to the node in the batch
         assert (nodes_neighbor_times[:, :, 0] == node_interact_times.repeat(repeats=num_neighbors,
@@ -782,7 +803,7 @@ class TAWRMACv1(L.LightningModule):
         nodes_neighbor_delta_times = nodes_neighbor_times[:, :, 0][:, :, np.newaxis] - nodes_neighbor_times
         # Tensor, shape (batch_size, num_neighbors ** self.walk_length, self.walk_length + 1, time_feat_dim)
         neighbor_time_features = self.time_encoder(
-            torch.from_numpy(nodes_neighbor_delta_times).float().to(self.device).flatten(start_dim=1)) \
+            torch.from_numpy(nodes_neighbor_delta_times).float().to(self._device).flatten(start_dim=1)) \
             .reshape(nodes_neighbor_delta_times.shape[0], nodes_neighbor_delta_times.shape[1],
                      nodes_neighbor_delta_times.shape[2], self.time_feat_dim)
 
@@ -881,7 +902,7 @@ class TAWRMACv1(L.LightningModule):
 
     def get_raw_messages(self, source_nodes, source_node_embedding, destination_nodes,
                          destination_node_embedding, edge_times, edge_idxs):
-        edge_times = torch.from_numpy(edge_times).float().to(self.device)
+        edge_times = torch.from_numpy(edge_times).float().to(self._device)
         edge_features = self.edge_raw_features[edge_idxs]
 
         source_memory = self.memory.get_memory(source_nodes)

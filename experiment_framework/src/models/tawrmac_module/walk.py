@@ -226,6 +226,7 @@ class BiLSTMEncoder(torch.nn.Module):
         :param lengths: ndarray, shape (batch_size, num_neighbors ** self.walk_length), record the valid length of each walk
         :return:
         """
+        
         # Tensor, shape (batch_size * (num_neighbors ** self.walk_length), self.walk_length + 1, input_dim), which corresponds to the LSTM input (batch_size, seq_len, input_dim)
         inputs = inputs.reshape(inputs.shape[0] * inputs.shape[1], inputs.shape[2], inputs.shape[3])
         # a PackedSequence object, pack the padded sequence for efficient computation and avoid the errors of computing padded value, set enforce_sorted to False

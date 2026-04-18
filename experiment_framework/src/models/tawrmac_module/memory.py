@@ -71,8 +71,11 @@ class Memory(nn.Module):
             self.messages[k] = [(x[0].clone(), x[1].clone()) for x in v]
 
     def detach_memory(self):
-        self.memory.detach_()
+        self.memory.detach()
 
+        # if isinstance(self.last_update, torch.Tensor):
+        #     self.last_update = self.last_update.detach()
+        
         # Detach all stored messages
         for k, v in self.messages.items():
             new_node_messages = []

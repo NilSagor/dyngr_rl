@@ -104,13 +104,16 @@ class TAWRMACDataPipeline:
     def build_neighbor_finder(self) -> 'TAWRMACDataPipeline':
         """Build TAWRMAC NewNeighborFinder from training edges only."""
         train_mask = self.data['train_mask']
-        train_src = self.data['edges'][0][train_mask].cpu().numpy()
-        train_dst = self.data['edges'][1][train_mask].cpu().numpy()
+        train_edges = self.data['edges'][train_mask]  # shape: (num_train, 2)
+        train_src = train_edges[:, 0].cpu().numpy()
+        train_dst = train_edges[:, 1].cpu().numpy()
         train_ts = self.data['timestamps'][train_mask].cpu().numpy()
         train_eid = np.arange(len(train_src))
 
-        max_node_idx = max(train_src.max(), train_dst.max())
+        # Use total number of nodes, not just max in training
+        max_node_idx = self.data['num_nodes'] - 1
         adj_list = [[] for _ in range(max_node_idx + 1)]
+
         for src, dst, eid, ts in zip(train_src, train_dst, train_eid, train_ts):
             adj_list[src].append((dst, eid, ts))
             adj_list[dst].append((src, eid, ts))
@@ -154,8 +157,9 @@ class TAWRMACDataPipeline:
 
         for split, mask_key in zip(splits, masks):
             mask = self.data[mask_key]
-            src = self.data['edges'][0][mask].cpu().numpy()
-            dst = self.data['edges'][1][mask].cpu().numpy()
+            split_edges = self.data['edges'][mask]  # shape: (num_split, 2)
+            src = split_edges[:, 0].cpu().numpy()
+            dst = split_edges[:, 1].cpu().numpy()
             ts = self.data['timestamps'][mask].cpu().numpy()
 
             last_observed_time = None
@@ -172,7 +176,6 @@ class TAWRMACDataPipeline:
                 negative_sample_strategy=strategy if split != 'train' else 'random',
                 seed=self.config['experiment']['seed']
             )
-
         logger.info(f"Built TAWRMAC samplers with strategy '{strategy}'")
         return self
     
@@ -214,8 +217,9 @@ class TAWRMACDataPipeline:
 
         for split, mask_key in zip(splits, masks):
             mask = self.data[mask_key]
-            # edges is already a tensor; keep on CPU for dataset
-            edges = self.data['edges'][:, mask].cpu().numpy()
+            split_edges = self.data['edges'][mask]  # (num_split, 2)
+            # Transpose to (2, num_split) for dataset compatibility
+            edges = split_edges.T.cpu().numpy()  # shape (2, num_split)
             timestamps = self.data['timestamps'][mask].cpu().numpy()
             edge_idxs = np.arange(edges.shape[1])
 
@@ -227,7 +231,6 @@ class TAWRMACDataPipeline:
                 split=split,
                 batch_size=batch_size,
             )
-
         logger.info(f"Built datasets: { {k: len(v) for k, v in self.datasets.items()} }")
         return self
     

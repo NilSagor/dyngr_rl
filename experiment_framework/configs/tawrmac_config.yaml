@@ -55,7 +55,7 @@ model:
   weight_decay: 0.00001
 
 training:
-  batch_size: 256
+  batch_size: 200
   max_epochs: 50
   patience: 10
   gradient_clip_val: 1.0

@@ -110,71 +110,115 @@ class NewNeighborFinder:
         return self.cache.get(key)
 
     def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
-        """
-        Given a list of users ids and relative cut times, extracts a sampled temporal neighborhood of each user in the list.
-
-        Params
-        ------
-        src_idx_l: List[int]
-        cut_time_l: List[float],
-        num_neighbors: int
-        """
-        assert (len(source_nodes) == len(timestamps))
+        assert len(source_nodes) == len(timestamps)
 
         tmp_n_neighbors = n_neighbors if n_neighbors > 0 else 1
-        # NB! All interactions described in these matrices are sorted in each row by time
-        neighbors = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
-            np.int32)  # each entry in position (i,j) represent the id of the item targeted by user src_idx_l[i] with an interaction happening before cut_time_l[i]
-        edge_times = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
-            np.float32)  # each entry in position (i,j) represent the timestamp of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
-        edge_idxs = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
-            np.int32)  # each entry in position (i,j) represent the interaction index of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
+        neighbors = np.zeros((len(source_nodes), tmp_n_neighbors), dtype=np.int32)
+        edge_times = np.zeros((len(source_nodes), tmp_n_neighbors), dtype=np.float32)
+        edge_idxs = np.zeros((len(source_nodes), tmp_n_neighbors), dtype=np.int32)
 
-        assert len(self.all_source_neighbors) > 0
-        for i in range(len(source_nodes)):
-            # source_neighbors, source_edge_idxs, source_edge_times, node_neighbor_sampled_probabilities = self.find_before(
-            #     source_node, timestamp,
-            #     return_sampled_probabilities=self.sample_neighbor_strategy == 'time_interval_aware')  # extracts all neighbors, interactions indexes and timestamps of all interactions of user source_node happening before cut_time
-            source_neighbors, source_edge_idxs, source_edge_times, node_neighbor_sampled_probabilities = \
-                self.all_source_neighbors[i], self.all_source_edge_idx[i], self.all_source_edge_times[i], \
-                    None
-            if len(source_neighbors) > 0 and n_neighbors > 0:
-                # when self.sample_neighbor_strategy == 'uniform', we shuffle the data before sampling with node_neighbor_sampled_probabilities as None
+        for i, (src, ts) in enumerate(zip(source_nodes, timestamps)):
+            # Directly query neighbors before ts
+            src_neighbors, src_edge_idxs, src_edge_times, _ = self.find_before(src, ts)
 
-                if self.sample_neighbor_strategy == 'uniform':  # if we are applying uniform sampling, shuffles the data above before sampling
-                    # sampled_idx = np.random.randint(0, len(source_neighbors), n_neighbors)
-
-                    if self.seed is None:
-                        sampled_idx = np.random.choice(a=len(source_neighbors), size=n_neighbors,
-                                                       p=node_neighbor_sampled_probabilities)
+            if len(src_neighbors) > 0 and n_neighbors > 0:
+                if self.sample_neighbor_strategy == 'uniform':
+                    # Uniform sampling with probabilities (softmax if needed)
+                    _, _, _, probs = self.find_before(src, ts, return_sampled_probabilities=True)
+                    if probs is not None and len(probs) > 0:
+                        # Convert to probabilities
+                        probs = torch.softmax(torch.from_numpy(probs).float(), dim=0).numpy()
                     else:
-                        sampled_idx = self.random_state.choice(a=len(source_neighbors), size=n_neighbors,
-                                                               p=node_neighbor_sampled_probabilities)
-
-                    neighbors[i, :] = source_neighbors[sampled_idx]
-                    edge_times[i, :] = source_edge_times[sampled_idx]
-                    edge_idxs[i, :] = source_edge_idxs[sampled_idx]
-
-                    # re-sort based on time
+                        probs = None
+                    if self.seed is None:
+                        sampled_idx = np.random.choice(len(src_neighbors), size=n_neighbors, p=probs)
+                    else:
+                        sampled_idx = self.random_state.choice(len(src_neighbors), size=n_neighbors, p=probs)
+                    neighbors[i, :] = src_neighbors[sampled_idx]
+                    edge_times[i, :] = src_edge_times[sampled_idx]
+                    edge_idxs[i, :] = src_edge_idxs[sampled_idx]
+                    # Sort by time
                     pos = edge_times[i, :].argsort()
                     neighbors[i, :] = neighbors[i, :][pos]
                     edge_times[i, :] = edge_times[i, :][pos]
                     edge_idxs[i, :] = edge_idxs[i, :][pos]
                 else:
-                    # Take most recent interactions
-                    source_edge_times = source_edge_times[-n_neighbors:]
-                    source_neighbors = source_neighbors[-n_neighbors:]
-                    source_edge_idxs = source_edge_idxs[-n_neighbors:]
-
-                    assert (len(source_neighbors) <= n_neighbors)
-                    assert (len(source_edge_times) <= n_neighbors)
-                    assert (len(source_edge_idxs) <= n_neighbors)
-
-                    neighbors[i, n_neighbors - len(source_neighbors):] = source_neighbors
-                    edge_times[i, n_neighbors - len(source_edge_times):] = source_edge_times
-                    edge_idxs[i, n_neighbors - len(source_edge_idxs):] = source_edge_idxs
-
+                    # Take most recent n_neighbors
+                    src_edge_times = src_edge_times[-n_neighbors:]
+                    src_neighbors = src_neighbors[-n_neighbors:]
+                    src_edge_idxs = src_edge_idxs[-n_neighbors:]
+                    neighbors[i, n_neighbors - len(src_neighbors):] = src_neighbors
+                    edge_times[i, n_neighbors - len(src_edge_times):] = src_edge_times
+                    edge_idxs[i, n_neighbors - len(src_edge_idxs):] = src_edge_idxs
         return neighbors, edge_idxs, edge_times
+    
+    
+    # def get_temporal_neighbor(self, source_nodes, timestamps, n_neighbors=20):
+    #     """
+    #     Given a list of users ids and relative cut times, extracts a sampled temporal neighborhood of each user in the list.
+
+    #     Params
+    #     ------
+    #     src_idx_l: List[int]
+    #     cut_time_l: List[float],
+    #     num_neighbors: int
+    #     """
+    #     assert (len(source_nodes) == len(timestamps))
+
+    #     tmp_n_neighbors = n_neighbors if n_neighbors > 0 else 1
+    #     # NB! All interactions described in these matrices are sorted in each row by time
+    #     neighbors = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
+    #         np.int32)  # each entry in position (i,j) represent the id of the item targeted by user src_idx_l[i] with an interaction happening before cut_time_l[i]
+    #     edge_times = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
+    #         np.float32)  # each entry in position (i,j) represent the timestamp of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
+    #     edge_idxs = np.zeros((len(source_nodes), tmp_n_neighbors)).astype(
+    #         np.int32)  # each entry in position (i,j) represent the interaction index of an interaction between user src_idx_l[i] and item neighbors[i,j] happening before cut_time_l[i]
+
+    #     assert len(self.all_source_neighbors) > 0
+    #     for i in range(len(source_nodes)):
+    #         # source_neighbors, source_edge_idxs, source_edge_times, node_neighbor_sampled_probabilities = self.find_before(
+    #         #     source_node, timestamp,
+    #         #     return_sampled_probabilities=self.sample_neighbor_strategy == 'time_interval_aware')  # extracts all neighbors, interactions indexes and timestamps of all interactions of user source_node happening before cut_time
+    #         source_neighbors, source_edge_idxs, source_edge_times, node_neighbor_sampled_probabilities = \
+    #             self.all_source_neighbors[i], self.all_source_edge_idx[i], self.all_source_edge_times[i], \
+    #                 None
+    #         if len(source_neighbors) > 0 and n_neighbors > 0:
+    #             # when self.sample_neighbor_strategy == 'uniform', we shuffle the data before sampling with node_neighbor_sampled_probabilities as None
+
+    #             if self.sample_neighbor_strategy == 'uniform':  # if we are applying uniform sampling, shuffles the data above before sampling
+    #                 # sampled_idx = np.random.randint(0, len(source_neighbors), n_neighbors)
+
+    #                 if self.seed is None:
+    #                     sampled_idx = np.random.choice(a=len(source_neighbors), size=n_neighbors,
+    #                                                    p=node_neighbor_sampled_probabilities)
+    #                 else:
+    #                     sampled_idx = self.random_state.choice(a=len(source_neighbors), size=n_neighbors,
+    #                                                            p=node_neighbor_sampled_probabilities)
+
+    #                 neighbors[i, :] = source_neighbors[sampled_idx]
+    #                 edge_times[i, :] = source_edge_times[sampled_idx]
+    #                 edge_idxs[i, :] = source_edge_idxs[sampled_idx]
+
+    #                 # re-sort based on time
+    #                 pos = edge_times[i, :].argsort()
+    #                 neighbors[i, :] = neighbors[i, :][pos]
+    #                 edge_times[i, :] = edge_times[i, :][pos]
+    #                 edge_idxs[i, :] = edge_idxs[i, :][pos]
+    #             else:
+    #                 # Take most recent interactions
+    #                 source_edge_times = source_edge_times[-n_neighbors:]
+    #                 source_neighbors = source_neighbors[-n_neighbors:]
+    #                 source_edge_idxs = source_edge_idxs[-n_neighbors:]
+
+    #                 assert (len(source_neighbors) <= n_neighbors)
+    #                 assert (len(source_edge_times) <= n_neighbors)
+    #                 assert (len(source_edge_idxs) <= n_neighbors)
+
+    #                 neighbors[i, n_neighbors - len(source_neighbors):] = source_neighbors
+    #                 edge_times[i, n_neighbors - len(source_edge_times):] = source_edge_times
+    #                 edge_idxs[i, n_neighbors - len(source_edge_idxs):] = source_edge_idxs
+
+    #     return neighbors, edge_idxs, edge_times
 
     def find_all_first_hop(self, source_nodes, timestamps):
         self.all_source_neighbors = []
