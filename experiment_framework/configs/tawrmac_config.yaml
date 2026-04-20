@@ -44,7 +44,7 @@ model:
   num_walk_heads: 4
 
   # Co-occurrence module
-  enable_neighbor_cooc: false                # Set true if you have GPU memory
+  enable_neighbor_cooc: true                # Set true if you have GPU memory
   max_input_seq_length: 32
 
   # Neighbor sampling

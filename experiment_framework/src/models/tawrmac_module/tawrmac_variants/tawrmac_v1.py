@@ -101,28 +101,7 @@ class TAWRMACv1(L.LightningModule):
             self.neighbor_co_occurrence_encoder = NeighborCooccurrenceEncoder(
                 neighbor_co_occurrence_feat_dim=self.neighbor_co_occurrence_feat_dim,
                 device=self._device)
-
-
-
-
-        # if self.enable_walk:
-        #     self.walk_emb_dim = walk_emb_dim
-        #     self.position_feat_dim = position_feat_dim
-        #     self.walk_length = walk_length
-        #     self.num_walk_heads = num_walk_heads
-
-
-        #     self.position_encoder = PositionEncoder(position_feat_dim=self.position_feat_dim,
-        #                                             walk_length=self.walk_length,
-        #                                             device=device)
-
-        #     self.walk_encoder = WalkEncoder(
-        #         input_dim=self.n_node_features + self.n_edge_features + self.time_feat_dim + self.position_feat_dim,
-        #         position_feat_dim=self.position_feat_dim, output_dim=self.walk_emb_dim,
-        #         num_walk_heads=self.num_walk_heads,
-        #         dropout=dropout)
-        #     if self.enable_restart:
-        #         self.restart_prob = RestartMLP(dim=self.n_node_features)
+        
 
         # Walk setup
         if self.enable_walk:
@@ -144,49 +123,8 @@ class TAWRMACv1(L.LightningModule):
                 dropout=config.dropout)
             if self.enable_restart:
                 self.restart_prob = RestartMLP(dim=self.n_node_features)
-        
-        
-        
-        # if self.use_memory:
-        #     self.fixed_time_dim = fixed_time_dim
-        #     self.fixed_time_encoder = TimeEncode(dimension=self.fixed_time_dim, parameter_requires_grad=False)
-
-        #     self.memory_dimension = self.n_node_features
-        #     self.memory_update_at_start = memory_update_at_start
-        #     raw_message_dimension = 2 * self.memory_dimension + self.n_edge_features + \
-        #                             self.time_encoder.dimension
-
-
-        #     message_dimension = raw_message_dimension
-        #     self.memory = Memory(n_nodes=self.n_nodes,
-        #                          memory_dimension=self.memory_dimension,
-        #                          input_dimension=message_dimension,
-        #                          message_dimension=message_dimension,
-        #                          device=device)
-        #     self.message_aggregator = LastMessageAggregator(device=device)
-        #     self.message_function = IdentityMessageFunction()
-        #     self.memory_updater = GRUMemoryUpdater(memory=self.memory,
-        #                                            message_dimension=message_dimension,
-        #                                            memory_dimension=self.memory_dimension,
-        #                                            device=device)
-
-
-        #     self.embedding_module = GraphAttentionEmbedding(node_features=self.node_raw_features,
-        #                                                  edge_features=self.edge_raw_features,
-        #                                                  memory=self.memory,
-        #                                                  neighbor_finder=self.neighbor_finder,
-        #                                                  time_encoder=self.time_encoder,
-        #                                                  fixed_time_encoder=self.fixed_time_encoder,
-        #                                                  n_layers=self.n_layers,
-        #                                                  n_node_features=self.n_node_features,
-        #                                                  n_edge_features=self.n_edge_features,
-        #                                                  n_time_features=self.time_feat_dim,
-        #                                                  embedding_dimension=self.embedding_dimension,
-        #                                                  device=self._device,
-        #                                                  n_heads=n_heads, dropout=dropout,
-        #                                                  use_memory=True,
-        #                                                  n_fixed_time_features=self.fixed_time_dim)
-
+            
+       
         # Memory setup
         if self.use_memory:
             self.fixed_time_dim = config.fixed_time_dim
@@ -230,18 +168,6 @@ class TAWRMACv1(L.LightningModule):
                 n_fixed_time_features=self.fixed_time_dim
             )
 
-
-        # self.final_emb_dim = 0
-        # if self.use_memory:
-        #     self.final_emb_dim += self.n_node_features
-        # if self.enable_walk:
-        #     self.final_emb_dim += self.walk_emb_dim
-        #     if self.enable_restart:
-        #         self.final_emb_dim += 1
-        # if self.neighbor_cooc:
-        #     self.final_emb_dim += (self.max_input_sequence_length + 1) * self.neighbor_cooc_proj_out
-        # self.affinity_score = AffinityMergeLayer(self.final_emb_dim, self.final_emb_dim,
-        #                                          self.n_node_features, 1)
 
         # Final embedding dimension
         self.final_emb_dim = 0
@@ -330,8 +256,12 @@ class TAWRMACv1(L.LightningModule):
             timestamps, edge_idxs, self.n_neighbors
         )
 
+                
         pos_label = torch.ones_like(pos_prob, dtype=torch.long)
         neg_label = torch.zeros_like(neg_prob, dtype=torch.long)
+
+        loss = F.binary_cross_entropy(pos_prob, pos_label.float()) + \
+            F.binary_cross_entropy(neg_prob, neg_label.float())
 
         preds = torch.cat([pos_prob, neg_prob])
         targets = torch.cat([pos_label, neg_label])
@@ -351,6 +281,7 @@ class TAWRMACv1(L.LightningModule):
         ap = ap_metric(preds, targets)
         accuracy = accuracy_metric(preds, targets)
 
+        self.log(f"{prefix}_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log(f'{prefix}_auc', auc, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log(f'{prefix}_ap', ap, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log(f'{prefix}_accuracy', accuracy, on_step=False, on_epoch=True, batch_size=batch_size)
