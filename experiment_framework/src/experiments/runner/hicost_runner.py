@@ -4,7 +4,7 @@ from src.experiments.runner.tgn_runner import TGNRunner
 
 
 class HiCoSTRunner(TGNRunner):
-    """Runner for HiCoST variants (v1, v2, v3). Inherits pipeline setup from TGN."""
+    """Runner for HiCoST variants (v1, v2, v3, v4). Inherits pipeline setup from TGN."""
 
     def _log_model_status(self, model) -> None:
         super()._log_model_status(model)

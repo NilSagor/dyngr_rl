@@ -9,7 +9,7 @@ experiment:
   debug: false   # Set to true for FLOPs profiling
 
 data:
-  dataset: "wikipedia"
+  dataset: "reddit"
   evaluation_type: "transductive"               # "transductive","inductive"
   negative_sampling_strategy: "random"   # "random", "historical", "inductive"
   train_ratio: 0.7

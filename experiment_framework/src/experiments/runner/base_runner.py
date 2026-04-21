@@ -1,9 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import Dict
-
-from exp_utils.trainer_setup import TrainerSetup
-
-from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -16,7 +11,7 @@ from src.experiments.exp_utils.experiment_logger import ExperimentLogger
 from src.experiments.exp_utils.trainer_setup import TrainerSetup
 from src.experiments.exp_utils.analysis_callback import AnalysisCollector
 from src.experiments.exp_utils.clear_callback import ClearCacheCallback
-from lightning.pytorch.callbacks import EarlyStopping
+# from lightning.pytorch.callbacks import EarlyStopping
 
 
 class BaseRunner(ABC):
@@ -89,6 +84,16 @@ class BaseRunner(ABC):
 
         # 3. Model-specific setup
         self.setup_model(model, pipeline)
+
+        if self.config['experiment'].get('compile', False):
+            if torch.cuda.is_available() and hasattr(torch, 'compile'):
+                logger.info("Enabling torch.compile for model optimization...")
+                # Use "reduce-overhead" for RTX 5090 to get maximum speedup
+                model = torch.compile(model, mode="reduce-overhead")
+            else:
+                logger.warning("torch.compile requested but not supported/available.")
+
+
         self._log_model_status(model)
 
         # Validate model is ready (optional)
@@ -103,7 +108,10 @@ class BaseRunner(ABC):
         self.analysis_collector = AnalysisCollector()
 
         # 5. Trainer
-        trainer = TrainerSetup.create(self.config, callbacks=[self.analysis_collector, ClearCacheCallback()])
+        trainer = TrainerSetup.create(
+            self.config, 
+            callbacks=[self.analysis_collector, ClearCacheCallback()]
+        )
         logger.info(f"Trainer max_epochs: {trainer.max_epochs}")
 
         # 6. Training

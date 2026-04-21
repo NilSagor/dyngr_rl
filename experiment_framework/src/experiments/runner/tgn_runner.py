@@ -2,7 +2,8 @@ from typing import Dict, Any
 import torch
 from loguru import logger
 
-from src.datasets.continue_temporal.data_con_pipeline import DataPipeline
+# from src.datasets.continue_temporal.data_con_pipeline import DataPipeline
+from src.datasets.continue_temporal.hicost_pipeline import DataPipeline
 from src.experiments.runner.base_runner import BaseRunner
 from src.experiments.exp_utils.flops_calculator import FLOPsCalculator
 
@@ -40,10 +41,14 @@ class TGNRunner(BaseRunner):
         features = pipeline.get_features()
         model.set_raw_features(features['node_features'], features['edge_features'])
         model.set_neighbor_finder(pipeline.neighbor_finder)
-        model.set_graph(
-            pipeline.neighbor_finder.edge_index,
-            pipeline.neighbor_finder.edge_time
-        )
+        # model.set_graph(
+        #     pipeline.neighbor_finder.edge_index,
+        #     pipeline.neighbor_finder.edge_time
+        # )
+        if hasattr(pipeline.neighbor_finder, 'edge_index'):
+            model.set_graph(pipeline.neighbor_finder.edge_index, pipeline.neighbor_finder.edge_time)
+        else:
+            logger.warning("Neighbor finder lacks edge_index; graph not set. Walk sampler may not work.")
 
     def _profile_model(self, model: torch.nn.Module, pipeline) -> None:
         """Compute FLOPs for TGN-style models."""

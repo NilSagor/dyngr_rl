@@ -18,6 +18,7 @@ from src.models.enhanced_tgn.variants.tgn_v7 import TGNv7
 from src.models.enhanced_tgn.variants.hicost import HiCoST
 from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
 from src.models.enhanced_tgn.variants.hicostv3 import HiCoSTv3
+from src.models.enhanced_tgn.variants.hicostv4 import HiCoSTv4
 
 
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_v1 import TAWRMACv1
@@ -37,6 +38,7 @@ MODEL_REGISTRY = {
     "HiCoST": HiCoST,
     "HiCoSTv2": HiCoSTv2,
     "HiCoSTv3": HiCoSTv3,
+    "HiCoSTv4": HiCoSTv4,
     "TAWRMACv1": TAWRMACv1,
 }
 
@@ -63,6 +65,8 @@ class ModelFactory:
         #  HiCoSTv3 uses config dataclass
         if model_name == "HiCoSTv3":
             model = ModelFactory._create_hicostv3(model_config, data_info, config)
+        elif model_name == "HiCoSTv4":
+            model = ModelFactory._create_hicostv4(model_config, data_info, config)
         elif model_name == "TAWRMACv1":
             model = ModelFactory._create_tawrmacv1(model_config, data_info, config)
         else:
@@ -77,6 +81,103 @@ class ModelFactory:
         logger.info(f"Created {model_name}: {num_params:,} parameters")
         
         return model
+    
+    @staticmethod
+    def _create_hicostv4(model_config: Dict, data_info: Dict, full_config: Dict):
+        """Build HiCoSTConfig and instantiate HiCoSTv3."""
+      
+        
+        training_cfg = full_config.get('training', {})
+        
+        # Build config object from YAML dict
+        # Only include fields that exist in HiCoSTConfig dataclass
+        hicost_config = HiCoSTConfig(
+            # Required
+            num_nodes=data_info['num_nodes'],
+            
+            # Core dimensions 
+            node_feat_dim=data_info.get('node_feat_dim', data_info.get('node_features', 0)),
+            edge_feat_dim=data_info.get('edge_feat_dim', model_config.get('edge_features_dim', 64)),
+            edge_features_dim=model_config.get('edge_features_dim', 64),  # alias
+            hidden_dim=model_config.get('hidden_dim', 172),
+            memory_dim=model_config.get('memory_dim', 172),
+            time_dim=model_config.get('time_dim', 64),
+            
+            # Learning params
+            learning_rate=training_cfg.get('learning_rate', 1e-4),
+            weight_decay=training_cfg.get('weight_decay', 1e-5),
+            warmup_epochs=training_cfg.get('warmup_epochs', 0.1),
+            min_lr_ratio=training_cfg.get('min_lr_ratio', 0.01),
+            
+            # SAM params
+            num_prototypes=model_config.get('num_prototypes', 5),
+            sam_residual_alpha=model_config.get('sam_residual_alpha', 0.8),
+            sam_time_decay=model_config.get('sam_time_decay', 0.99),
+            use_sam=model_config.get('use_sam', True),
+            similarity_metric=model_config.get('similarity_metric', 'cosine'),
+            
+            # Walk sampler params
+            debug_simple_walk=model_config.get('debug_simple_walk', False),
+            walk_length_short=model_config.get('walk_length_short', 3),
+            walk_length_long=model_config.get('walk_length_long', 10),
+            walk_length_tawr=model_config.get('walk_length_tawr', 8),
+            num_walks_short=model_config.get('num_walks_short', 5),
+            num_walks_long=model_config.get('num_walks_long', 3),
+            num_walks_tawr=model_config.get('num_walks_tawr', 3),
+            walk_temperature=model_config.get('walk_temperature', 0.1),            
+            walk_time_noise_std=model_config.get('walk_time_noise_std', 0.0),
+            walk_mask_prob=model_config.get('walk_mask_prob', 0.05),
+            walk_adaptive_factor=model_config.get('walk_adaptive_factor', 0.5),
+            
+            # HCT params
+            use_hct=model_config.get('use_hct', True),
+            hct_d_model=model_config.get('hct_d_model', 128),
+            hct_nhead=model_config.get('hct_nhead', 2),
+            hct_num_layers=model_config.get('hct_num_layers', 1),
+            hct_num_intra_layers=model_config.get('hct_num_intra_layers', 2),
+            hct_num_inter_layers=model_config.get('hct_num_inter_layers', 2),
+            hct_drop_path=model_config.get('hct_drop_path', 0.1),
+            hct_sigma_time=model_config.get('hct_sigma_time', 5.0),
+            hct_cooccurrence_sigma=model_config.get('hct_cooccurrence_sigma', 2.0),
+            
+            # ST-ODE params
+            use_st_ode=model_config.get('use_st_ode', True),
+            ode_method=model_config.get('ode_method', 'dopri5'),
+            ode_mu=model_config.get('ode_mu', model_config.get('mu', 0.1)),  # handle alias
+            mu=model_config.get('mu', 0.1),
+            adaptive_mu=model_config.get('adaptive_mu', True),
+            ode_num_eig=model_config.get('ode_num_eig', 10),
+            ode_velocity_gate_thresh=model_config.get('ode_velocity_gate_thresh', 5.0),
+            st_ode_update_interval=model_config.get('st_ode_update_interval', 10),
+            ode_step_size=model_config.get('ode_step_size', 1.0),
+            use_gru_ode=model_config.get('use_gru_ode', True),
+            adjoint=model_config.get('adjoint', True),
+            
+            # MRP (GatedMutualRefinementPooling) params
+            mrp_fusion_mode=model_config.get('mrp_fusion_mode', 'gated_plus_residual'),
+            mrp_pool_attn_heads=model_config.get('mrp_pool_attn_heads', 1),
+            mrp_nhead=model_config.get('mrp_nhead', 4),
+            mrp_modalities=model_config.get('mrp_modalities', 3),
+            
+            # Hard negative mining
+            use_hard_negative_mining=model_config.get('use_hard_negative_mining', True),
+            neg_sample_ratio=model_config.get('neg_sample_ratio', 5),
+            hard_neg_threshold=model_config.get('hard_neg_threshold', 0.7),
+            label_smoothing=model_config.get('label_smoothing', 0.1),
+            
+            # Dropout & ablation flags
+            dropout=model_config.get('dropout', 0.1),
+            use_prototype_attention=model_config.get('use_prototype_attention', True),
+            use_hct_hierarchical=model_config.get('use_hct_hierarchical', True),
+            use_gated_refinement=model_config.get('use_gated_refinement', True),
+            use_multi_scale_walks=model_config.get('use_multi_scale_walks', True),
+        )
+        
+        logger.info(f"HiCoSTv4 config: memory_dim={hicost_config.memory_dim}, "
+                   f"fusion_mode={hicost_config.mrp_fusion_mode}")
+        
+        # Instantiate with config object
+        return MODEL_REGISTRY["HiCoSTv4"](config=hicost_config)
     
     @staticmethod
     def _create_hicostv3(model_config: Dict, data_info: Dict, full_config: Dict):

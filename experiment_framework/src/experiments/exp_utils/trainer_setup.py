@@ -6,7 +6,7 @@ from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, Callback
 from src.experiments.exp_utils.analysis_callback import AnalysisCollector
-from src.experiments.exp_utils.model_profile import ModelProfiler
+# from src.experiments.exp_utils.model_profile import ModelProfiler
 
 from lightning.pytorch.strategies import DDPStrategy
 
@@ -88,6 +88,7 @@ class TrainerSetup:
         if torch.cuda.is_available():
             if "RTX 40" in torch.cuda.get_device_name(0) or "RTX 50" in torch.cuda.get_device_name(0):
                 print("Detected RTX 40/50 series - enabling TF32 for faster training")
+                torch.set_float32_matmul_precision('high')
                 torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cuda.matmul.allow_tf32 = True
         
@@ -115,7 +116,6 @@ class TrainerSetup:
             gradient_clip_val=config['training']['gradient_clip_val'],
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
-            enable_progress_bar=True,
-            # compile=True,            
+            enable_progress_bar=True,                       
             # profiler=profiler,
         )
