@@ -1,7 +1,7 @@
-# tawrmac_config.py
-from dataclasses import dataclass, field
+# hicostdev_configdev1.py
+from dataclasses import dataclass
 from typing import Optional, Any
-import torch
+
 
 @dataclass
 class HiCoSTdev1Config:
@@ -33,6 +33,9 @@ class HiCoSTdev1Config:
     # Co-occurrence 
     enable_neighbor_cooc: bool = False
     max_input_seq_length: int = 32
+
+    # co-gnn
+    use_explicit_co_gnn: bool = True
 
     # time
     time_dim: int = 172

@@ -20,9 +20,11 @@ from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
 from src.models.enhanced_tgn.variants.hicostv3 import HiCoSTv3
 from src.models.enhanced_tgn.variants.hicostv4 import HiCoSTv4
 
-
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_v1 import TAWRMACv1
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_config import TAWRMACConfig
+
+from src.models.hicost_dev.hicost_variants.hicostdev1 import HiCoSTdev1
+from src.models.hicost_dev.hicost_variants.hicostdev_configdev1 import HiCoSTdev1Config
 
 
 # Constants
@@ -40,6 +42,7 @@ MODEL_REGISTRY = {
     "HiCoSTv3": HiCoSTv3,
     "HiCoSTv4": HiCoSTv4,
     "TAWRMACv1": TAWRMACv1,
+    "HiCoSTdev1": HiCoSTdev1,
 }
 
 
@@ -69,6 +72,8 @@ class ModelFactory:
             model = ModelFactory._create_hicostv4(model_config, data_info, config)
         elif model_name == "TAWRMACv1":
             model = ModelFactory._create_tawrmacv1(model_config, data_info, config)
+        elif model_name == "HiCoSTdev1":
+            model = ModelFactory._create_hicostdev1(model_config, data_info, config)
         else:
             # === Legacy path for all other models ===
             model_args = ModelFactory._build_legacy_args(model_class, model_config, data_info)
@@ -311,6 +316,43 @@ class ModelFactory:
             weight_decay=training_cfg.get('weight_decay', 1e-5),
         )
         return TAWRMACv1(config=tawrmac_cfg)
+    
+    @staticmethod
+    def _create_hicostdev1(model_config: Dict, data_info: Dict, full_config: Dict):     
+
+        training_cfg = full_config.get('training', {})
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Build config object
+        hicostdev1_cfg = HiCoSTdev1Config(
+            neighbor_finder=None,  # Will be set later via set_neighbor_finder
+            node_features=data_info.get('node_features'),
+            edge_features=data_info.get('edge_features'),
+            device=device,
+            n_layers=model_config.get('n_layers', 2),
+            n_heads=model_config.get('n_heads', 2),
+            dropout=model_config.get('dropout', 0.1),
+            use_memory=model_config.get('use_memory', False),
+            memory_update_at_start=model_config.get('memory_update_at_start', True),
+            memory_dimension=model_config.get('memory_dim', 500),
+            n_neighbors=model_config.get('n_neighbors', None),
+            enable_walk=model_config.get('enable_walk', False),
+            enable_restart=model_config.get('enable_restart', False),
+            pick_new_neighbors=model_config.get('pick_new_neighbors', False),
+            walk_emb_dim=model_config.get('walk_emb_dim', 172),
+            position_feat_dim=model_config.get('position_feat_dim', 100),
+            walk_length=model_config.get('walk_length', 4),
+            num_walks=model_config.get('num_walks', 10),
+            num_walk_heads=model_config.get('num_walk_heads', 4),
+            enable_neighbor_cooc=model_config.get('enable_neighbor_cooc', False),
+            use_explicit_co_gnn = model_config.get('use_explicit_co_gnn', True),
+            max_input_seq_length=model_config.get('max_input_seq_length', 32),
+            time_dim=model_config.get('time_dim', 172),
+            fixed_time_dim=model_config.get('fixed_time_dim', 20),
+            learning_rate=training_cfg.get('learning_rate', 1e-4),
+            weight_decay=training_cfg.get('weight_decay', 1e-5),
+        )
+        return HiCoSTdev1(config=hicostdev1_cfg)
     
     @staticmethod
     def _build_legacy_args(model_class, model_config: Dict, data_info: Dict) -> Dict:

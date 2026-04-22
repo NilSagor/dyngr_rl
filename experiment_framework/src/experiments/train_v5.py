@@ -25,6 +25,7 @@ from src.experiments.exp_utils.config_utils import (
 from src.experiments.runner.tgn_runner import TGNRunner
 from src.experiments.runner.hicost_runner import HiCoSTRunner
 from src.experiments.runner.tawrmac_runner import TAWRMACRunner
+from src.experiments.runner.hicostdev1_runner import HiCoSTdev1Runner
 
 
 
@@ -35,6 +36,8 @@ def get_runner(model_name: str):
         return TAWRMACRunner
     elif model_name.startswith('HiCoST'):
         return HiCoSTRunner
+    elif model_name.startswith('HiCoSTdev'):
+        return HiCoSTdev1Runner
     elif model_name in ['TGN', 'TGNv2', 'TGNv3', 'TGNv4', 'TGNv5', 'TGNv6', 'TGNv7', 'DyGFormer']:
         return TGNRunner
     else:

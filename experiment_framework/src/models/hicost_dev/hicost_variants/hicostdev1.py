@@ -356,15 +356,18 @@ class HiCoSTdev1(L.LightningModule):
     def on_train_epoch_start(self):
         # Build co-occurrence graph for explicit Co-GNN
         if self.use_explicit_co_gnn:
-            # Get edge_index from neighbor_finder if available
             if hasattr(self.neighbor_finder, 'edge_index'):
                 edge_index = self.neighbor_finder.edge_index
                 if edge_index is not None:
+                    # Move to model device before building graph
+                    edge_index = edge_index.to(self._device)
                     self.co_gnn_edge_index, self.co_gnn_edge_weight = build_cooccurrence_graph(edge_index, self.n_nodes)
-                    # Precompute Co-GNN embeddings for all nodes
                     self.update_co_gnn_embeddings()
+                else:
+                    logger.warning("edge_index is None; explicit Co-GNN disabled")
+                    self._c_emb = None
             else:
-                logger.warning("No edge_index in neighbor_finder; explicit Co-GNN disabled for this epoch")
+                logger.warning("No edge_index in neighbor_finder; explicit Co-GNN disabled")
                 self._c_emb = None
 
         if self.neighbor_finder is not None:
@@ -372,24 +375,33 @@ class HiCoSTdev1(L.LightningModule):
         if self.use_memory and self.memory is not None:
             self.memory.__init_memory__()
     
+    
     def update_co_gnn_embeddings(self):
         """Compute Co-GNN embeddings for all nodes and store in self._c_emb."""
         if not self.use_explicit_co_gnn:
             return
+        
+        # Use the stored co_gnn_edge_index/weight from on_train_epoch_start
         if not hasattr(self, 'co_gnn_edge_index') or self.co_gnn_edge_index is None:
+            logger.warning("co_gnn_edge_index not set; skipping Co-GNN update")
             return
 
-        # Build base node features: node_raw_features + memory
+        # Build base node features: node_raw_features + memory (if available)
         base_x = self.node_raw_features
         if self.use_memory and hasattr(self, 'memory') and self.memory is not None:
             base_x = base_x + self.memory.get_memory(list(range(self.n_nodes)))
 
-        # Run Co-GNN
+        # Move co-occurrence graph to the same device as base_x
+        edge_index = self.co_gnn_edge_index.to(base_x.device)
+        edge_weight = self.co_gnn_edge_weight.to(base_x.device)
+
         with torch.no_grad():
-            c_emb = self.co_gnn(base_x, self.co_gnn_edge_index, self.co_gnn_edge_weight)   # [N, out_dim]
+            c_emb = self.co_gnn(base_x, edge_index, edge_weight)
         self.register_buffer('_c_emb', c_emb)
 
-
+    
+    
+    
     def get_node_embedding_dim(self):
         return self.final_emb_dim
 
@@ -994,18 +1006,4 @@ class HiCoSTdev1(L.LightningModule):
         # Already set during init; can ignore or update if needed
         pass
 
-    def update_co_gnn_embeddings(self):
-        """Called at start of each epoch."""
-        if not self.use_explicit_co_gnn:
-            return
-        # Build co-occurrence graph
-        edge_index, edge_weight = build_cooccurrence_graph(self.edge_index, self.n_nodes)
-        # Build base node features (we can use node_raw_features + memory + walk? but walk is batch-specific)
-        # For simplicity, we use node_raw_features + memory (if memory exists)
-        base_x = self.node_raw_features
-        if self.use_memory:
-            base_x = base_x + self.memory.get_memory(list(range(self.n_nodes)))
-        # Run Co-GNN
-        with torch.no_grad():
-            c_emb = self.co_gnn(base_x, edge_index, edge_weight)   # [N, out_dim]
-        self._c_emb = c_emb
+   
