@@ -5,7 +5,7 @@ from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
 from loguru import logger
 
-from .time_encoding import TimeEncoder
+from .time_encoding import TimeEncode
 
 class MultiScaleWalkSampler(nn.Module):
     """
@@ -62,7 +62,7 @@ class MultiScaleWalkSampler(nn.Module):
         self._edges_initialized = False
         self.neighbor_cache: Dict[int, List[Tuple[int, float]]] = {}
         
-        self.time_encoder = TimeEncoder(time_dim)
+        self.time_encoder = TimeEncode(time_dim)
 
         self._dense_tables_built = False
         self._cached_edge_hash = None
@@ -334,20 +334,24 @@ class MultiScaleWalkSampler(nn.Module):
             valid_counts = valid_neighbor_mask.sum(dim=-1)
             has_valid = valid_counts > 0
 
-            #
+            # 
+            if self.use_temporal_bias:
 
-            t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
-            t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
+                t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
+                t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
 
-            time_diff = (neighbor_times - t_max) / safe_temp
-            time_diff = torch.clamp(time_diff, min=-50, max=50)
-            temp_weights = torch.exp(time_diff)
+                time_diff = (neighbor_times - t_max) / safe_temp
+                time_diff = torch.clamp(time_diff, min=-50, max=50)
+                temp_weights = torch.exp(time_diff)
             
-            temp_weights = temp_weights.masked_fill(~valid_neighbor_mask, 0.0)
+                weights = temp_weights.masked_fill(~valid_neighbor_mask, 0.0)
+            else:
+                weights = valid_neighbor_mask.float()
+
             fallback_weights = base_mask.float()
             
             has_valid = valid_neighbor_mask.sum(dim=-1) > 0
-            weights = torch.where(has_valid.unsqueeze(-1), temp_weights, fallback_weights)
+            weights = torch.where(has_valid.unsqueeze(-1), weights, fallback_weights)
             sampling_mask = torch.where(has_valid.unsqueeze(-1), valid_neighbor_mask, base_mask)
             
             weights = weights.masked_fill(~sampling_mask, 0.0)
@@ -496,17 +500,21 @@ class MultiScaleWalkSampler(nn.Module):
             has_any = base_mask.sum(dim=-1) > 0
             
             sampling_mask = torch.where(has_temporal.unsqueeze(-1), valid_neighbor_mask, base_mask)
+
+            if self.use_temporal_bias:         
+                t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
+                t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
             
-            t_max = neighbor_times.masked_fill(~base_mask, -float('inf')).max(dim=-1, keepdim=True)[0]
-            t_max = torch.where(t_max > -float('inf'), t_max, torch.zeros_like(t_max))
-            
-            time_diff = (neighbor_times - t_max) / safe_temp
-            time_diff = torch.clamp(time_diff, min=-50, max=50)
-            temporal_weights = torch.exp(time_diff)
-            temporal_weights = temporal_weights.masked_fill(~valid_neighbor_mask, 0.0)
+                time_diff = (neighbor_times - t_max) / safe_temp
+                time_diff = torch.clamp(time_diff, min=-50, max=50)
+                temporal_weights = torch.exp(time_diff)
+                weights = temporal_weights.masked_fill(~valid_neighbor_mask, 0.0)
+            else:
+                weights = valid_neighbor_mask.float()
+
 
             uniform_weights = base_mask.float()
-            weights = torch.where(has_temporal.unsqueeze(-1), temporal_weights, uniform_weights)
+            weights = torch.where(has_temporal.unsqueeze(-1), weights, uniform_weights)
             
             prob_sums = weights.sum(dim=-1, keepdim=True)
             probs = torch.where(

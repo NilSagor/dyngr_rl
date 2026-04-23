@@ -22,7 +22,7 @@ from src.models.hicost_dev.co_gnn import CoGNN
 from src.models.hicost_dev.time_delta_attention import TimeDeltaAttentionWalkEncoder
 from src.models.hicost_dev.multi_swalk import MultiScaleWalkSampler
 
-from .hicostdev_configdev1 import HiCoSTdev1Config
+from .hicostdev_configdev2 import HiCoSTdev2Config
 from dataclasses import asdict
 
 
@@ -61,7 +61,7 @@ def build_cooccurrence_graph(edge_index, num_nodes):
 
 
 class HiCoSTdev2(L.LightningModule):
-    def __init__(self, config:HiCoSTdev1Config):
+    def __init__(self, config:HiCoSTdev2Config):
         super(HiCoSTdev2, self).__init__()
         torch.autograd.set_detect_anomaly(True)
         self.save_hyperparameters(asdict(config))
@@ -81,17 +81,12 @@ class HiCoSTdev2(L.LightningModule):
         else:
             self.edge_raw_features = config.edge_features.to(self._device)
                
-        
-        
+    
         self.n_node_features = self.node_raw_features.shape[1]
         self.n_nodes = self.node_raw_features.shape[0]
         self.n_edge_features = self.edge_raw_features.shape[1]
         self.embedding_dimension = self.n_node_features
         self.n_neighbors = config.n_neighbors
-
-        
-        
-        
 
         self.use_memory = config.use_memory
         self.time_feat_dim = config.time_dim
@@ -105,10 +100,8 @@ class HiCoSTdev2(L.LightningModule):
         self.fixed_time_encoder = None
         
         self.use_time_delta_attention = getattr(config, 'use_time_delta_attention', False)
-        
-        
-      
-         # Co-occurrence setup
+ 
+        # Co-occurrence setup
         if self.neighbor_cooc:
             self.max_input_sequence_length = config.max_input_seq_length
             self.neighbor_cooc_proj_out = 10
