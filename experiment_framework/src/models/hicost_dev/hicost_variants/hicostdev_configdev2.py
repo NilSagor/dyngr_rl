@@ -30,7 +30,9 @@ class HiCoSTdev1Config:
     num_walks: int = 10
     num_walk_heads: int = 4
     
-   
+    # time_delta_attention_walk
+    use_time_delta_attention: bool = True
+    use_temporal_bias: bool = True
 
     # Co-occurrence 
     enable_neighbor_cooc: bool = False
