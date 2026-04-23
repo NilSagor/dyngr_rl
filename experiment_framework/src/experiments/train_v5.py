@@ -34,8 +34,8 @@ def get_runner(model_name: str):
     """Return appropriate runner class based on model name."""
     if model_name.startswith('TAWRMAC'):
         return TAWRMACRunner
-    elif model_name.startswith('HiCoST'):
-        return HiCoSTRunner
+    # elif model_name.startswith('HiCoST'):
+    #     return HiCoSTRunner
     elif model_name.startswith('HiCoSTdev'):
         return HiCoSTdev1Runner
     elif model_name in ['TGN', 'TGNv2', 'TGNv3', 'TGNv4', 'TGNv5', 'TGNv6', 'TGNv7', 'DyGFormer']:

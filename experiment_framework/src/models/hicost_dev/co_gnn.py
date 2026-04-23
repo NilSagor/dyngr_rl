@@ -10,8 +10,8 @@ class GCNLayer(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x, adj_norm):
-        # x: [N, in_dim]
-        # adj_norm: [N, N] symmetric normalized adjacency
+        # Ensure adj_norm is on the same device as x
+        adj_norm = adj_norm.to(x.device)
         return torch.mm(adj_norm, torch.mm(x, self.weight))
 
 class CoGNN(nn.Module):
@@ -21,7 +21,32 @@ class CoGNN(nn.Module):
         self.gcn2 = GCNLayer(hidden_dim, out_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, adj_norm):
+    def forward(self, x, edge_index, edge_weight=None):
+        device = x.device
+        num_nodes = x.size(0)
+
+        # Move inputs to device
+        edge_index = edge_index.to(device)
+        if edge_weight is None:
+            edge_weight = torch.ones(edge_index.size(1), device=device)
+        else:
+            edge_weight = edge_weight.to(device)
+
+        # Build sparse adjacency matrix
+        adj = torch.sparse_coo_tensor(edge_index, edge_weight, (num_nodes, num_nodes), device=device)
+
+        # Add self-loops
+        adj = adj + torch.eye(num_nodes, device=device).to_sparse()
+
+        # Degree and normalized Laplacian
+        deg = torch.sparse.sum(adj, dim=1).to_dense()
+        deg_inv_sqrt = torch.pow(deg + 1e-8, -0.5)
+        D_inv_sqrt = torch.diag(deg_inv_sqrt)
+
+        # Normalized adjacency: D^{-1/2} A D^{-1/2}
+        adj_norm = D_inv_sqrt @ adj.to_dense() @ D_inv_sqrt
+
+        # GCN layers
         x = F.relu(self.gcn1(x, adj_norm))
         x = self.dropout(x)
         x = self.gcn2(x, adj_norm)

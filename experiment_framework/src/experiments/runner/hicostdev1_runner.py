@@ -24,6 +24,12 @@ class HiCoSTdev1Runner(BaseRunner):
     def setup_model(self, model: torch.nn.Module, pipeline) -> None:
         # HiCoSTdev1 only needs neighbor finder; features already in config
         model.set_neighbor_finder(pipeline.neighbor_finder)
+        # Pass the training graph to model for Co-GNN
+        if hasattr(pipeline, 'train_edge_index') and pipeline.train_edge_index is not None:
+            model.set_graph(pipeline.train_edge_index, pipeline.train_edge_time)
+            logger.info("Co-GNN graph passed to model via set_graph")
+        else:
+            logger.warning("Pipeline missing train_edge_index; Co-GNN will use zero fallback")
 
     def _log_model_status(self, model: torch.nn.Module) -> None:
         logger.info(f"=== HiCoSTDev1 with CoGNN Model Status ===")

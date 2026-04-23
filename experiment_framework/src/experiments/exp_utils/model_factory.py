@@ -66,14 +66,14 @@ class ModelFactory:
         model_class = MODEL_REGISTRY[model_name]
         
         #  HiCoSTv3 uses config dataclass
-        if model_name == "HiCoSTv3":
-            model = ModelFactory._create_hicostv3(model_config, data_info, config)
-        elif model_name == "HiCoSTv4":
-            model = ModelFactory._create_hicostv4(model_config, data_info, config)
+        if model_name == "HiCoSTdev1":
+            model = ModelFactory._create_hicostdev1(model_config, data_info, config)
+        # if model_name == "HiCoSTv3":
+        #     model = ModelFactory._create_hicostv3(model_config, data_info, config)
+        # elif model_name == "HiCoSTv4":
+        #     model = ModelFactory._create_hicostv4(model_config, data_info, config)
         elif model_name == "TAWRMACv1":
             model = ModelFactory._create_tawrmacv1(model_config, data_info, config)
-        elif model_name == "HiCoSTdev1":
-            model = ModelFactory._create_hicostdev1(model_config, data_info, config)
         else:
             # === Legacy path for all other models ===
             model_args = ModelFactory._build_legacy_args(model_class, model_config, data_info)

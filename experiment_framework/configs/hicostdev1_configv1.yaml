@@ -2,8 +2,8 @@
 # Complete configuration for TAWRMACv1 training
 
 experiment:
-  name: "HiCoSTDev1"
-  description: "HiCostDev with co-gnn on Wikipedia"
+  name: "HiCoSTdev1"
+  description: "HiCoSTdev1 with co-gnn on Wikipedia"
   seed: 42
   precision: 32
   debug: false   # Set to true for FLOPs profiling
@@ -17,9 +17,10 @@ data:
   test_ratio: 0.15
   unseen_ratio: 0.1                          # Required for inductive
   validate_batches: true                     # Recommended
+  max_neighbors: 20
 
 model:
-  name: "HiCoSTDev1"                          # Must match registry key
+  name: "HiCoSTdev1"                          # Must match registry key
 
   # Core dimensions
   memory_dim: 172

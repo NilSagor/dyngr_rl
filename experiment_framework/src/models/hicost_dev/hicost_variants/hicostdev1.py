@@ -222,17 +222,18 @@ class HiCoSTdev1(L.LightningModule):
         )
 
         self.use_explicit_co_gnn = getattr(config, 'use_explicit_co_gnn', False)
+        self.co_gnn_out_dim = 32  # default, will be overwritten if co_gnn is created
         if self.use_explicit_co_gnn:
             # Co-GNN dimensions: input = final_emb_dim (before adding co-gnn output)
             # We will later concatenate c_u, so we increase final_emb_dim by out_dim
             self.co_gnn = CoGNN(
-                in_dim=self.final_emb_dim,
+                in_dim=self.n_node_features,
                 hidden_dim=64,
-                out_dim=32,
+                out_dim=self.co_gnn_out_dim,
                 dropout=config.dropout
             )
             # Increase final embedding dimension by 32
-            self.final_emb_dim += 32
+            self.final_emb_dim += self.co_gnn_out_dim
             # Recreate affinity_score with new dimension
             self.affinity_score = AffinityMergeLayer(
                 self.final_emb_dim, self.final_emb_dim,
@@ -249,6 +250,19 @@ class HiCoSTdev1(L.LightningModule):
         self.val_accuracy = Accuracy(task='binary')
         self.test_accuracy = Accuracy(task='binary')
 
+    # def on_fit_start(self):
+    #     """Called once when the trainer begins. Initialise Co-GNN embeddings."""
+    #     if self.use_explicit_co_gnn:
+    #         if hasattr(self.neighbor_finder, 'edge_index') and self.neighbor_finder.edge_index is not None:
+    #             edge_index = self.neighbor_finder.edge_index.to(self._device)
+    #             self.co_gnn_edge_index, self.co_gnn_edge_weight = build_cooccurrence_graph(edge_index, self.n_nodes)
+    #             self.update_co_gnn_embeddings()
+    #             logger.info("Co-GNN embeddings initialised on fit start")
+    #         else:
+    #             logger.warning("No edge_index in neighbor_finder; Co-GNN will be disabled")
+    #             self.use_explicit_co_gnn = False
+    
+    
     def forward(self, sources, destinations, timestamps, edge_idxs, negative_sources=None, negative_destinations=None):
         """Wrapper for edge probability computation."""
        
@@ -391,12 +405,15 @@ class HiCoSTdev1(L.LightningModule):
         if self.use_memory and hasattr(self, 'memory') and self.memory is not None:
             base_x = base_x + self.memory.get_memory(list(range(self.n_nodes)))
 
+        # Ensure co_gnn is on the same device as base_x
+        self.co_gnn = self.co_gnn.to(base_x.device)
+        
         # Move co-occurrence graph to the same device as base_x
         edge_index = self.co_gnn_edge_index.to(base_x.device)
         edge_weight = self.co_gnn_edge_weight.to(base_x.device)
 
         with torch.no_grad():
-            c_emb = self.co_gnn(base_x, edge_index, edge_weight)
+            c_emb = self.co_gnn(base_x, edge_index, edge_weight)   # [N, out_dim]
         self.register_buffer('_c_emb', c_emb)
 
     
@@ -586,17 +603,78 @@ class HiCoSTdev1(L.LightningModule):
                 self.update_memory(unique_destinations, destination_id_to_messages)
 
         # add explicit Co-GNN embeddings if enabled and available
-        if self.use_explicit_co_gnn and hasattr(self, '_c_emb') and self._c_emb is not None:
-            src_c = self._c_emb[source_nodes]
-            dst_c = self._c_emb[destination_nodes]
+        # if self.use_explicit_co_gnn: 
+        #     if hasattr(self, '_c_emb') and self._c_emb is not None:
+        #         src_c = self._c_emb[source_nodes]
+        #         dst_c = self._c_emb[destination_nodes]
+        #         source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
+        #         destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
+        #         if negative_sources is not None:
+        #             neg_src_c = self._c_emb[negative_sources]
+        #             neg_dst_c = self._c_emb[negative_destinations]
+        #             neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
+        #             neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
+        #     else:
+        #         # Fallback: use zeros
+        #         out_dim = 32  # match co_gnn.out_dim
+        #         src_c = torch.zeros(len(source_nodes), out_dim, device=self._device)
+        #         dst_c = torch.zeros(len(destination_nodes), out_dim, device=self._device)
+        #         logger.warning("Co-GNN embeddings missing; using zeros")
+        #         source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
+        #         destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
+        
+        # Add Co-GNN embeddings (or zeros if not available)
+        # out_dim = self.co_gnn_out_dim if hasattr(self, 'co_gnn_out_dim') else 32
+        # if hasattr(self, '_c_emb') and self._c_emb is not None:
+        #     src_c = self._c_emb[source_nodes]
+        #     dst_c = self._c_emb[destination_nodes]
+        #     if negative_sources is not None:
+        #         neg_src_c = self._c_emb[negative_sources]
+        #         neg_dst_c = self._c_emb[negative_destinations]
+        # else:
+        #     # Fallback: zeros
+        #     src_c = torch.zeros(len(source_nodes), out_dim, device=self._device)
+        #     dst_c = torch.zeros(len(destination_nodes), out_dim, device=self._device)
+        #     if negative_sources is not None:
+        #         neg_src_c = torch.zeros(len(negative_sources), out_dim, device=self._device)
+        #         neg_dst_c = torch.zeros(len(negative_destinations), out_dim, device=self._device)
+        #     logger.debug("Using zero Co-GNN embeddings (fallback)")
+
+        # Continue with normalization and memory update 
+        # source_node_embedding = F.normalize(source_node_embedding)
+        # destination_node_embedding = F.normalize(destination_node_embedding)
+        # if negative_sources is not None:
+        #     neg_source_node_embedding = F.normalize(neg_source_node_embedding)
+        #     neg_destination_node_embedding = F.normalize(neg_destination_node_embedding)
+        
+        # source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
+        # destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
+        # if negative_sources is not None:
+        #     neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
+        #     neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
+        
+        if self.use_explicit_co_gnn:
+            out_dim = self.co_gnn_out_dim
+            if hasattr(self, '_c_emb') and self._c_emb is not None:
+                src_c = self._c_emb[source_nodes]
+                dst_c = self._c_emb[destination_nodes]
+                if negative_sources is not None:
+                    neg_src_c = self._c_emb[negative_sources]
+                    neg_dst_c = self._c_emb[negative_destinations]
+            else:
+                src_c = torch.zeros(len(source_nodes), out_dim, device=self._device)
+                dst_c = torch.zeros(len(destination_nodes), out_dim, device=self._device)
+                if negative_sources is not None:
+                    neg_src_c = torch.zeros(len(negative_sources), out_dim, device=self._device)
+                    neg_dst_c = torch.zeros(len(negative_destinations), out_dim, device=self._device)
+                # logger.debug("Co-GNN embeddings not available; using zeros")
+
             source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
             destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
             if negative_sources is not None:
-                neg_src_c = self._c_emb[negative_sources]
-                neg_dst_c = self._c_emb[negative_destinations]
                 neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
                 neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
-
+        
         # Continue with normalization and memory update 
         source_node_embedding = F.normalize(source_node_embedding)
         destination_node_embedding = F.normalize(destination_node_embedding)
@@ -605,6 +683,10 @@ class HiCoSTdev1(L.LightningModule):
             neg_destination_node_embedding = F.normalize(neg_destination_node_embedding)
         
         
+        
+        # logger.debug(f"[DEBUG] source_node_embedding shape: {source_node_embedding.shape}")
+        # logger.debug(f"[DEBUG] self.final_emb_dim: {self.final_emb_dim}")
+
         return (
             source_node_embedding, destination_node_embedding, neg_source_node_embedding,
             neg_destination_node_embedding)  # , memory[-1].view(1, -1))
@@ -990,16 +1072,42 @@ class HiCoSTdev1(L.LightningModule):
     
     
 
+    # def set_neighbor_finder(self, neighbor_finder):
+    #     """Called by training pipeline to inject neighbor finder."""
+    #     self.neighbor_finder = neighbor_finder
+    #     if self.use_memory and hasattr(self, 'embedding_module'):
+    #         self.embedding_module.neighbor_finder = neighbor_finder
+
     def set_neighbor_finder(self, neighbor_finder):
         """Called by training pipeline to inject neighbor finder."""
         self.neighbor_finder = neighbor_finder
         if self.use_memory and hasattr(self, 'embedding_module'):
             self.embedding_module.neighbor_finder = neighbor_finder
 
+        # --- Co-GNN initialisation ---
+        if self.use_explicit_co_gnn:
+            if hasattr(neighbor_finder, 'edge_index') and neighbor_finder.edge_index is not None:
+                edge_index = neighbor_finder.edge_index.to(self._device)
+                self.co_gnn_edge_index, self.co_gnn_edge_weight = build_cooccurrence_graph(edge_index, self.n_nodes)
+                self.update_co_gnn_embeddings()
+                logger.info("Co-GNN graph built and embeddings initialised")
+            else:
+                logger.warning("Neighbor finder has no edge_index; Co-GNN embeddings will be zero (fallback)")
+                # self.use_explicit_co_gnn = False
+                self._c_emb = None
+    
+    # def set_graph(self, edge_index, edge_time):
+    #     """Called by training pipeline; TAWRMAC uses neighbor_finder instead."""
+    #     # Not needed, neighbor_finder already holds graph info
+    #     pass
     def set_graph(self, edge_index, edge_time):
-        """Called by training pipeline; TAWRMAC uses neighbor_finder instead."""
-        # Not needed, neighbor_finder already holds graph info
-        pass
+        self.edge_index = edge_index
+        self.edge_time = edge_time
+        if self.use_explicit_co_gnn:
+            edge_index = edge_index.to(self._device)
+            self.co_gnn_edge_index, self.co_gnn_edge_weight = build_cooccurrence_graph(edge_index, self.n_nodes)
+            self.update_co_gnn_embeddings()
+            logger.info("Co-GNN graph rebuilt from set_graph")
 
     def set_raw_features(self, node_features, edge_features):
         """Called by training pipeline to update raw features (optional)."""

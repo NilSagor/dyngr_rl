@@ -46,17 +46,7 @@ class DataPipeline:
         logger.info(f"Loaded: {self.data['num_nodes']} nodes, {self.data['statistics']['num_edges']} edges")
         return self
     
-    # def build_neighbor_finder(self) -> 'DataPipeline':
-    #     # Same as before – unchanged
-    #     train_edges = self.data['edges'][self.data['train_mask']]
-    #     train_ts = self.data['timestamps'][self.data['train_mask']]
-    #     self.neighbor_finder = NeighborFinder(
-    #         train_edges=train_edges,
-    #         train_timestamps=train_ts,
-    #         max_neighbors=self.config['data']['max_neighbors']
-    #     )
-    #     logger.info(f"Built leakage-proof NeighborFinder from {len(train_edges)} training edges")
-    #     return self
+   
     
     def build_neighbor_finder(self) -> 'DataPipeline':
         """Build neighbor finder from training edges only (leakage-proof)."""

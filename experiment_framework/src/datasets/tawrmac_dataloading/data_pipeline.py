@@ -123,6 +123,13 @@ class TAWRMACDataPipeline:
             sample_neighbor_strategy='uniform' if self.config['data'].get('uniform', False) else 'recent',
             seed=self.config['experiment']['seed']
         )
+        
+        self.train_edge_index = torch.tensor([train_src, train_dst], dtype=torch.long)
+        self.train_edge_time = torch.tensor(train_ts, dtype=torch.float)
+        
+        self.neighbor_finder.edge_index = self.train_edge_index
+        self.neighbor_finder.edge_time = self.train_edge_time
+        
         logger.info(f"Built TAWRMAC NewNeighborFinder from {len(train_src)} training edges")
         return self
     
