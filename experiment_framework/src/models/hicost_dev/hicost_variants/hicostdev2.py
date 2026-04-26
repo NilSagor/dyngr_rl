@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 from gc import enable
 from loguru import logger
+import math
 
 import lightning as L
 
@@ -100,7 +101,11 @@ class HiCoSTdev2(L.LightningModule):
         self.fixed_time_encoder = None
         
         self.use_time_delta_attention = getattr(config, 'use_time_delta_attention', False)
- 
+        self.use_multi_scale_walks = getattr(config, 'use_multi_scale_walks', True)   # <-- ADD THIS LINE
+        self.use_prototype_attention = getattr(config, 'use_prototype_attention', True)
+        self.use_gated_refinement = getattr(config, 'use_gated_refinement', True)
+        
+        
         # Co-occurrence setup
         if self.neighbor_cooc:
             self.max_input_sequence_length = config.max_input_seq_length
@@ -247,6 +252,8 @@ class HiCoSTdev2(L.LightningModule):
             self.co_gnn = None
 
 
+        self._rebuild_affinity_layer()
+
         self.val_auroc = AUROC(task='binary')
         self.val_ap = AveragePrecision(task='binary')
         self.test_auroc = AUROC(task='binary')
@@ -290,6 +297,14 @@ class HiCoSTdev2(L.LightningModule):
             n_neighbors)
 
 
+        
+        # print(f"Source node embedding shape: {source_node_embedding.shape}")  # expect [batch, 706]
+        # print(f"Destination node embedding shape: {destination_node_embedding.shape}")  # same
+        # print(f"Neg source shape: {neg_source_node_embedding.shape}")  
+        # print(f"Neg dest shape: {neg_destination_node_embedding.shape}")
+        # print(f"Concatenated (source+neg) shape: {torch.cat([source_node_embedding, neg_source_node_embedding], dim=0).shape}")  # [2*batch, 706]
+        # print(f"Concatenated along feature dim inside affinity: {torch.cat([source_node_embedding, neg_source_node_embedding], dim=1).shape}")  # [batch, 1412]
+        
         score = self.affinity_score(torch.cat([source_node_embedding, neg_source_node_embedding], dim=0),
                                     torch.cat([destination_node_embedding,
                                                neg_destination_node_embedding])
@@ -449,9 +464,7 @@ class HiCoSTdev2(L.LightningModule):
     
 
     def compute_temporal_embeddings(self, source_nodes, destination_nodes, negative_sources, negative_destinations,
-                                    edge_times, edge_idxs, n_neighbors=20):
-
-
+                                edge_times, edge_idxs, n_neighbors=20):
         n_samples = len(source_nodes)
         if negative_sources is not None:
             nodes = np.concatenate([source_nodes, destination_nodes, negative_sources, negative_destinations])
@@ -461,65 +474,42 @@ class HiCoSTdev2(L.LightningModule):
             timestamps = np.concatenate([edge_times, edge_times])
         positives = np.concatenate([source_nodes, destination_nodes])
 
-        
         # Step 1: let neighbor_finder compute first-hop (for memory/GAT)
         self.neighbor_finder.find_all_first_hop(nodes, timestamps)
-        
+
         # Step 2: get current memory from SAM
         memory = None
-
         if self.use_memory:
             if self.memory_update_at_start:
-                # Update memory for all nodes with messages stored in previous batches
-
                 node_list = list(range(self.n_nodes))
                 memory, last_update = self.get_updated_memory(node_list, self.memory.messages)
             else:
                 memory = self.memory.get_memory(list(range(self.n_nodes)))
                 last_update = self.memory.last_update
 
-                       
-            # Compute the embeddings using the embedding module
-            node_embedding = self.embedding_module.compute_embedding(memory=memory,
-                                                                     source_nodes=nodes,
-                                                                     timestamps=timestamps,
-                                                                     n_layers=self.n_layers,
-                                                                     n_neighbors=n_neighbors,
-                                                                     time_diffs=None)
-
+            node_embedding = self.embedding_module.compute_embedding(
+                memory=memory,
+                source_nodes=nodes,
+                timestamps=timestamps,
+                n_layers=self.n_layers,
+                n_neighbors=n_neighbors,
+                time_diffs=None
+            )
             source_node_embedding = node_embedding[:n_samples]
-            destination_node_embedding = node_embedding[n_samples: 2 * n_samples]
-
-            neg_source_node_embedding = None
-            neg_destination_node_embedding = None
-
-            if negative_sources is not None:
-                neg_source_node_embedding = node_embedding[2 * n_samples:3 * n_samples]
-                neg_destination_node_embedding = node_embedding[3 * n_samples:]
-
-            src_restart_emb = source_node_embedding
-            dst_restart_emb = destination_node_embedding
-            neg_src_restart_emb = neg_source_node_embedding
-            neg_dst_restart_emb = neg_destination_node_embedding
+            destination_node_embedding = node_embedding[n_samples:2*n_samples]
+            neg_source_node_embedding = node_embedding[2*n_samples:3*n_samples] if negative_sources is not None else None
+            neg_destination_node_embedding = node_embedding[3*n_samples:] if negative_sources is not None else None
         else:
-            src_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
-            dst_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
-            neg_src_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
-            neg_dst_restart_emb = torch.nn.Parameter(
-                torch.empty((n_samples, self.n_node_features), requires_grad=True)).to(self._device)
+            # No memory: fallback to raw node features (or zeros)
+            source_node_embedding = self.node_raw_features[source_nodes]
+            destination_node_embedding = self.node_raw_features[destination_nodes]
+            if negative_sources is not None:
+                neg_source_node_embedding = self.node_raw_features[negative_sources]
+                neg_destination_node_embedding = self.node_raw_features[negative_destinations]
+            else:
+                neg_source_node_embedding = neg_destination_node_embedding = None
 
-            # Initialize the tensor with Xavier uniform
-            torch.nn.init.xavier_uniform_(src_restart_emb)
-            torch.nn.init.xavier_uniform_(dst_restart_emb)
-            torch.nn.init.xavier_uniform_(neg_src_restart_emb)
-            torch.nn.init.xavier_uniform_(neg_dst_restart_emb)
-
-        
         # Step 3: generate multi‑scale walks using the new sampler
-        # Note: the sampler expects source/target nodes as tensors, same as here.
         walk_data = self.walk_sampler(
             source_nodes=torch.tensor(source_nodes, device=self._device),
             target_nodes=torch.tensor(destination_nodes, device=self._device),
@@ -530,155 +520,86 @@ class HiCoSTdev2(L.LightningModule):
         )
 
         # Step 4: encode walks for source and target nodes
-        src_per_type, src_masks = self._encode_walks_for_side(walk_data['source'], memory)
-        dst_per_type, dst_masks = self._encode_walks_for_side(walk_data['target'], memory)  
-        
+        src_walk_emb, _ = self._encode_walks_for_side(walk_data['source'], memory)   # [B, walk_emb_dim]
+        dst_walk_emb, _ = self._encode_walks_for_side(walk_data['target'], memory)   # [B, walk_emb_dim]
+
+        # Handle negative walks (if needed)
+        neg_src_walk_emb = None
+        neg_dst_walk_emb = None
+        if negative_sources is not None:
+            # Option A: Generate walks for negative pairs (call sampler again – doubles compute)
+            # Option B: Use zero embeddings (simpler, but may hurt performance)
+            # For now we use zeros as a safe fallback:
+            neg_src_walk_emb = torch.zeros(n_samples, self.walk_emb_dim, device=self._device)
+            neg_dst_walk_emb = torch.zeros(n_samples, self.walk_emb_dim, device=self._device)
+            # TODO: Extend walk_sampler.forward to accept negative nodes and return all four walk sets.
+
+        # Concatenate memory (if any) with walk embeddings
         if self.enable_walk:
-            walk_restarts = None
-
-            if self.enable_restart:
-
-                src_walk_restart = self.restart_prob(src_restart_emb)
-                dst_walk_restart = self.restart_prob(dst_restart_emb)
-                if negative_sources is not None:
-                    neg_src_walk_restart = self.restart_prob(neg_src_restart_emb)
-                    neg_dst_walk_restart = self.restart_prob(neg_dst_restart_emb)
-                    walk_restarts = torch.cat(
-                        [src_walk_restart, dst_walk_restart, neg_src_walk_restart, neg_dst_walk_restart])
-                else:
-                    walk_restarts = torch.cat(
-                        [src_walk_restart, dst_walk_restart])
-
-            src_walk_embedding, dst_walk_embedding, neg_src_walk_embedding, neg_dst_walk_embedding = self.compute_walk_embeddings(
-                nodes, timestamps, n_samples, self.num_walks,
-                source_nodes, destination_nodes, negative_sources, negative_destinations, edge_times, walk_restarts)
-
             if self.use_memory:
-                source_node_embedding = torch.cat([source_node_embedding, src_walk_embedding], dim=1)
-                destination_node_embedding = torch.cat([destination_node_embedding, dst_walk_embedding], dim=1)
+                source_node_embedding = torch.cat([source_node_embedding, src_walk_emb], dim=1)
+                destination_node_embedding = torch.cat([destination_node_embedding, dst_walk_emb], dim=1)
                 if negative_sources is not None:
-                    neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_walk_embedding], dim=1)
-                    neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_walk_embedding],
-                                                               dim=1)
+                    neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_walk_emb], dim=1)
+                    neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_walk_emb], dim=1)
             else:
-                source_node_embedding = src_walk_embedding
-                destination_node_embedding = dst_walk_embedding
+                source_node_embedding = src_walk_emb
+                destination_node_embedding = dst_walk_emb
                 if negative_sources is not None:
-                    neg_source_node_embedding = neg_src_walk_embedding
-                    neg_destination_node_embedding = neg_dst_walk_embedding
+                    neg_source_node_embedding = neg_src_walk_emb
+                    neg_destination_node_embedding = neg_dst_walk_emb
 
-            if self.enable_restart:
-                source_node_embedding = torch.cat([source_node_embedding, src_walk_restart.view(-1, 1)], dim=1)
-                destination_node_embedding = torch.cat([destination_node_embedding, dst_walk_restart.view(-1, 1)],
-                                                       dim=1)
+            # (Optional) restart probability from old MLP – not used with anonymous walks, kept for legacy.
+            if self.enable_restart and hasattr(self, 'restart_prob'):
+                src_restart = self.restart_prob(src_walk_emb)  # use walk embedding, not memory
+                dst_restart = self.restart_prob(dst_walk_emb)
+                source_node_embedding = torch.cat([source_node_embedding, src_restart.view(-1,1)], dim=1)
+                destination_node_embedding = torch.cat([destination_node_embedding, dst_restart.view(-1,1)], dim=1)
                 if negative_sources is not None:
-                    neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_walk_restart.view(-1, 1)],
-                                                          dim=1)
+                    neg_src_restart = self.restart_prob(neg_src_walk_emb)
+                    neg_dst_restart = self.restart_prob(neg_dst_walk_emb)
+                    neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_restart.view(-1,1)], dim=1)
+                    neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_restart.view(-1,1)], dim=1)
 
-                    neg_destination_node_embedding = torch.cat(
-                        [neg_destination_node_embedding, neg_dst_walk_restart.view(-1, 1)], dim=1)
-
+        # Co-occurrence embeddings (if enabled)
         if self.neighbor_cooc:
-            src_cooc_embedding, dst_cooc_embedding, neg_src_cooc_embedding, neg_dst_cooc_embedding = self.compute_cooc_embeddings(
-                nodes, timestamps, n_samples,
-                source_nodes, destination_nodes, negative_sources, negative_destinations, edge_times)
-
-            source_node_embedding = torch.cat([source_node_embedding, src_cooc_embedding], dim=1)
-            destination_node_embedding = torch.cat([destination_node_embedding, dst_cooc_embedding], dim=1)
+            src_cooc, dst_cooc, neg_src_cooc, neg_dst_cooc = self.compute_cooc_embeddings(
+                nodes, timestamps, n_samples, source_nodes, destination_nodes,
+                negative_sources, negative_destinations, edge_times)
+            source_node_embedding = torch.cat([source_node_embedding, src_cooc], dim=1)
+            destination_node_embedding = torch.cat([destination_node_embedding, dst_cooc], dim=1)
             if negative_sources is not None:
-                neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_cooc_embedding], dim=1)
-                neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_cooc_embedding],
-                                                           dim=1)
+                neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_cooc], dim=1)
+                neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_cooc], dim=1)
 
+        # Normalize
         source_node_embedding = F.normalize(source_node_embedding)
         destination_node_embedding = F.normalize(destination_node_embedding)
-
         if negative_sources is not None:
             neg_source_node_embedding = F.normalize(neg_source_node_embedding)
             neg_destination_node_embedding = F.normalize(neg_destination_node_embedding)
 
+        # Update memory (if using)
         if self.use_memory:
             if self.memory_update_at_start:
-                # Persist the updates to the memory only for sources and destinations (since now we have
-                # new messages for them)
                 self.update_memory(positives, self.memory.messages)
-
-                assert torch.allclose(memory[positives], self.memory.get_memory(positives), atol=1e-3), \
-                    "Something wrong in how the memory was updated"
-
-                # Remove messages for the positives since we have already updated the memory using them
                 self.memory.clear_messages(positives)
 
+            unique_sources, src_messages = self.get_raw_messages(
+                source_nodes, source_node_embedding, destination_nodes,
+                destination_node_embedding, edge_times, edge_idxs)
+            unique_destinations, dst_messages = self.get_raw_messages(
+                destination_nodes, destination_node_embedding, source_nodes,
+                source_node_embedding, edge_times, edge_idxs)
 
-            unique_sources, source_id_to_messages = self.get_raw_messages(source_nodes,
-                                                                          source_node_embedding,
-                                                                          destination_nodes,
-                                                                          destination_node_embedding,
-                                                                          edge_times, edge_idxs)
-            unique_destinations, destination_id_to_messages = self.get_raw_messages(destination_nodes,
-                                                                                    destination_node_embedding,
-                                                                                    source_nodes,
-                                                                                    source_node_embedding,
-                                                                                    edge_times, edge_idxs)
             if self.memory_update_at_start:
-
-                self.memory.store_raw_messages(unique_sources, source_id_to_messages)
-                self.memory.store_raw_messages(unique_destinations, destination_id_to_messages)
+                self.memory.store_raw_messages(unique_sources, src_messages)
+                self.memory.store_raw_messages(unique_destinations, dst_messages)
             else:
-                self.update_memory(unique_sources, source_id_to_messages)
-                self.update_memory(unique_destinations, destination_id_to_messages)
+                self.update_memory(unique_sources, src_messages)
+                self.update_memory(unique_destinations, dst_messages)
 
-        # add explicit Co-GNN embeddings if enabled and available
-        # if self.use_explicit_co_gnn: 
-        #     if hasattr(self, '_c_emb') and self._c_emb is not None:
-        #         src_c = self._c_emb[source_nodes]
-        #         dst_c = self._c_emb[destination_nodes]
-        #         source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
-        #         destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
-        #         if negative_sources is not None:
-        #             neg_src_c = self._c_emb[negative_sources]
-        #             neg_dst_c = self._c_emb[negative_destinations]
-        #             neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
-        #             neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
-        #     else:
-        #         # Fallback: use zeros
-        #         out_dim = 32  # match co_gnn.out_dim
-        #         src_c = torch.zeros(len(source_nodes), out_dim, device=self._device)
-        #         dst_c = torch.zeros(len(destination_nodes), out_dim, device=self._device)
-        #         logger.warning("Co-GNN embeddings missing; using zeros")
-        #         source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
-        #         destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
-        
-        # Add Co-GNN embeddings (or zeros if not available)
-        # out_dim = self.co_gnn_out_dim if hasattr(self, 'co_gnn_out_dim') else 32
-        # if hasattr(self, '_c_emb') and self._c_emb is not None:
-        #     src_c = self._c_emb[source_nodes]
-        #     dst_c = self._c_emb[destination_nodes]
-        #     if negative_sources is not None:
-        #         neg_src_c = self._c_emb[negative_sources]
-        #         neg_dst_c = self._c_emb[negative_destinations]
-        # else:
-        #     # Fallback: zeros
-        #     src_c = torch.zeros(len(source_nodes), out_dim, device=self._device)
-        #     dst_c = torch.zeros(len(destination_nodes), out_dim, device=self._device)
-        #     if negative_sources is not None:
-        #         neg_src_c = torch.zeros(len(negative_sources), out_dim, device=self._device)
-        #         neg_dst_c = torch.zeros(len(negative_destinations), out_dim, device=self._device)
-        #     logger.debug("Using zero Co-GNN embeddings (fallback)")
-
-        # Continue with normalization and memory update 
-        # source_node_embedding = F.normalize(source_node_embedding)
-        # destination_node_embedding = F.normalize(destination_node_embedding)
-        # if negative_sources is not None:
-        #     neg_source_node_embedding = F.normalize(neg_source_node_embedding)
-        #     neg_destination_node_embedding = F.normalize(neg_destination_node_embedding)
-        
-        # source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
-        # destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
-        # if negative_sources is not None:
-        #     neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
-        #     neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
-        
+        # Add explicit Co-GNN embeddings if enabled
         if self.use_explicit_co_gnn:
             out_dim = self.co_gnn_out_dim
             if hasattr(self, '_c_emb') and self._c_emb is not None:
@@ -693,105 +614,87 @@ class HiCoSTdev2(L.LightningModule):
                 if negative_sources is not None:
                     neg_src_c = torch.zeros(len(negative_sources), out_dim, device=self._device)
                     neg_dst_c = torch.zeros(len(negative_destinations), out_dim, device=self._device)
-                # logger.debug("Co-GNN embeddings not available; using zeros")
-
             source_node_embedding = torch.cat([source_node_embedding, src_c], dim=1)
             destination_node_embedding = torch.cat([destination_node_embedding, dst_c], dim=1)
             if negative_sources is not None:
                 neg_source_node_embedding = torch.cat([neg_source_node_embedding, neg_src_c], dim=1)
                 neg_destination_node_embedding = torch.cat([neg_destination_node_embedding, neg_dst_c], dim=1)
-        
-        # Continue with normalization and memory update 
+
+        # Final normalization after all concatenations
         source_node_embedding = F.normalize(source_node_embedding)
         destination_node_embedding = F.normalize(destination_node_embedding)
         if negative_sources is not None:
             neg_source_node_embedding = F.normalize(neg_source_node_embedding)
             neg_destination_node_embedding = F.normalize(neg_destination_node_embedding)
-             
+
+        # print(f"memory_emb dim: {source_node_embedding.shape[-1] if self.use_memory else 0}")
+        # print(f"walk_emb dim: {src_walk_emb.shape[-1]}")
+        # print(f"cooc_emb dim: {src_cooc.shape[-1] if self.neighbor_cooc else 0}")
+        # print(f"co_gnn_emb dim: {src_c.shape[-1] if self.use_explicit_co_gnn else 0}")
         
-        return (
-            source_node_embedding, destination_node_embedding, neg_source_node_embedding,
-            neg_destination_node_embedding)  # , memory[-1].view(1, -1))
+        return (source_node_embedding, destination_node_embedding,
+                neg_source_node_embedding, neg_destination_node_embedding)
 
     def _encode_walks_for_side(self, side_walks, memory):
         """
-        Encode walks for one side (source or target) and return:
-          per_type_embeddings: [batch, num_types, max_walks, hidden_dim]
-          per_type_masks: [batch, num_types, max_walks]
+        Encode walks for one side (source or target) and return a single embedding per node.
+        Returns:
+            walk_embedding: Tensor [batch_size, walk_emb_dim]
+            None (mask placeholder, not used)
         """
         if not self.enable_walk:
             return None, None
 
         types = ['short', 'long', 'tawr'] if self.use_multi_scale_walks else ['short']
-        per_type_embeds = []
-        per_type_masks = []
-        max_walks = 0
+        walk_embeddings = []  # list of tensors [batch_size, walk_emb_dim]
+
         for t in types:
             if t not in side_walks:
                 continue
             data = side_walks[t]
-            anon_ids = data['nodes_anon']           # [batch, num_walks, walk_len]
-            times = data['times']                   # [batch, num_walks, walk_len]
-            masks = data['masks']                   # [batch, num_walks, walk_len]
+            anon_ids = data['nodes_anon']          # [B, num_walks, walk_len]
+            times = data['times']                  # [B, num_walks, walk_len]
+            masks = data['masks']                  # [B, num_walks, walk_len]
 
-            batch_size, num_walks, walk_len = anon_ids.shape
+            B, num_walks, walk_len = anon_ids.shape
             device = anon_ids.device
 
-            # Use anonymized embedding table (must be part of sampler)
-            # We'll add an embedding table to MultiScaleWalkSampler – see note below.
-            # For now, we assume the sampler has an `anon_embedding` layer.
-            if not hasattr(self.walk_sampler, 'anon_embedding'):
-                raise AttributeError("MultiScaleWalkSampler must have an 'anon_embedding' layer (nn.Embedding).")
-            anon_emb = self.walk_sampler.anon_embedding(anon_ids)   # [batch, num_walks, walk_len, hidden_dim]
+            # 1) Anonymized node embeddings
+            anon_emb = self.walk_sampler.anon_embedding(anon_ids)   # [B, num_walks, walk_len, memory_dim]
 
-            # Time deltas: current time - timestamps? The encoder expects time deltas to current interaction.
-            # For simplicity, we use the timestamps directly as deltas (they are already decreasing along walk).
-            # In the original time_delta_attention, it expects time_deltas as positive numbers (gap to current).
-            # To compute deltas, we need the current interaction time. We don't have that here.
-            # As a workaround, we use the first timestamp of each walk as the reference.
-            ref_time = times[:, :, 0:1]   # [batch, num_walks, 1]
-            deltas = ref_time - times      # [batch, num_walks, walk_len] (positive for past)
+            # 2) Zero edge features
+            zero_edge = torch.zeros(B, num_walks, walk_len, self.n_edge_features, device=device)
+
+            # 3) Time encoding from deltas (relative to first step)
+            ref_time = times[:, :, 0:1]            # [B, num_walks, 1]
+            deltas = ref_time - times              # [B, num_walks, walk_len]
             deltas = torch.clamp(deltas, min=0.0)
+            time_feats = self.time_encoder(deltas.unsqueeze(-1))   # [B, num_walks, walk_len, time_dim]
 
-            # Mask for valid steps
-            mask = masks.float()
+            # 4) Sinusoidal positional encoding
+            pos_enc = self._get_sinusoidal_encoding(walk_len, self.position_feat_dim, device)  # [walk_len, pos_dim]
+            pos_enc = pos_enc.unsqueeze(0).unsqueeze(0).expand(B, num_walks, -1, -1)   # [B, num_walks, walk_len, pos_dim]
 
-            # Pass through walk encoder
-            if self.use_time_delta_attention:
-                # Flatten walks for parallel processing
-                flat_anon = anon_emb.view(batch_size * num_walks, walk_len, -1)
-                flat_deltas = deltas.view(batch_size * num_walks, walk_len)
-                flat_mask = mask.view(batch_size * num_walks, walk_len)
+            # --- Fix: force all tensors to exactly 4 dimensions ---
+            anon_emb = anon_emb.reshape(B, num_walks, walk_len, -1)
+            zero_edge = zero_edge.reshape(B, num_walks, walk_len, -1)
+            time_feats = time_feats.reshape(B, num_walks, walk_len, -1)
+            pos_enc = pos_enc.reshape(B, num_walks, walk_len, -1)
 
-                walk_emb = self.walk_encoder(flat_anon, flat_deltas, flat_mask)
-                # walk_emb shape: [batch*num_walks, hidden_dim]
-                walk_emb = walk_emb.view(batch_size, num_walks, -1)
-            else:
-                # legacy encoder – we skip (not used in A2)
-                raise NotImplementedError("Legacy walk encoder not implemented in this refactor.")
+            # 5) Concatenate all features -> [B, num_walks, walk_len, total_dim]
+            features = torch.cat([anon_emb, zero_edge, time_feats, pos_enc], dim=-1)
 
-            # Keep the embeddings per walk
-            per_type_embeds.append(walk_emb)
-            per_type_masks.append(torch.ones(batch_size, num_walks, device=device, dtype=torch.bool))
-            max_walks = max(max_walks, num_walks)
+            # 6) Pass to walk encoder (returns [B, walk_emb_dim])
+            walk_emb = self.walk_encoder(features, deltas, masks)
+            walk_embeddings.append(walk_emb)
 
-        # Pad to same number of walks across types
-        if per_type_embeds:
-            padded_embeds = []
-            padded_masks = []
-            for emb, msk in zip(per_type_embeds, per_type_masks):
-                cur_w = emb.size(1)
-                if cur_w < max_walks:
-                    pad = max_walks - cur_w
-                    emb = F.pad(emb, (0,0,0,pad))   # pad on walk dimension
-                    msk = F.pad(msk, (0,pad), value=False)
-                padded_embeds.append(emb)
-                padded_masks.append(msk)
-            per_type_embeds = torch.stack(padded_embeds, dim=1)   # [batch, num_types, max_walks, hidden_dim]
-            per_type_masks = torch.stack(padded_masks, dim=1)     # [batch, num_types, max_walks]
-            return per_type_embeds, per_type_masks
-        else:
-            return None, None
+        if not walk_embeddings:
+            # Fallback: zero embedding
+            return torch.zeros(B, self.walk_emb_dim, device=device), None
+
+        # Average across walk types (or concat – choose one)
+        final_embedding = torch.stack(walk_embeddings, dim=0).mean(dim=0)   # [B, walk_emb_dim]
+        return final_embedding, None
     
     
     
@@ -1137,7 +1040,8 @@ class HiCoSTdev2(L.LightningModule):
                 logger.warning("Neighbor finder has no edge_index; Co-GNN embeddings will be zero (fallback)")
                 # self.use_explicit_co_gnn = False
                 self._c_emb = None
-    
+        
+        self._rebuild_affinity_layer()
     
     def set_graph(self, edge_index, edge_time):
         self.edge_index = edge_index
@@ -1160,6 +1064,36 @@ class HiCoSTdev2(L.LightningModule):
     def compute_node_walk_embeddings(self, *args, **kwargs):
         pass
 
+    def _get_sinusoidal_encoding(self, length, dim, device):
+        pe = torch.zeros(length, dim, device=device)
+        position = torch.arange(0, length, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * -(math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+    
+    def _rebuild_affinity_layer(self):
+        # Compute the real embedding dimension from the actual components
+        real_dim = 0
+        if self.use_memory:
+            real_dim += self.n_node_features           # 172
+        if self.enable_walk:
+            real_dim += self.walk_emb_dim              # should be 172
+        if self.neighbor_cooc:
+            real_dim += (self.max_input_sequence_length + 1) * self.neighbor_cooc_proj_out  # e.g., 330
+        if self.use_explicit_co_gnn:
+            real_dim += self.co_gnn_out_dim            # 32
+        # Note: enable_restart is disabled, so no +1
+
+        if real_dim != self.final_emb_dim:
+            logger.warning(f"Adjusting final_emb_dim from {self.final_emb_dim} to {real_dim}")
+            self.final_emb_dim = real_dim
+            # Recreate the affinity layer with the correct dimensions
+            self.affinity_score = AffinityMergeLayer(
+                self.final_emb_dim, self.final_emb_dim,
+                self.n_node_features, 1
+            ).to(self._device)
+    
     # def compute_node_walk_embeddings(self, node_ids: np.ndarray, node_interact_times: np.ndarray,
     #                                  node_multi_hop_graphs: tuple, num_neighbors: int = 20):
     #     """

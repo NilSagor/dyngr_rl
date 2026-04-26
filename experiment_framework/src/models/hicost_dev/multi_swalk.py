@@ -70,6 +70,13 @@ class MultiScaleWalkSampler(nn.Module):
         self.register_buffer('global_min_time', torch.tensor(0.0))
         self.register_buffer('global_max_time', torch.tensor(0.0))
 
+        max_anon_nodes = 200
+        self.anon_embedding = nn.Embedding(
+            num_embeddings=max_anon_nodes,   # e.g., 100
+            embedding_dim=memory_dim,
+            padding_idx=0
+        )
+
         # check attributes exist 
         required_attrs = ['temperature', 'safe_temperature', 'time_noise_std', 'mask_prob']
         for attr in required_attrs:

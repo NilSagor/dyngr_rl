@@ -38,7 +38,7 @@ model:
 
   # Walk module
   enable_walk: true
-  enable_restart: true
+  enable_restart: false
   pick_new_neighbors: false
   walk_length: 4
   num_walks: 10
