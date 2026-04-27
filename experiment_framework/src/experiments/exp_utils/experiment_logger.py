@@ -21,9 +21,13 @@ class ExperimentLogger:
         ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.csv_path = self.log_dir.parent / csv_filename
+        # self.csv_path = self.log_dir.parent / csv_filename
+        self.csv_path = self.log_dir / csv_filename
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+               
+        
+        
         # Analysis subdirectories
         self.walks_dir = self.log_dir / "walks"
         self.memory_dir = self.log_dir / "memory"
@@ -46,6 +50,8 @@ class ExperimentLogger:
         model: torch.nn.Module,
         count_trainable_only: bool = True,
         # New optional analysis data
+        best_val_metric: Optional[float] = None, 
+        monitor_name: str = 'val_ap',
         walk_stats: Optional[Dict] = None,           # TAWR walk statistics
         memory_trace: Optional[List[torch.Tensor]] = None,  # Prototype attention over epochs
         ode_trajectory: Optional[Dict] = None,       # ST-ODE dynamics
@@ -55,7 +61,9 @@ class ExperimentLogger:
         """Log experiment results to CSV."""
         if not test_results:
             raise ValueError("test_results must be non-empty")
-
+        
+        
+        
         # Safely extract metrics, warn if missing
         first_result = test_results[0]
         metrics = {
@@ -80,6 +88,8 @@ class ExperimentLogger:
             'evaluation_type': config['data']['evaluation_type'],
             'negative_sampling_strategy': config['data']['negative_sampling_strategy'],
             'seed': config['experiment']['seed'],
+            'best_val_metric': best_val_metric,
+            'monitor_metric': monitor_name,
             'test_accuracy': metrics['test_accuracy'],
             'test_ap': metrics['test_ap'],
             'test_auc': metrics['test_auc'],
@@ -88,6 +98,24 @@ class ExperimentLogger:
             'num_parameters': num_params,
             'timestamp': datetime.now().isoformat(),
         }
+
+
+        # ── Inject architecture & training params into the row ──
+        model_cfg = config.get('model', {})
+        train_cfg = config.get('training', {})
+
+        # Architecture flags (all boolean/enum values)
+        for key in ['use_memory', 'enable_walk', 'enable_restart', 'enable_neighbor_cooc',
+                    'use_explicit_co_gnn', 'n_layers', 'n_heads', 'dropout',
+                    'walk_length', 'num_walks', 'n_neighbors']:
+            row[key] = model_cfg.get(key)
+        
+        # Training hyperparams
+        for key in ['learning_rate', 'weight_decay', 'batch_size']:
+            row[key] = train_cfg.get(key)       
+        
+        row['best_val_metric'] = best_val_metric
+        row['monitor_metric'] = monitor_name
 
         file_exists = self.csv_path.exists()
         with open(self.csv_path, 'a', newline='') as f:

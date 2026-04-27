@@ -3,8 +3,9 @@ from .base_runner import BaseRunner
 from .tawrmac_runner import TAWRMACRunner
 from .tgn_runner import TGNRunner
 from .hicost_runner import HiCoSTRunner
-from .hicostdev1_runner import HiCoSTdev1Runner
-from .hicostdev2_runner import HiCoSTdev2Runner
+from .hicost_dev_runner import HiCoSTDevRunner
+# from .hicostdev1_runner import HiCoSTdev1Runner
+# from .hicostdev2_runner import HiCoSTdev2Runner
 # from .freedyg_runner import FreeDyGRunner   # if exists
 
 
@@ -20,12 +21,12 @@ RUNNER_REGISTRY = {
     "TGNv7": TGNRunner,
     "DyGFormer": TGNRunner,           # DyGFormer uses same runner as TGN
     # "FreeDyG": FreeDyGRunner,
-    "HiCoST": HiCoSTRunner,
-    "HiCoSTv2": HiCoSTRunner,
-    "HiCoSTv3": HiCoSTRunner,
-    "HiCoSTv4": HiCoSTRunner,
-    "HiCoSTdev1": HiCoSTdev1Runner,
-    "HiCoSTdev2": HiCoSTdev2Runner,
+    # "HiCoST": HiCoSTRunner,
+    # "HiCoSTv2": HiCoSTRunner,
+    # "HiCoSTv3": HiCoSTRunner,
+    # "HiCoSTv4": HiCoSTRunner,
+    "HiCoSTdev1": HiCoSTDevRunner,
+    "HiCoSTdev2": HiCoSTDevRunner,
 }
 
 

@@ -1,6 +1,6 @@
-# configs/hicost_dev/v1.yaml
-# Complete configuration for HiCoST with co-gnn training
-
+# experiment_framework/configs/hicost_dev/v1.yaml
+# Complete configuration for V1: baseline TAWRMAC + HiCoST with co-gnn training
+# v1_plus_co_gnn
 experiment:
   name: "HiCoSTdev1"
   description: "HiCoSTdev1 with co-gnn on Wikipedia"
@@ -52,11 +52,11 @@ model:
   n_neighbors: 10                            # Number of temporal neighbors to sample
 
   # Optimizer
-  learning_rate: 0.0001
-  weight_decay: 0.00001
+  # learning_rate: 0.0001
+  # weight_decay: 0.00001
 
   # explicit co-gnn
-  use_explicit_co_gnn: true
+  use_explicit_co_gnn: false
 
 training:
   learning_rate: 0.0001
@@ -70,6 +70,7 @@ training:
   monitor: "val_ap"
   mode: "max"
   save_top_k: 3
+  dev_fast_run: true
 
 
 hardware:                                     # Required by TrainerSetup
@@ -88,6 +89,9 @@ profiling:
 #   gradient_clip_val: 1.0
 #   val_check_interval: 1.0                    # Check every epoch
 #   log_every_n_steps: 10
+
+# pass it to the Lightning Trainer as default_root_dir. Lightning will automatically create checkpoints/ and logs/ inside that run folder.
+# run_dir = f"experiments/outputs/{config['experiment']['name']}_{timestamp}"
 
 # logging:
 #   log_dir: "logs/"

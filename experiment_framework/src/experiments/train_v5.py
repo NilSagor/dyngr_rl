@@ -80,9 +80,9 @@ def main():
     for seed in seeds:
         config = build_experiment_config(config, seed)
 
-        log_path = Path(config['logging']['log_dir']) / 'train.log'
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.add(str(log_path), rotation="10 MB", level="INFO")
+        # log_path = Path(config['logging']['log_dir']) / 'train.log'
+        # log_path.parent.mkdir(parents=True, exist_ok=True)
+        # logger.add(str(log_path), rotation="10 MB", level="INFO")
 
         # Get runner class and execute
         runner_class = get_runner(config['model']['name'])        

@@ -1,6 +1,7 @@
 import torch 
 from typing import Dict, List, Optional, Any
 from loguru import logger
+from pathlib import Path
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 
 import lightning as L
@@ -18,32 +19,46 @@ class TrainerSetup:
     """Encapsulates trainer configuration."""
     
     @staticmethod
-    def create(config: Dict, callbacks: Optional[List[Callback]] = None) -> L.Trainer:
+    def create(
+        config: Dict, 
+        callbacks: Optional[List[Callback]] = None,
+        default_root_dir: Optional[str] = None,   
+        fast_dev_run: bool = False                
+    ) -> L.Trainer:
         """Create PyTorch Lightning trainer."""
+        
+        if default_root_dir:
+            ckpt_dir = str(Path(default_root_dir) / "checkpoints")
+            log_dir  = str(Path(default_root_dir) / "logs")
+        else:
+            ckpt_dir = config['logging']['checkpoint_dir']
+            log_dir  = config['logging']['log_dir']
+        
+        # ------ callbacks ------
         base_callbacks = [
             ModelCheckpoint(
-                dirpath=config['logging']['checkpoint_dir'],
+                dirpath=ckpt_dir,
                 filename='{epoch}-{val_ap:.2f}',
-                monitor=config['logging']['monitor'],
-                mode=config['logging']['mode'],
-                save_top_k=config['logging']['save_top_k'],
+                monitor=config['training']['monitor'],
+                mode=config['training']['mode'],
+                save_top_k=config['training']['save_top_k'],
                 verbose=True,
             ),
             EarlyStopping(
-                monitor=config['logging']['monitor'],
+                monitor=config['training']['monitor'],
                 patience=config['training']['patience'],
-                mode=config['logging']['mode'],
+                mode=config['training']['mode'],
                 verbose=True,
             ),
-            LearningRateMonitor(logging_interval='epoch'),           
+            LearningRateMonitor(logging_interval='epoch'),          
             # ReduceLROnPlateau(monitor='val_ap', mode='max', patience=10, factor=0.5)
         ]
 
-        has_analysis_collector = any(
-            isinstance(c, AnalysisCollector) for c in (callbacks or [])
-        )
-        if not has_analysis_collector:
-            base_callbacks.append(AnalysisCollector())
+        # has_analysis_collector = any(
+        #     isinstance(c, AnalysisCollector) for c in (callbacks or [])
+        # )
+        # if not has_analysis_collector:
+        #     base_callbacks.append(AnalysisCollector())
 
         if callbacks:
             for cb in callbacks:
@@ -52,20 +67,19 @@ class TrainerSetup:
         
         all_callbacks = base_callbacks
         
+        # ------ loggers ------
         loggers = [
-            CSVLogger(
-                save_dir=config['logging']['log_dir'],
-                name=config['experiment']['name']
-            ),
+            CSVLogger(save_dir=log_dir, name=config['experiment']['name']),
         ]
-        
         if config.get('logger', 'tensorboard') == 'tensorboard':
             loggers.append(
                 TensorBoardLogger(
-                    save_dir=config['logging']['log_dir'],
+                    save_dir=log_dir, 
                     name=config['experiment']['name']
                 )
             )
+
+
         
         accelerator = 'gpu' if config['hardware']['gpus'] else 'cpu'
         devices = config['hardware']['gpus'] if config['hardware']['gpus'] else 'auto'
@@ -92,30 +106,29 @@ class TrainerSetup:
                 torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cuda.matmul.allow_tf32 = True
         
-        # profiler = None
-        # if config.get('profiling', {}).get('enabled', False):
-        #     profiler = ModelProfiler(
-        #     dirpath=config['logging']['log_dir'],
-        #     filename="profile",
-        #     schedule=torch.profiler.schedule(wait=1, warmup=2, active=3, repeat=1),
-        #     on_trace_ready=torch.profiler.tensorboard_trace_handler(...),
-        #     record_shapes=True,
-        #     profile_memory=True,
-        #     with_stack=True,
-        # )
+       
 
-        return L.Trainer(
+        # ------ create the trainer ------
+        trainer_args = dict(
             max_epochs=config['training']['max_epochs'],
             accelerator=accelerator,
             devices=devices,
             strategy=strategy,
             callbacks=all_callbacks,
             logger=loggers,
-            # precision=config['experiment']['precision'],
-            precision = precision,            
+            precision=precision,
             gradient_clip_val=config['training']['gradient_clip_val'],
             log_every_n_steps=config['training']['log_every_n_steps'],
             val_check_interval=config['training']['val_check_interval'],
-            enable_progress_bar=True,                       
-            # profiler=profiler,
+            enable_progress_bar=True,
         )
+
+        if default_root_dir:
+            trainer_args['default_root_dir'] = default_root_dir
+
+        if fast_dev_run:
+            trainer_args['fast_dev_run'] = True
+            trainer_args.pop('max_epochs', None)        
+            trainer_args.pop('val_check_interval', None)
+
+        return L.Trainer(**trainer_args)

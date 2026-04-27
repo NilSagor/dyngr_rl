@@ -13,6 +13,9 @@ __pycache__/
 checkpoint*/
 checkpoints/
 models/saved_models/
+experiment_framework/outputs/
+experiment_framework/outputs/*
+!experiment_framework/outputs/.gitkeep
 
 # --- Logs & Training Output ---
 logs/

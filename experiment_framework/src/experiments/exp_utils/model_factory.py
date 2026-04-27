@@ -12,18 +12,20 @@ from src.models.enhanced_tgn.variants.tgn_v4 import TGNv4
 from src.models.enhanced_tgn.variants.tgn_v5 import TGNv5
 from src.models.enhanced_tgn.variants.tgn_v6 import TGNv6
 from src.models.enhanced_tgn.variants.tgn_v7 import TGNv7
-from src.models.enhanced_tgn.variants.hicost import HiCoST
-from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
-from src.models.enhanced_tgn.variants.hicostv3 import HiCoSTv3
-from src.models.enhanced_tgn.variants.hicostv4 import HiCoSTv4
+# from src.models.enhanced_tgn.variants.hicost import HiCoST
+# from src.models.enhanced_tgn.variants.hicostv2 import HiCoSTv2
+# from src.models.enhanced_tgn.variants.hicostv3 import HiCoSTv3
+# from src.models.enhanced_tgn.variants.hicostv4 import HiCoSTv4
 
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_v1 import TAWRMACv1
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_config import TAWRMACConfig
 
-from src.models.hicost_dev.hicost_variants.hicostdev1 import HiCoSTdev1
-from src.models.hicost_dev.hicost_variants.hicostdev_configdev1 import HiCoSTdev1Config
-from src.models.hicost_dev.hicost_variants.hicostdev2 import HiCoSTdev2
-from src.models.hicost_dev.hicost_variants.hicostdev_configdev2 import HiCoSTdev2Config
+# from src.models.hicost_dev.hicost_variants.hicostdev1 import HiCoSTdev1
+# from src.models.hicost_dev.hicost_variants.hicostdev_configdev1 import HiCoSTdev1Config
+# from src.models.hicost_dev.hicost_variants.hicostdev2 import HiCoSTdev2
+# from src.models.hicost_dev.hicost_variants.hicostdev_configdev2 import HiCoSTdev2Config
+from src.models.hicost_dev.v1.model import HiCoSTdev1
+from src.models.hicost_dev.v1.config import HiCoSTConfig
 # If HiCoSTdev3 exists, import its config similarly
 
 # ============================================================================
@@ -42,16 +44,17 @@ MODEL_INFO = {
     "TGNv5": (TGNv5, None),
     "TGNv6": (TGNv6, None),
     "TGNv7": (TGNv7, None),
-    "HiCoST": (HiCoST, None),
-    "HiCoSTv2": (HiCoSTv2, None),
+    # "HiCoST": (HiCoST, None),
+    # "HiCoSTv2": (HiCoSTv2, None),
     # TAWRMAC and HiCoSTdev variants use config dataclasses
     "TAWRMACv1": (TAWRMACv1, TAWRMACConfig),
-    "HiCoSTdev1": (HiCoSTdev1, HiCoSTdev1Config),
-    "HiCoSTdev2": (HiCoSTdev2, HiCoSTdev2Config),
+    # "HiCoSTdev1": (HiCoSTdev1, HiCoSTdev1Config),
+    # "HiCoSTdev2": (HiCoSTdev2, HiCoSTdev2Config),
     # "HiCoSTv3": (HiCoSTv3, HiCoSTConfig),   # HiCoSTv3 uses HiCoSTConfig
     # "HiCoSTv4": (HiCoSTv4, HiCoSTConfig),
     # Add HiCoSTdev3 when needed
     # "HiCoSTdev3": (HiCoSTdev3, HiCoSTdev3Config),
+    "HiCoSTdev1": (HiCoSTdev1, HiCoSTConfig)
 }
 
 class ModelFactory:

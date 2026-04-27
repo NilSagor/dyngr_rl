@@ -87,9 +87,9 @@ def build_experiment_config(config: Dict, seed: int) -> Dict:
         'seed': seed,
     })
 
-    config['logging'].update({
-        'log_dir': str(DEFAULT_LOG_DIR / exp_name),
-        'checkpoint_dir': str(DEFAULT_CHECKPOINT_DIR / f"{exp_name}_{config_hash}"),
-    })
+    # config['logging'].update({
+    #     'log_dir': str(DEFAULT_LOG_DIR / exp_name),
+    #     'checkpoint_dir': str(DEFAULT_CHECKPOINT_DIR / f"{exp_name}_{config_hash}"),
+    # })
 
     return config

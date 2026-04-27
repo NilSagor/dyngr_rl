@@ -4,6 +4,8 @@ from typing import Any, Optional
 
 @dataclass
 class HiCoSTConfig:
+    # version: str = None
+    
     # ── Runtime objects (injected by training script) ──
     neighbor_finder: Any = None
     node_features: Any = None
