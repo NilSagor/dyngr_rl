@@ -1,0 +1,89 @@
+# experiment_framework/configs/hicost_dev/v2.yaml
+# Complete configuration for HiCoST v1 with time delta attention walk on Wikipedia
+
+experiment:
+  name: "HiCoST"
+  description: "HiCoST v1 with time delta attention walk on Wikipedia"
+  seed: 42
+  precision: 32
+ 
+
+data:
+  dataset: "wikipedia"
+  evaluation_type: "transductive"               # "transductive","inductive"
+  negative_sampling_strategy: "random"   # "random", "historical", "inductive"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  unseen_ratio: 0.1                          # Required for inductive
+  validate_batches: true                     # Recommended
+  max_neighbors: 20
+
+
+model:
+  name: "HiCoSTdev2"                          # Must match registry key
+
+  # Core dimensions
+  memory_dim: 172
+  time_dim: 172
+  walk_emb_dim: 172
+  position_feat_dim: 100
+  fixed_time_dim: 20
+  n_layers: 2
+  n_heads: 2
+  dropout: 0.1
+
+  # Memory
+  use_memory: true
+  memory_update_at_start: true
+
+  # Walk module
+  enable_walk: true
+  enable_restart: true
+  pick_new_neighbors: false
+  walk_length: 4
+  num_walks: 10
+  num_walk_heads: 4
+
+  # time delta attention walk
+  use_time_delta_attention: true
+  use_temporal_bias: false 
+
+  # Co-occurrence module
+  enable_neighbor_cooc: true                # Set true if you have GPU memory
+  max_input_seq_length: 32
+
+  # Neighbor sampling
+  n_neighbors: 10                            # Number of temporal neighbors to sample
+
+  # Optimizer
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+
+  # explicit co-gnn
+  use_explicit_co_gnn: true
+
+training:
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  batch_size: 128
+  max_epochs: 50
+  patience: 10
+  gradient_clip_val: 1.0
+  val_check_interval: 1.0
+  log_every_n_steps: 10
+  monitor: "val_ap"
+  mode: "max"
+  save_top_k: 3
+
+
+hardware:                                     # Required by TrainerSetup
+  gpus: 1
+  num_workers: 4
+  pin_memory: true
+
+profiling:                                 
+  enabled: false
+
+
+
