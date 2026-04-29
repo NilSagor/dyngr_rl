@@ -1,0 +1,56 @@
+# configs/baseline/freedyg_config.yaml
+experiment:
+  name: "freedyg_reproduction"
+  description: "Reproducing FreeDyG on dynamic graphs"
+  seed: 42
+  precision: 32
+  debug: false
+
+data:
+  dataset: "reddit"
+  evaluation_type: "transductive"
+  negative_sampling_strategy: "random"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  unseen_ratio: 0.1
+  validate_batches: true
+
+model:
+  name: "FreeDyG"
+  
+  # Core architecture
+  time_feat_dim: 100
+  channel_embedding_dim: 172
+  num_layers: 2
+  dropout: 0.1
+  max_input_sequence_length: 128    # Key hyperparameter: neighbors per node
+  nif_feat_dim: 50                   # NIF encoder internal dimension
+  
+  # Sampling
+  sample_neighbor_strategy: "uniform"
+  time_scaling_factor: 0.0
+  
+  # Runtime
+  device: "cuda"
+
+training:
+  batch_size: 256
+  max_epochs: 50
+  patience: 10
+  gradient_clip_val: 1.0
+  val_check_interval: 1.0
+  log_every_n_steps: 10
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  monitor: "val_ap"
+  mode: "max"
+  save_top_k: 3
+
+hardware:
+  gpus: 1
+  num_workers: 4
+  pin_memory: true
+
+profiling:
+  enabled: false

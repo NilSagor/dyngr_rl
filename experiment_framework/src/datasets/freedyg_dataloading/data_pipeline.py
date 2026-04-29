@@ -1,89 +1,49 @@
-import torch 
-import torch.nn as nn
+# src/datasets/freedyg_dataloading/data_pipeline.py
 import numpy as np
-
-from torch.utils.data import DataLoader, TensorDataset
-
-from src.models.freedyg_module.NeighborSampler import get_neighbor_sampler, NegativeEdgeSampler
-from src.datasets.freedyg_dataloading.data_utils import get_link_prediction_data
+from src.datasets.tawrmac_dataloading.data_pipeline import TAWRMACDataPipeline
+from src.models.freedyg_module.components.neighbor_sampler import NeighborSampler
+from utils.neighbor_utils import build_adj_list  
 
 
-
-
-class FreeDyGDataPipeline:
-    def __init__(self, config):
-        self.config = config
-        self._load_data()
-
-    def _load_data(self):
-        # Load raw data splits
-        (self.node_raw_features, self.edge_raw_features,
-         self.full_data, self.train_data, self.val_data, self.test_data,
-         self.new_node_val_data, self.new_node_test_data) = get_link_prediction_data(
-            dataset_name=self.config.dataset_name,
-            val_ratio=self.config.val_ratio,
-            test_ratio=self.config.test_ratio
+class FreeDyGDataPipeline(TAWRMACDataPipeline):
+    """
+    FreeDyG data pipeline: reuses TAWRMAC loading logic, adds NeighborSampler.
+    
+    FreeDyG uses the same batch format and negative sampling as TAWRMAC,
+    so we inherit most functionality and only override sampler construction.
+    """
+    
+    def build_neighbor_sampler(self) -> 'FreeDyGDataPipeline':
+        """Build NeighborSampler for FreeDyG (replaces NewNeighborFinder)."""
+        train_mask = self.data['train_mask']
+        train_edges = self.data['edges'][train_mask]
+        train_src = train_edges[:, 0].cpu().numpy()
+        train_dst = train_edges[:, 1].cpu().numpy()
+        train_ts = self.data['timestamps'][train_mask].cpu().numpy()
+        
+        # Build adjacency list (undirected graph)
+        adj_list = build_adj_list(
+            src_node_ids=train_src,
+            dst_node_ids=train_dst,
+            edge_ids=np.arange(len(train_src)),
+            timestamps=train_ts,
+            max_node_id=self.data['num_nodes'] - 1
         )
-        # Convert to tensors
-        self.node_raw_features = torch.from_numpy(self.node_raw_features.astype(np.float32))
-        self.edge_raw_features = torch.from_numpy(self.edge_raw_features.astype(np.float32))
-
-        # Build neighbor samplers
-        self.train_neighbor_sampler = get_neighbor_sampler(
-            data=self.train_data,
-            sample_neighbor_strategy=self.config.sample_neighbor_strategy,
-            time_scaling_factor=self.config.time_scaling_factor,
-            seed=self.config.seed
+        
+        # Create sampler with config-driven strategy
+        strategy = self.config['model'].get('sample_neighbor_strategy', 'uniform')
+        time_scaling = self.config['model'].get('time_scaling_factor', 0.0)
+        seed = self.config['experiment'].get('seed')
+        
+        self.neighbor_sampler = NeighborSampler(
+            adj_list=adj_list,
+            sample_neighbor_strategy=strategy,
+            time_scaling_factor=time_scaling,
+            seed=seed
         )
-        self.full_neighbor_sampler = get_neighbor_sampler(
-            data=self.full_data,
-            sample_neighbor_strategy=self.config.sample_neighbor_strategy,
-            time_scaling_factor=self.config.time_scaling_factor,
-            seed=self.config.seed + 1
-        )
-
-        # Negative edge samplers
-        self.train_neg_sampler = NegativeEdgeSampler(
-            src_node_ids=self.train_data.src_node_ids,
-            dst_node_ids=self.train_data.dst_node_ids
-        )
-        self.val_neg_sampler = NegativeEdgeSampler(
-            src_node_ids=self.full_data.src_node_ids,
-            dst_node_ids=self.full_data.dst_node_ids,
-            seed=0
-        )
-        self.test_neg_sampler = NegativeEdgeSampler(
-            src_node_ids=self.full_data.src_node_ids,
-            dst_node_ids=self.full_data.dst_node_ids,
-            seed=2
-        )
-
-        # Create DataLoaders
-        self.loaders = {
-            'train': self._make_loader(self.train_data, shuffle=True),
-            'val': self._make_loader(self.val_data, shuffle=False),
-            'test': self._make_loader(self.test_data, shuffle=False)
-        }
-
-    def _make_loader(self, data, shuffle):
-        dataset = TensorDataset(
-            torch.from_numpy(data.src_node_ids),
-            torch.from_numpy(data.dst_node_ids),
-            torch.from_numpy(data.node_interact_times),
-            torch.from_numpy(data.edge_ids)
-        )
-        return DataLoader(dataset, batch_size=self.config.batch_size, shuffle=shuffle, num_workers=4)
-
-    def get_features(self):
-        return {
-            'node_raw_features': self.node_raw_features,
-            'edge_raw_features': self.edge_raw_features,
-        }
-
+        return self
+    
     @property
-    def num_nodes(self):
-        return self.node_raw_features.shape[0]
-
-    @property
-    def neighbor_finder(self):
-        return self.train_neighbor_sampler  # used by model setup
+    def train_neighbor_sampler(self):
+        """Alias for pipeline compatibility (some runners expect this name)."""
+        return self.neighbor_sampler
