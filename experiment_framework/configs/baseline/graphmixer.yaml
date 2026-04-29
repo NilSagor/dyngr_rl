@@ -1,0 +1,59 @@
+# configs/baseline/graphmixer_config.yaml
+# Complete configuration for GraphMixer training
+
+experiment:
+  name: "graphmixer_reproduction"
+  description: "Reproducing GraphMixer on dynamic graphs"
+  seed: 42
+  precision: 32
+  debug: false   # Set to true for FLOPs/profile debugging
+
+data:
+  dataset: "reddit"
+  evaluation_type: "transductive"               # "transductive", "inductive"
+  negative_sampling_strategy: "random"          # "random", "historical", "inductive"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  unseen_ratio: 0.1                             # Required for inductive
+  validate_batches: true                        # Recommended
+
+model:
+  name: "GraphMixer"                            # Must match registry key
+
+  # Core Architecture (maps 1:1 to GraphMixerConfig)
+  time_feat_dim: 100
+  num_tokens: 20                                # Neighbors sampled for link encoder
+  num_layers: 2                                 # Number of MLP-Mixer blocks
+  token_dim_expansion_factor: 0.5
+  channel_dim_expansion_factor: 4.0
+  dropout: 0.1
+
+  # GraphMixer-specific sampling hyperparameters
+  time_gap: 2000                                # Window size for node encoder aggregation
+  sample_neighbor_strategy: "uniform"           # "uniform", "recent", "time_interval_aware"
+  time_scaling_factor: 0.0                      # Only used if strategy == "time_interval_aware"
+
+  # Runtime (will be injected by pipeline, keep as placeholder)
+  device: "cuda"
+
+training:
+  batch_size: 256                               # GraphMixer is memory-light vs TAWRMAC
+  max_epochs: 50
+  patience: 10
+  gradient_clip_val: 1.0
+  val_check_interval: 1.0                       # Validate every epoch
+  log_every_n_steps: 10
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  monitor: "val_ap"
+  mode: "max"
+  save_top_k: 3
+
+hardware:                                       # Required by TrainerSetup
+  gpus: 1
+  num_workers: 4
+  pin_memory: true
+
+profiling:                                      # Optional
+  enabled: false
