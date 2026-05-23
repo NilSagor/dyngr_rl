@@ -2,8 +2,8 @@
 # Complete configuration for HiCoST v1 with time delta attention walk on Wikipedia
 
 experiment:
-  name: "HiCoST"
-  description: "HiCoST v1 with time delta attention walk on Wikipedia"
+  name: "HiCoSTdev2"
+  description: "HiCoSTdev2 v2 (v2_causal_time_delta) with Causal time delta attention walk on Wikipedia"
   seed: 42
   precision: 32
  

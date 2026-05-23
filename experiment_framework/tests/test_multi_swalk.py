@@ -1,7 +1,7 @@
 import pytest
 import torch
 import torch.nn as nn
-from src.models.enhanced_tgn.component.co_transformer import (
+from experiment_framework.src.models.enhanced_tgn.component.hct_module import (
     IntraWalkEncoder,
     CooccurrenceMatrix,
     InterWalkTransformer,

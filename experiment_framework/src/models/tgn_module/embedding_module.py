@@ -257,15 +257,20 @@ class GraphAttentionEmbedding(GraphEmbedding):
             )
 
         # --- Get source node features (always a tensor, from self.node_features) ---
-        source_features = self.node_features[source_nodes_tensor].to(device)
+        # Get RAW node features (NOT projected)
+        if self.node_features is not None:
+            source_features = self.node_features[source_nodes_tensor].to(device)
+        else:
+            source_features = self.node_embedding(source_nodes_tensor)
 
         # --- Concatenate memory ONCE (no duplicate) ---
         if self.use_memory:
             source_memory = memory[source_nodes_tensor].to(device)   # full memory tensor
             source_features = torch.cat([source_features, source_memory], dim=-1)
 
+        
         # --- Project to embedding dimension ---
-        current_embeddings = self.feature_proj(source_features)
+        current_embeddings = self.feature_proj(source_features) # [batch, 172]
 
         # --- Multi‑layer attention ---
         for layer_idx in range(n_layers):
@@ -297,13 +302,16 @@ class GraphAttentionEmbedding(GraphEmbedding):
             neighbor_features = torch.zeros(
                 neighbors_t.shape[0], neighbors_t.shape[1], self.node_features.shape[1],
                 device=device
-            )
+            )            
             if valid_mask.any():
                 valid_nodes = neighbors_t[valid_mask]
-                valid_features = self.node_features[valid_nodes].to(device)
+                valid_features = self.node_features[valid_nodes].to(device) 
                 neighbor_features[valid_mask] = valid_features
 
+            
+
             # Add neighbor memory if used
+            # Concatenate neighbor memory BEFORE projection
             if self.use_memory:
                 neighbor_memory = torch.zeros(
                     neighbors_t.shape[0], neighbors_t.shape[1], memory.shape[1],
@@ -313,8 +321,9 @@ class GraphAttentionEmbedding(GraphEmbedding):
                     neighbor_memory[valid_mask] = memory[valid_nodes].to(device)
                 neighbor_features = torch.cat([neighbor_features, neighbor_memory], dim=-1)
 
+  
             # Project neighbor features
-            neighbor_embeddings = self.feature_proj(neighbor_features)
+            neighbor_embeddings = self.feature_proj(neighbor_features) ## [batch, n_nbrs, 172]
 
             # Edge features are zero (TGN spec – no leakage)
             edge_features_batch = torch.zeros(

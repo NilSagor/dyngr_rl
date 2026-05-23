@@ -113,7 +113,14 @@ class BaseRunner(ABC):
 
         # 2. Model creation
         features = pipeline.get_features()
-        model = ModelFactory.create(self.config, features)
+        neighbor_sampler = getattr(
+            pipeline, 'neighbor_sampler', None
+        )
+
+        if neighbor_sampler is None and hasattr(pipeline, 'samplers'):
+            neighbor_sampler = pipeline.samplers.get('neighbor_sampler')
+        
+        model = ModelFactory.create(self.config, features, neighbor_sampler)
 
         # 3. Model-specific setup + inject training hyperparams
         self.setup_model(model, pipeline)
@@ -138,9 +145,6 @@ class BaseRunner(ABC):
         if self.config['training'].get('dev_fast_run', False):
             logger.info("🏃 Fast dev run enabled - single batch train/val/test")
         
-        
-
-
         
         # 6. Trainer – now writes to the run directory        
 

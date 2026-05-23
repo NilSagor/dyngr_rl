@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from src.datasets.sam_dataloading.data_loader import load_dataset
 from src.datasets.sam_dataloading.negative_sample import NegativeSampler
-from src.datasets.continue_temporal.neighobr_finder import NeighborFinder
+from experiment_framework.src.datasets.continue_temporal.neighbor_finder import NeighborFinder
 from src.datasets.continue_temporal.temporal_data import TemporalDataset
 from src.datasets.continue_temporal.data_continue import ContinuousTimeDataLoader
 

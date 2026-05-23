@@ -23,7 +23,7 @@ class GraphMixer(L.LightningModule):
     # def __init__(self, node_raw_features: np.ndarray, edge_raw_features: np.ndarray, neighbor_sampler: NeighborSampler,
     #              time_feat_dim: int, num_tokens: int, num_layers: int = 2, token_dim_expansion_factor: float = 0.5,
     #              channel_dim_expansion_factor: float = 4.0, dropout: float = 0.1, device: str = 'cpu'):
-    def __init__(self, config:GraphMixerConfig):
+    def __init__(self, config:GraphMixerConfig, node_raw_features=None, edge_raw_features=None, neighbor_sampler=None):
         """
         TCL model.
         :param node_raw_features: ndarray, shape (num_nodes + 1, node_feat_dim)
@@ -41,24 +41,51 @@ class GraphMixer(L.LightningModule):
         self.save_hyperparameters()
         self.cfg = config
         
-        self.device = torch.device(
+        self._device = torch.device(
             config.device if isinstance(config.device, str) else 'cpu'
         )
         
         # self.node_raw_features = torch.from_numpy(config.node_raw_features.astype(np.float32)).to(device)
         # self.edge_raw_features = torch.from_numpy(config.edge_raw_features.astype(np.float32)).to(device)
 
-        if isinstance(config.node_raw_features, np.ndarray):
-            self.node_raw_features = torch.from_numpy(config.node_raw_features.astype(np.float32)).to(self.device)
-        else:
-            self.node_raw_features = config.node_raw_features.to(self.device)
-            
-        if isinstance(config.edge_raw_features, np.ndarray):
-            self.edge_raw_features = torch.from_numpy(config.edge_raw_features.astype(np.float32)).to(self.device)
-        else:
-            self.edge_raw_features = config.edge_raw_features.to(self.device)
         
-        self.neighbor_sampler = config.neighbor_sampler
+        self.node_raw_features = node_raw_features if node_raw_features is not None else config.node_raw_features
+        self.edge_raw_features = edge_raw_features if edge_raw_features is not None else config.edge_raw_features
+        self.neighbor_sampler = neighbor_sampler if neighbor_sampler is not None else config.neighbor_sampler
+
+        if self.node_raw_features is None or self.edge_raw_features is None or self.neighbor_sampler is None:
+            raise ValueError("GraphMixer requires node_raw_features, edge_raw_features, and neighbor_sampler")
+        
+        if isinstance(self.node_raw_features, np.ndarray):
+            self.node_raw_features = torch.from_numpy(self.node_raw_features.astype(np.float32)).to(self._device)
+        else:            
+            self.node_raw_features = self.node_raw_features.to(self._device)
+
+        if isinstance(self.edge_raw_features, np.ndarray):
+            self.edge_raw_features = torch.from_numpy(
+                self.edge_raw_features.astype(np.float32)
+            ).to(self._device)
+        else:
+            self.edge_raw_features = self.edge_raw_features.to(self._device)
+        
+        
+        # if isinstance(self.node_raw_features, np.ndarray):
+        #     node_tensor = torch.from_numpy(self.node_raw_features.astype(np.float32))
+        # else:
+        #     node_tensor = self.node_raw_features
+
+        # self.register_buffer('node_raw_features', node_tensor)
+
+        # if isinstance(self.edge_raw_features, np.ndarray):
+        #     edge_tensor = torch.from_numpy(self.edge_raw_features.astype(np.float32))
+        # else:
+        #     edge_tensor = self.edge_raw_features
+
+        # self.register_buffer('edge_raw_features', edge_tensor)
+        
+        
+        
+        # self.neighbor_sampler = config.neighbor_sampler
         self.node_feat_dim = self.node_raw_features.shape[1]
         self.edge_feat_dim = self.edge_raw_features.shape[1]
         self.time_feat_dim = config.time_feat_dim
@@ -67,7 +94,7 @@ class GraphMixer(L.LightningModule):
         self.token_dim_expansion_factor = config.token_dim_expansion_factor
         self.channel_dim_expansion_factor = config.channel_dim_expansion_factor
         self.dropout = config.dropout
-        # self.device = device
+        
 
         self.num_channels = self.edge_feat_dim
         
@@ -226,7 +253,7 @@ class GraphMixer(L.LightningModule):
         # Tensor, shape (batch_size, num_neighbors, edge_feat_dim)
         nodes_edge_raw_features = self.edge_raw_features[torch.from_numpy(neighbor_edge_ids)]
         # Tensor, shape (batch_size, num_neighbors, time_feat_dim)
-        nodes_neighbor_time_features = self.time_encoder(timestamps=torch.from_numpy(node_interact_times[:, np.newaxis] - neighbor_times).float().to(self.device))
+        nodes_neighbor_time_features = self.time_encoder(timestamps=torch.from_numpy(node_interact_times[:, np.newaxis] - neighbor_times).float().to(self._device))
 
         # ndarray, set the time features to all zeros for the padded timestamp
         nodes_neighbor_time_features[torch.from_numpy(neighbor_node_ids == 0)] = 0.0
@@ -260,7 +287,7 @@ class GraphMixer(L.LightningModule):
         # Tensor, shape (batch_size, time_gap)
         valid_time_gap_neighbor_node_ids_mask[valid_time_gap_neighbor_node_ids_mask == 0] = -1e10
         # Tensor, shape (batch_size, time_gap)
-        scores = torch.softmax(valid_time_gap_neighbor_node_ids_mask, dim=1).to(self.device)
+        scores = torch.softmax(valid_time_gap_neighbor_node_ids_mask, dim=1).to(self._device)
 
         # Tensor, shape (batch_size, node_feat_dim), average over the time_gap neighbors
         nodes_time_gap_neighbor_node_agg_features = torch.mean(nodes_time_gap_neighbor_node_raw_features * scores.unsqueeze(dim=-1), dim=1)

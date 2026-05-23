@@ -20,6 +20,12 @@ from src.models.enhanced_tgn.variants.tgn_v7 import TGNv7
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_v1 import TAWRMACv1
 from src.models.tawrmac_module.tawrmac_variants.tawrmac_config import TAWRMACConfig
 
+from src.models.graphmixer_module.graphmixer import GraphMixer
+from src.models.graphmixer_module.graphmixer_config import GraphMixerConfig
+
+# from src.models.freedyg_module.freedgy import FreeDyG
+# from src.models.freedyg_module.freedyg_config import FreeDyGConfig
+
 # from src.models.hicost_dev.hicost_variants.hicostdev1 import HiCoSTdev1
 # from src.models.hicost_dev.hicost_variants.hicostdev_configdev1 import HiCoSTdev1Config
 # from src.models.hicost_dev.hicost_variants.hicostdev2 import HiCoSTdev2
@@ -48,20 +54,22 @@ MODEL_INFO = {
     # "HiCoSTv2": (HiCoSTv2, None),
     # TAWRMAC and HiCoSTdev variants use config dataclasses
     "TAWRMACv1": (TAWRMACv1, TAWRMACConfig),
+    "GraphMixer": (GraphMixer, GraphMixerConfig),
+    # "FreeDyG": (FreeDyG, FreeDyGConfig),
     # "HiCoSTdev1": (HiCoSTdev1, HiCoSTdev1Config),
     # "HiCoSTdev2": (HiCoSTdev2, HiCoSTdev2Config),
     # "HiCoSTv3": (HiCoSTv3, HiCoSTConfig),   # HiCoSTv3 uses HiCoSTConfig
     # "HiCoSTv4": (HiCoSTv4, HiCoSTConfig),
     # Add HiCoSTdev3 when needed
     # "HiCoSTdev3": (HiCoSTdev3, HiCoSTdev3Config),
-    "HiCoSTdev1": (HiCoSTdev1, HiCoSTConfig)
+    "HiCoSTdev1": (HiCoSTdev1, HiCoSTConfig),
 }
 
 class ModelFactory:
     """Factory for creating and validating models using registry + config dataclasses."""
 
     @staticmethod
-    def create(config: Dict, data_info: Dict) -> torch.nn.Module:
+    def create(config: Dict, data_info: Dict, neighbor_sampler=None) -> torch.nn.Module:
         """Create model with proper parameter handling."""
         model_config = config['model'].copy()
         model_name = model_config.pop('name')
@@ -99,7 +107,24 @@ class ModelFactory:
             cfg_obj = config_class(**filtered_args)
             
             # Instantiate model
-            model = model_class(config=cfg_obj)
+            # Special handling for GraphMixer (and possibly other models that need extra args)
+            if model_name == 'GraphMixer':
+                # Extract node/edge raw features from data_info (already tensors)
+                node_raw_features = data_info.get('node_features')
+                edge_raw_features = data_info.get('edge_features')
+                
+                if neighbor_sampler is None:
+                    raise ValueError("GraphMixer requires neighbor_sampler to be provided")
+                
+                model = model_class(
+                    config=cfg_obj,
+                    node_raw_features=node_raw_features,
+                    edge_raw_features=edge_raw_features,
+                    neighbor_sampler=neighbor_sampler
+                )
+            else:
+                # All other models use the simpler config-only constructor
+                model = model_class(config=cfg_obj)
         else:
             # Legacy models: build args using signature of model class
             model_args = ModelFactory._build_legacy_args(model_class, model_config, data_info)

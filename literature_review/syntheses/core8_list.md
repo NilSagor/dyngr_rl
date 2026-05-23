@@ -27,6 +27,7 @@
 5. **FreeDyG** - Unique frequency-domain perspective
 6. **GraphMixer** - Efficient MLP-based alternative
 
+
 ### Tier 3 (Baseline)
 7. **EdgeBank** - Simple but strong baseline
 8. **JODIE** - Historical significance and comparison

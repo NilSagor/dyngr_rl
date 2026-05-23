@@ -20,8 +20,8 @@ from torchmetrics import Accuracy
 
 
 from src.models.hicost_dev.co_gnn import CoGNN
-from src.models.hicost_dev.time_delta_attention import TimeDeltaAttentionWalkEncoder
-from src.models.hicost_dev.multi_swalk import MultiScaleWalkSampler
+from experiment_framework.src.models.hicost_dev.v2.time_delta_attention import TimeDeltaAttentionWalkEncoder
+from experiment_framework.src.models.hicost_dev.v2.multi_swalk import MultiScaleWalkSampler
 
 from .hicostdev_configdev2 import HiCoSTdev2Config
 from dataclasses import asdict

@@ -10,10 +10,20 @@ python experiment_framework/src/experiments/train_v5.py \
     --config experiment_framework/configs/tawrmac_config.yaml \
     --seeds 42
 
+
+
 ### multiple seed
 python src/experiments/train_v5.py \
     --config configs/tawrmac_config.yaml \
     --seeds 42 123 456
+
+
+## GraphMixer training
+# Dry-run with 1 batch to verify no crashes
+python src/main.py \
+  --config configs/baseline/graphmixer_config.yaml \
+  --runner graphmixer \
+  --override training.max_epochs=1 training.batch_size=8 experiment.debug=true
 
 
 ### Quick Debug run

@@ -11,7 +11,7 @@ from src.datasets.tawrmac_dataloading.data_pipeline import TAWRMACDataPipeline
 from src.datasets.graphmixer_dataloading.data_pipeline import GraphMixerDataPipeline
 from src.experiments.runner.base_runner import BaseRunner
 from src.models.graphmixer_module.components.neighbor_sampler import NeighborSampler
-from utils.neighbor_utils import build_adj_list
+from src.utils.neighbor_utils import build_adj_list
 
 
 
@@ -67,6 +67,9 @@ class GraphMixerRunner(BaseRunner):
             model.neighbor_sampler = pipeline.neighbor_sampler
             if hasattr(pipeline.neighbor_sampler, 'reset_random_state'):
                 pipeline.neighbor_sampler.reset_random_state()
+        
+        if hasattr(pipeline.neighbor_sampler, 'sample_neighbor_strategy'):
+            model._sampling_strategy = pipeline.neighbor_sampler.sample_neighbor_strategy
 
 
     def _log_model_status(self, model: torch.nn.Module) -> None:
@@ -79,7 +82,14 @@ class GraphMixerRunner(BaseRunner):
         logger.info(f"Channel expansion factor: {model.channel_dim_expansion_factor}")
         logger.info(f"Dropout: {model.dropout}")
         logger.info(f"Time gap (node encoder window): {getattr(model.cfg, 'time_gap', 2000)}")
-        logger.info(f"Sampling strategy: {getattr(pipeline.neighbor_sampler, 'sample_neighbor_strategy', 'N/A')}")
+        
+        strategy = getattr(model, '_sampling_strategy', None)
+        if strategy is None:
+            sampler = getattr(model, 'neighbor_sampler', None)
+            strategy = getattr(sampler, 'sample_neighbor_strategy', 'N/A') if sampler else 'N/A'
+        logger.info(f"Sampling strategy: {strategy}")
+
+        logger.info(f"Sampling strategy: {strategy}")
         logger.info(f"Node feat dim: {model.node_feat_dim}")
         logger.info(f"Edge feat dim: {model.edge_feat_dim}")
         logger.info("=" * 40)

@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from src.models.freedyg_module.FeedForwardNet import FeedForwardNet
-from src.models.freedyg_module.FilterLayer import FilterLayer
+from experiment_framework.src.models.freedyg_module.components.FeedForwardNet import FeedForwardNet
+from experiment_framework.src.models.freedyg_module.components.FilterLayer import FilterLayer
 
 class MLPMixer(nn.Module):
 

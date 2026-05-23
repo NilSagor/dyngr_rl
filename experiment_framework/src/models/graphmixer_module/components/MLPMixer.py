@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.models.graphmixer_module.FeedForwardNet import FeedForwardNet
+from src.models.graphmixer_module.components.FeedForwardNet import FeedForwardNet
 
 class MLPMixer(nn.Module):
 

@@ -4,7 +4,7 @@ import lightning.pytorch as pl
 
 from torchmetrics import Accuracy, AUROC, AveragePrecision
 from src.models.freedyg_module.Freedyg import FreeDyG
-from src.models.freedyg_module.MergeLayer import MergeLayer
+from experiment_framework.src.models.freedyg_module.components.MergeLayer import MergeLayer
 
 class FreeDyGLightningModule(pl.LightningModule):
     def __init__(self, args, node_raw_features, edge_raw_features, neighbor_sampler, compile_model=False):

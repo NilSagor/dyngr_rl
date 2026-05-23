@@ -6,15 +6,27 @@ import torch.nn as nn
 from loguru import logger
 
 from .base_runner import BaseRunner
-from datasets.freedyg_dataloading.data_pipeline import FreeDyGDataPipeline
-from models.freedyg_module.freedyg_variants.freedyg_v1 import FreeDyGLightningModule
+# from datasets.freedyg_dataloading.data_pipeline import FreeDyGDataPipeline
+
+from src.datasets.tawrmac_dataloading.data_pipeline import TAWRMACDataPipeline
+from src.datasets.graphmixer_dataloading.data_pipeline import GraphMixerDataPipeline
+from src.models.freedyg_module.freedgy import FreeDyG
 
 class FreeDyGRunner(BaseRunner):
     """Runner for FreeDyG model."""
 
     def create_data_pipeline(self):
-        """Create and return the data pipeline."""
-        return FreeDyGDataPipeline(self.config)
+        """Build FreeDyG pipeline: reuse TAWRMAC loading, add NeighborSampler."""
+        # Start with TAWRMAC pipeline to reuse load(), build_samplers(), etc.
+        pipeline = (TAWRMACDataPipeline(self.config)
+                    .load()
+                    .build_samplers()      # Reuse NegativeEdgeSampler logic
+                    .build_datasets()      # Reuse dataset format
+                    .build_loaders())      # Reuse DataLoader setup
+        
+        # Inject GraphMixer-specific NeighborSampler
+        pipeline = self._attach_neighbor_sampler(pipeline)
+        return pipeline
 
     def setup_model(self, model: nn.Module, pipeline) -> None:
         """Inject pipeline components into the LightningModule."""

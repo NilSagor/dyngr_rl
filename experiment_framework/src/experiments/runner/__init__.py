@@ -7,6 +7,7 @@ from .hicost_dev_runner import HiCoSTDevRunner
 # from .hicostdev1_runner import HiCoSTdev1Runner
 # from .hicostdev2_runner import HiCoSTdev2Runner
 # from .freedyg_runner import FreeDyGRunner   # if exists
+from .graphmixer_runner import GraphMixerRunner
 
 
 # Create a registry mapping model names to runner classes
@@ -20,6 +21,7 @@ RUNNER_REGISTRY = {
     "TGNv6": TGNRunner,
     "TGNv7": TGNRunner,
     "DyGFormer": TGNRunner,           # DyGFormer uses same runner as TGN
+    "GraphMixer": GraphMixerRunner,
     # "FreeDyG": FreeDyGRunner,
     # "HiCoST": HiCoSTRunner,
     # "HiCoSTv2": HiCoSTRunner,

@@ -1,7 +1,7 @@
 # src/datasets/graphmixer_dataloading/data_pipeline.py
 from src.datasets.tawrmac_dataloading.data_pipeline import TAWRMACDataPipeline
 from src.models.graphmixer_module.components.neighbor_sampler import NeighborSampler
-from utils.neighbor_utils import build_adj_list  
+from src.utils.neighbor_utils import build_adj_list  
 
 
 class GraphMixerDataPipeline(TAWRMACDataPipeline):

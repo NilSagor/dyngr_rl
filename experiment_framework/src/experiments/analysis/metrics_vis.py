@@ -1,5 +1,5 @@
 # plot and charts
-# def _save_and_plot(self, df: pd.DataFrame, param_name: str):
+# def _save_and_plot( df: pd.DataFrame, param_name: str):
 #         if df.empty:
 #             return
         

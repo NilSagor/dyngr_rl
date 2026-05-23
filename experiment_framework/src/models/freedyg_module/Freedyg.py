@@ -4,12 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import MultiheadAttention
 
-from src.models.freedyg_module.TimeEncoder import TimeEncoder
-from utils.utils import NeighborSampler
-from src.models.freedyg_module.FeedForwardNet import FeedForwardNet
-from src.models.freedyg_module.FilterLayer import FilterLayer
-from src.models.freedyg_module.MLPMixer import MLPMixer
-from src.models.freedyg_module.NIFEncoder import NIFEncoder
+from experiment_framework.src.models.freedyg_module.components.TimeEncoder import TimeEncoder
+from src.models.graphmixer_module import NeighborSampler
+# from src.models.freedyg_module.FeedForwardNet import FeedForwardNet
+# from src.models.freedyg_module.FilterLayer import FilterLayer
+from experiment_framework.src.models.freedyg_module.components.MLPMixer import MLPMixer
+from experiment_framework.src.models.freedyg_module.components.NIFEncoder import NIFEncoder
 
 
 

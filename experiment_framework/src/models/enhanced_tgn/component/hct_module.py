@@ -121,40 +121,12 @@ class IntraWalkEncoder(nn.Module):
          # Normalize 5D inputs consistently
         walk_embeddings, walk_masks = self._normalize_5d_input(walk_embeddings, walk_masks)
         
-        # Safe dimension handling - only squeeze if dim 0 is actually 1
-        # if walk_embeddings.dim() == 5:
-        #     if walk_embeddings.size(0) == 1:
-        #         logger.warning(f"Walk embeddings is 5D {walk_embeddings.shape}, squeezing dim 0")
-        #         walk_embeddings = walk_embeddings.reshape(*walk_embeddings.shape[1:])
-        #         # FIX: Also squeeze walk_masks consistently
-        #         if walk_masks.dim() == 5:
-        #             walk_masks = walk_masks.reshape(*walk_masks.shape[1:])
-        #         elif walk_masks.dim() == 4:
-        #             walk_masks = walk_masks.reshape(*walk_masks.shape[1:])
-        #     else:
-        #         # FIX: Properly handle 5D with batch>1 by flattening batch dimensions
-        #         logger.warning(f"Walk embeddings is 5D with batch>1 {walk_embeddings.shape}, flattening")
-        #         batch_dim = walk_embeddings.size(0) * walk_embeddings.size(1)
-        #         walk_embeddings = walk_embeddings.view(batch_dim, *walk_embeddings.shape[2:])
-        #         # FIX: Handle masks consistently
-        #         if walk_masks.dim() == 5:
-        #             walk_masks = walk_masks.view(batch_dim, *walk_masks.shape[2:])
-        #         elif walk_masks.dim() == 4:
-        #             walk_masks = walk_masks.view(batch_dim, *walk_masks.shape[2:])
-        
+      
         if walk_embeddings.dim() != 4:
             raise ValueError(f"Expected 4D walk_embeddings, got {walk_embeddings.dim()}D: {walk_embeddings.shape}")
         if walk_masks.dim() != 3:
             raise ValueError(f"Expected 3D walk_masks, got {walk_masks.dim()}D: {walk_masks.shape}")
-        
-                
-        # if walk_masks.dim() != 3:
-        #         logger.warning(f"walk_masks has wrong dim {walk_masks.dim()}, expected 3D")
-        #         # Try to reshape to match
-        #         if walk_masks.numel() == walk_embeddings.size(0) * walk_embeddings.size(1) * walk_embeddings.size(2):
-        #             walk_masks = walk_masks.view(walk_embeddings.size(0), walk_embeddings.size(1), walk_embeddings.size(2))
-            
-               
+       
         walk_embeddings = _sanitize_tensor(walk_embeddings, "walk_embeddings")
        
           
@@ -768,79 +740,7 @@ class HierarchicalCooccurrenceTransformer(nn.Module):
             output = self.process_walk_type(walk_embeddings, nodes_anon, masks, walk_type=walk_type)
             outputs[type_name] = output
             
-            # Validate node indices BEFORE memory lookup
-            # if nodes.max().item() >= node_memory.size(0) or nodes.min().item() < 0:
-            #     logger.error(f"Invalid node index in walks! Max: {nodes.max().item()}, Min: {nodes.min().item()}, Memory size: {node_memory.size(0)}. Clamping...")
-            #     nodes = torch.clamp(nodes, 0, node_memory.size(0) - 1)
-            #     data['nodes'] = nodes
-
-            # if not torch.isfinite(nodes.float()).all():
-            #     logger.error("NaN/Inf in walk node indices! Replacing with zeros")
-            #     nodes = torch.zeros_like(nodes).long()
-            #     data['nodes'] = nodes
-
-            
-            # if nodes.dtype != torch.long and nodes.dtype != torch.int64:
-            #     logger.warning(f"Converting nodes from {nodes.dtype} to long")
-            #     nodes = nodes.long()
-            #     data['nodes'] = nodes
-            
-            # Safe dimension handling
-            # Consistent 5D handling - only squeeze leading batch dim if size==1
-            # for name, tensor in [('nodes', nodes), ('nodes_anon', nodes_anon), ('masks', masks)]:
-            #     if tensor.dim() == 4 and tensor.size(0) == 1:
-            #         tensor = tensor.squeeze(0)
-            #         data[name] = tensor
-            
-            # nodes = data['nodes']
-            # nodes_anon = data['nodes_anon']
-            # masks = data['masks']
-            
-            # num_walks = nodes.size(1)
-            # walk_len = nodes.size(2)         
-     
-            # flat_nodes = nodes.reshape(-1).long()
-            
-  
-            # # Validate flat_nodes before indexing
-            # if flat_nodes.max().item() >= node_memory.size(0) or flat_nodes.min().item() < 0:
-            #     logger.error(f"Invalid flat node index! Max: {flat_nodes.max().item()}, Min: {flat_nodes.min().item()}, Memory size: {node_memory.size(0)}. Clamping...")
-            #     flat_nodes = torch.clamp(flat_nodes, 0, node_memory.size(0) - 1)
-            
-            # if not torch.isfinite(flat_nodes.float()).all():
-            #     logger.error("NaN in flat_nodes! Replacing with zeros")
-            #     flat_nodes = torch.zeros_like(flat_nodes)
-            
-            # if flat_nodes.dtype != torch.long:
-            #     flat_nodes = flat_nodes.long()
-            
-            # accessed_memory = node_memory[flat_nodes]
-            # accessed_memory = _sanitize_tensor(accessed_memory, "accessed_memory")
-            
-            
-            # # walk_node_feats = node_memory[flat_nodes]
-            # walk_node_feats = self.memory_proj(accessed_memory)
-            # walk_embeddings = walk_node_feats.view(batch_size, num_walks, walk_len, self.d_model)
-
-            # # Sanitize after memory lookup
-            # walk_embeddings = _sanitize_tensor(walk_embeddings, "walk_embeddings")
-            
-            # # Add restart flags for TAWR
-            # if type_name == 'tawr' and 'restart_flags' in data:
-            #     restart_flags = data['restart_flags']
-            #     if restart_flags.dim() == 4 and restart_flags.size(0) == 1:
-            #         restart_flags = restart_flags.squeeze(0)
-            #     restart_flags = torch.clamp(restart_flags, 0, 1).long()
-            #     restart_embed = self.restart_embed(restart_flags)
-            #     walk_embeddings = walk_embeddings + restart_embed
-            
-            # output = self.process_walk_type(
-            #     walk_embeddings,
-            #     nodes_anon,
-            #     masks,
-            #     walk_type=walk_type
-            # )
-            # outputs[type_name] = output
+           
         
         # Fuse and return
         fused = self.fuse_walk_types(

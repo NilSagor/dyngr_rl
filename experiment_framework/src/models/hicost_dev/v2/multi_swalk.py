@@ -5,7 +5,7 @@ from typing import List, Tuple, Dict, Optional
 import torch.nn.functional as F
 from loguru import logger
 
-from .time_encoding import TimeEncode
+from ..components.time_encoding import TimeEncode
 
 class MultiScaleWalkSampler(nn.Module):
     """
