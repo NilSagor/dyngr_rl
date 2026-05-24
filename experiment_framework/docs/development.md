@@ -95,6 +95,8 @@ RUNNER_REGISTRY = {
 
 
 
+
+
 ## 4. Add Config Template
 
 ```python
@@ -111,4 +113,12 @@ python experiment_framework/src/experiments/train_v5.py \
   -c configs/baseline/my_model.yaml \
   --override training.max_epochs=1 experiment.debug=true
 
+
+
 ```
+
+main ← [STABLE] Paper baselines, reproducibility, releases
+  ↑
+refactor/unified-model ← [INTEGRATION] Active development, testing, docs
+  ↑
+feat/new_module        ← [DEVELOPMENT] Short-lived feature branches
