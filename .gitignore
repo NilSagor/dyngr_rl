@@ -67,3 +67,4 @@ experiment_framework/data/processed/
 *.log
 *.aux
 *.out
+experiment_framework/outputs/
