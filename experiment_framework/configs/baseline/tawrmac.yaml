@@ -1,4 +1,4 @@
-# configs/tawrmac_config.yaml
+# # experiment_framework/configs/baseline/tawrmac_config.yaml
 # Complete configuration for TAWRMACv1 training
 
 experiment:

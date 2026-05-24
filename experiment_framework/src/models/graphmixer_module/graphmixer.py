@@ -141,11 +141,16 @@ class GraphMixer(L.LightningModule):
         return torch.sigmoid(scores)
     
     def training_step(self, batch, batch_idx):
-        sources = batch['sources'].cpu().numpy()
-        destinations = batch['destinations'].cpu().numpy()
-        timestamps = batch['timestamps'].cpu().numpy()
-        neg_sources = batch['negative_sources'].cpu().numpy()
-        neg_destinations = batch['negative_destinations'].cpu().numpy()
+        # sources = batch['sources'].cpu().numpy()
+        # destinations = batch['destinations'].cpu().numpy()
+        # timestamps = batch['timestamps'].cpu().numpy()
+        # neg_sources = batch['negative_sources'].cpu().numpy()
+        # neg_destinations = batch['negative_destinations'].cpu().numpy()
+        sources = batch['sources']
+        destinations = batch['destinations']
+        timestamps = batch['timestamps']
+        neg_sources = batch['negative_sources']
+        neg_destinations = batch['negative_destinations']
         
         num_neighbors = getattr(self.cfg, 'num_tokens', 20)
         time_gap = getattr(self.cfg, 'time_gap', 2000)
@@ -163,11 +168,16 @@ class GraphMixer(L.LightningModule):
         return loss
     
     def _shared_eval_step(self, batch, batch_idx, prefix: str):
-        sources = batch['sources'].cpu().numpy()
-        destinations = batch['destinations'].cpu().numpy()
-        timestamps = batch['timestamps'].cpu().numpy()
-        neg_sources = batch['negative_sources'].cpu().numpy()
-        neg_destinations = batch['negative_destinations'].cpu().numpy()
+        # sources = batch['sources'].cpu().numpy()
+        # destinations = batch['destinations'].cpu().numpy()
+        # timestamps = batch['timestamps'].cpu().numpy()
+        # neg_sources = batch['negative_sources'].cpu().numpy()
+        # neg_destinations = batch['negative_destinations'].cpu().numpy()
+        sources = batch['sources']
+        destinations = batch['destinations']
+        timestamps = batch['timestamps']
+        neg_sources = batch['negative_sources']
+        neg_destinations = batch['negative_destinations']
         
         num_neighbors = getattr(self.cfg, 'num_tokens', 20)
         time_gap = getattr(self.cfg, 'time_gap', 2000)
@@ -185,7 +195,7 @@ class GraphMixer(L.LightningModule):
         targets = torch.cat([
             torch.ones_like(pos_scores), 
             torch.zeros_like(neg_scores)
-        ])
+        ]).long()
         
         # Select appropriate metrics
         if prefix == 'val':

@@ -1,4 +1,5 @@
-# configs/baseline/freedyg_config.yaml
+# experiment_framework/configs/baseline/freedyg.yaml
+
 experiment:
   name: "freedyg_reproduction"
   description: "Reproducing FreeDyG on dynamic graphs"

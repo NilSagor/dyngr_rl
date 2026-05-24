@@ -1,5 +1,22 @@
 # experiment_log.md
 
+
+### 🛠️ Next Steps (2026/05/23)
+1. Create `experiment_framework/docs/commands.md` and paste the block above.
+2. Save the bash wrapper as `scripts/run_full_experiment.sh` (create `scripts/` if needed).
+3. Run `chmod +x scripts/run_full_experiment.sh`
+4. Commit: `git add experiment_framework/docs/commands.md scripts/run_full_experiment.sh`
+
+
+
+## graphmixer [50 epochs] (2026/05/23)
+|tesp accuracy|test ap| test auc| test loss|
+|0.8023109436035156|0.9068788290023804| 0.9074462056159973| 1.3177164793014526|
+
+Next freedyg
+
+
+
 ## Run: Dynamic Graph Link Prediction (Updated: 2026/01/30)
 
 - **Model**: DyGFormer, TGN

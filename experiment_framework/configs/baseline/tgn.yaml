@@ -1,5 +1,6 @@
-# TGN Model Configuration
+# # experiment_framework/configs/baseline/tgn.yaml
 
+# TGN Model Configuration
 # Model parameters
 model:
   name: "TGN"
